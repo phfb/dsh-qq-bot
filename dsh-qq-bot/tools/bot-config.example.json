@@ -1,0 +1,25 @@
+{
+  "_help_1": "把这份文件复制成 bot-config.json 再改。所有字段都可以留空(空串)，脚本会自己探测。",
+  "_help_2": "只有脚本探测不到的时候才需要你手填，填完跑 check-bot.cmd / start-bot.cmd 就会生效。",
+  "_help_3": "路径里的反斜杠要写两条(\\\\),或者直接用单斜杠(/)也可以。",
+  "_help_4": "插件数据目录里如果有 config.json(插件自己写的),那里的 selfId / accessToken / baseUrl 优先级更高,会覆盖这里的同名值。",
+
+  "snowlumaDir": "C:/Tools/SnowLuma",
+  "snowlumaExe": "",
+  "snowlumaScript": "",
+  "onebotConfigFile": "",
+
+  "dshExe": "C:/Users/YOUR_NAME/AppData/Local/Programs/DSH NEXT/DSH NEXT.exe",
+  "dataDir": "",
+
+  "selfId": "",
+  "baseUrl": "",
+  "accessToken": "",
+  "allowUsers": [],
+
+  "snowlumaWebUiPort": 5099,
+  "httpPort": 0,
+  "wsPort": 0,
+  "httpToken": "",
+  "wsToken": ""
+}

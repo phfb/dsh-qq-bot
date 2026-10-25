@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 日志
+*.log
+
+# 运行期数据（状态、配额、念头、会话映射）
+data/
+.dsh-qq-bot/
+
+# 本机配置（有 token / QQ 号，别提交）
+tools/bot-config.json
+
+# 编辑器和备份
+*.bak-*

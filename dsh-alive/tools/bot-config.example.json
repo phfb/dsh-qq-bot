@@ -1,0 +1,24 @@
+{
+  "_help_1": "把这份文件复制成 bot-config.json 再改：settings-alive.cmd 靠这里的 dataDir 找到 alive-config.json。",
+  "_help_2": "dataDir 必须和 dsh-qq-bot 那边用的是同一个目录，否则设置窗口存的那份插件读不到。",
+  "_help_3": "只有自动探测不到的时候才需要手填路径；路径反斜杠写两条(\\\\)或用单斜杠(/)都可以。",
+
+  "snowlumaDir": "C:/Tools/SnowLuma",
+  "snowlumaExe": "",
+  "snowlumaScript": "",
+  "onebotConfigFile": "",
+
+  "dshExe": "C:/Users/YOUR_NAME/AppData/Local/Programs/DSH NEXT/DSH NEXT.exe",
+  "dataDir": "",
+
+  "selfId": "",
+  "baseUrl": "",
+  "accessToken": "",
+  "allowUsers": [],
+
+  "snowlumaWebUiPort": 5099,
+  "httpPort": 0,
+  "wsPort": 0,
+  "httpToken": "",
+  "wsToken": ""
+}

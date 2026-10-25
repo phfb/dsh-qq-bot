@@ -1,0 +1,32 @@
+# dsh-qq-bot 的 bundle patch
+#
+# 装好之后 Loader 会读到 package.json 里的 dsh.bundle.patch，自动加载本文件。
+#
+# 这里只放**出厂默认值**。所有参数都能在
+#   DSH → 设置 → 插件 → dsh-qq-bot
+# 里图形化修改，改完即时生效，不用碰这个文件。
+#
+# 注意：同一 id 只能出现一次 —— 重复 insert 会长出第二个实例（会连两次 OneBot）。
+- insert:
+    - id: dsh-qq-bot
+      name: dsh-qq-bot
+      config:
+        # OneBot v11 WebSocket 地址。SnowLuma 默认在 wsServers 里监听 3001。
+        baseUrl: 'ws://127.0.0.1:3001/'
+
+        # 和 SnowLuma 里该账号的 accessToken 保持一致。
+        # 留空也行 —— SnowLuma 允许不校验 token。
+        accessToken: ''
+
+        # 你的 QQ 号：只有这些号发消息才会触发她。
+        # 留空 = 谁都不服务（安全默认，第一次装上先去设置页填自己的号）。
+        allowUsers: []
+
+        # bot 自己的 QQ 号，用来忽略自己发的消息。填 SnowLuma 挂的那个号。
+        selfId: ''
+
+        # 总开关。false = 完全不连、不转发。
+        enabled: true
+
+        # true = 收到消息只打日志，不真的发回 QQ（调试用）。
+        dryRun: false

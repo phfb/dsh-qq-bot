@@ -1,0 +1,45 @@
+{
+  "name": "dsh-qq-bot",
+  "version": "0.1.0",
+  "description": "把 QQ 私聊接进 DeepSeek Harness：让 DSH 常驻在你的手机 QQ 里，随时都能找她说话。私聊陪伴向，不是群管机器人。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "test",
+    "tools",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "onebot",
+    "onebot11",
+    "qq",
+    "qqbot",
+    "snowluma",
+    "companion"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}
