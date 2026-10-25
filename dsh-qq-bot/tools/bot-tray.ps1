@@ -8,7 +8,17 @@
   所有 PID / 端口都每次现查（Get-NetTCPConnection / Get-Process / get_login_info），
   不存任何 PID —— 重启之后 PID 全变，写死必然错。
 
-  由 bot-tray.cmd 拉起（隐藏控制台窗口）。
+  ── 为什么要拆线程（2026-10-25 改）────────────────────────────────────────
+  自检本身要 2~5 秒：Get-NetTCPConnection 一次 300~1000 ms，Get-CimInstance 一次
+  200~1300 ms，get_login_info 走 HTTP，Resolve-BotConfig 要探磁盘。
+  以前这些东西全跑在 WinForms 的 UI 线程上、每 5 秒一轮 —— 消息循环几乎没有空闲，
+  表现就是：鼠标划过图标没反应、划一下换个位置又不灵、右键要等半天才弹。
+
+  现在自检整个搬到独立 runspace 的后台线程，UI 线程只干一件事：每 800 ms 看一眼
+  有没有新结果，有就把几条现成的字符串贴到图标和菜单上（微秒级，不碰任何 IO）。
+  另外托盘自己就是「托盘进程」，自检不必再扫一遍 CIM 全表去确认它存在。
+
+  由 BOT-TRAY.vbs 拉起（WScript 启动，零窗口，连一闪的黑框都没有）。
 #>
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -30,20 +40,24 @@ $mutex = New-Object System.Threading.Mutex($false, 'Global\DshQqBotTray')
 $hasLock = $false
 try { $hasLock = $mutex.WaitOne(0) } catch { $hasLock = $false }
 if (-not $hasLock) {
-  # 这个进程是用 -WindowStyle Hidden 起的：弹 MessageBox 会变成一个看不见的窗口
+  # 这个进程是用隐藏窗口起的：弹 MessageBox 会变成一个看不见的窗口
   # 永远等人点，进程就卡在那儿了。所以第二个实例直接走人。
   exit 0
 }
 
 # ── 托盘自己的小日志（排查"图标不刷新"这种问题用）─────────────────────────
+# 日志路径只解析一次：Write-TrayLog 会被状态变化回调，不能每次都去探磁盘。
+$script:TrayLogPath = $null
+
 function Write-TrayLog {
   param([string]$Message)
   try {
-    $cfg = Resolve-BotConfig
-    $dir = $cfg.LogDir
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $path = Join-Path $dir 'tray.log'
-    Add-Content -LiteralPath $path -Encoding UTF8 -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+    if (-not $script:TrayLogPath) {
+      $dir = $script:Cfg.LogDir
+      if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+      $script:TrayLogPath = Join-Path $dir 'tray.log'
+    }
+    Add-Content -LiteralPath $script:TrayLogPath -Encoding UTF8 -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
   } catch { }
 }
 
@@ -51,10 +65,13 @@ function Write-TrayLog {
   NotifyIcon.Text 在 .NET Framework 里上限 63 个字符，超了会直接抛异常，
   而异常一抛整个刷新就中断（图标颜色也不更新），看起来就像"托盘死了"。
 #>
+$script:lastTrayText = ''
 function Set-TrayText {
   param([string]$Text)
   if ($null -eq $Text) { $Text = '' }
   if ($Text.Length -gt 62) { $Text = $Text.Substring(0, 59) + '...' }
+  if ($Text -eq $script:lastTrayText) { return }
+  $script:lastTrayText = $Text
   $script:notify.Text = $Text
 }
 
@@ -85,20 +102,149 @@ $script:iconGreen = New-StatusIcon -Color ([System.Drawing.Color]::FromArgb(63, 
 $script:iconYellow = New-StatusIcon -Color ([System.Drawing.Color]::FromArgb(210, 153, 34))
 $script:iconRed = New-StatusIcon -Color ([System.Drawing.Color]::FromArgb(248, 81, 73))
 
-# ── 常用动作（都现查状态，不依赖启动时那份快照）───────────────────────────
+# ── 配置：只在启动时解析一次（约 250 ms），之后全部复用 ────────────────────
+$script:Cfg = Resolve-BotConfig -Force
+
+# ══════════════════════════════════════════════════════════════════════════
+#  后台自检线程
+#  UI 线程绝不调用 Get-BotStatus —— 那会直接卡住消息循环，鼠标就没反应了。
+# ══════════════════════════════════════════════════════════════════════════
+$script:Shared = [hashtable]::Synchronized(@{
+    stop        = $false
+    trigger     = $false
+    intervalSec = 8
+    seq         = 0
+    state       = $null
+    ScriptDir   = $ScriptDir
+  })
+
+$script:workerRs = [runspacefactory]::CreateRunspace()
+$script:workerRs.ApartmentState = 'MTA'
+$script:workerRs.ThreadOptions = 'ReuseThread'
+$script:workerRs.Open()
+$script:workerRs.SessionStateProxy.SetVariable('Shared', $script:Shared)
+
+$script:workerScript = {
+  param($Shared)
+  $ErrorActionPreference = 'SilentlyContinue'
+  . (Join-Path $Shared.ScriptDir 'check-bot.ps1')
+  # 我自己就是托盘进程：别让自检再扫一遍 CIM 全表去找托盘（那是 0.2~1.3 秒）
+  $script:TraySelfRunning = $true
+
+  $round = 0
+  while (-not $Shared.stop) {
+    $at = (Get-Date).ToString('HH:mm:ss')
+    try {
+      # 每 6 轮（约 1 分钟）强制重扫一次配置：换了路径、换了号能自己跟上
+      $st = Get-BotStatus -Force:($round % 6 -eq 0)
+
+      $light = 'yellow'
+      if ($st.AllGreen) { $light = 'green' }
+      elseif ((-not $st.SnowLumaRunning) -or (-not $st.DshRunning) -or
+              (-not $st.WsPortListening) -or (-not $st.QqOnline)) { $light = 'red' }
+
+      $qqPart = if ($st.QqOnline) { "号 $($st.QqUin) 在线" } else { '号离线' }
+      $dshPart = if ($st.DshRunning) { "DSH:$($st.DshWebPort)" } else { 'DSH 没开' }
+      $linkPart = if ($st.OneBotLinkUp) { 'WS 已连' } else { 'WS 断开' }
+
+      $menuQq = if ($st.QqOnline) { "挂的号：$($st.QqUin)（$($st.QqNick)）" } else { '挂的号：离线' }
+      if ($st.SelfIdWarn) {
+        $menuQq = "挂的号：$(if ($st.QqOnline) { $st.QqUin } else { '离线' })（和 selfId 不一致）"
+      }
+      $sid = if ($st.SessionId) { [string]$st.SessionId } else { '' }
+      if ($sid.Length -gt 20) { $sid = $sid.Substring(0, 20) }
+
+      $Shared.state = @{
+        light       = $light
+        trayText    = "dsh-qq-bot · $qqPart · $dshPart · $linkPart"
+        menuQq      = $menuQq
+        menuLink    = "OneBot 连接：$(if ($st.OneBotLinkUp) { '已连上' } else { '断开' })"
+        menuSession = "当前对话：$(if ($sid) { $sid } else { '(还没建)' })"
+        report      = (Format-BotStatus -Status $st)
+        dshRunning  = [bool]$st.DshRunning
+        dshPort     = [int]$st.DshWebPort
+        dryRun      = [bool]$st.DryRun
+        error       = ''
+        at          = $at
+      }
+    } catch {
+      $Shared.state = @{
+        light       = 'red'
+        trayText    = 'dsh-qq-bot · 自检出错'
+        menuQq      = '挂的号：-'
+        menuLink    = 'OneBot 连接：-'
+        menuSession = '当前对话：-'
+        report      = "自检本身出错了：$($_.Exception.Message)"
+        dshRunning  = $false
+        dshPort     = 0
+        dryRun      = $false
+        error       = $_.Exception.Message
+        at          = $at
+      }
+    }
+    $Shared.seq = [int]$Shared.seq + 1
+    $round++
+    $Shared.trigger = $false
+
+    $deadline = [DateTime]::UtcNow.AddSeconds([int]$Shared.intervalSec)
+    while ([DateTime]::UtcNow -lt $deadline -and -not $Shared.stop) {
+      if ($Shared.trigger) { break }
+      Start-Sleep -Milliseconds 250
+    }
+  }
+}
+
+$script:worker = [powershell]::Create()
+$script:worker.Runspace = $script:workerRs
+$null = $script:worker.AddScript($script:workerScript).AddArgument($script:Shared)
+$script:workerHandle = $script:worker.BeginInvoke()
+
+# ── 用后台结果刷新界面（只贴字符串，零 IO）─────────────────────────────────
+$script:lastSeq = -1
+$script:lastLight = ''
+$script:lastReport = '正在自检，等 2~5 秒…'
+
+function Apply-WorkerState {
+  $s = $script:Shared.state
+  if ($null -eq $s) { return }
+  if ($script:lastSeq -eq [int]$script:Shared.seq) { return }
+  $script:lastSeq = [int]$script:Shared.seq
+
+  if ($s.light -ne $script:lastLight) {
+    switch ($s.light) {
+      'green' { $script:notify.Icon = $script:iconGreen }
+      'yellow' { $script:notify.Icon = $script:iconYellow }
+      'red' { $script:notify.Icon = $script:iconRed }
+    }
+    Write-TrayLog ("状态 {0} -> {1} | {2}（{3} 自检）" -f
+      $(if ($script:lastLight) { $script:lastLight } else { 'start' }), $s.light, $s.trayText, $s.at)
+    $script:lastLight = $s.light
+  }
+
+  Set-TrayText $s.trayText
+  if ($s.menuQq) { $script:miQq.Text = $s.menuQq }
+  if ($s.menuLink) { $script:miLink.Text = $s.menuLink }
+  if ($s.menuSession) { $script:miSession.Text = $s.menuSession }
+  if ($s.report) { $script:lastReport = $s.report }
+
+  if ($null -ne $script:statusForm -and -not $script:statusForm.IsDisposed -and $script:statusForm.Visible) {
+    Update-StatusWindow
+  }
+}
+
+# ── 常用动作（全部读后台缓存 / 静默起进程，绝不阻塞 UI）────────────────────
 
 function Invoke-OpenDsh {
-  $s = Get-BotStatus -Force
-  if ($s.DshRunning -and $s.DshWebPort -gt 0) {
-    Start-Process "http://127.0.0.1:$($s.DshWebPort)"
+  $s = $script:Shared.state
+  if ($null -ne $s -and $s.dshRunning -and $s.dshPort -gt 0) {
+    Start-Process "http://127.0.0.1:$($s.dshPort)"
   } else {
     [System.Windows.Forms.MessageBox]::Show('DSH 没在跑，先开 DSH。', 'dsh-qq-bot 托盘') | Out-Null
   }
 }
 
 function Invoke-OpenSnowLumaUi {
-  $cfg = Resolve-BotConfig
-  Start-Process "http://127.0.0.1:$($cfg.SnowLumaWebUiPort)"
+  Start-Process "http://127.0.0.1:$($script:Cfg.SnowLumaWebUiPort)"
 }
 
 function Invoke-OpenPath {
@@ -110,12 +256,32 @@ function Invoke-OpenPath {
   Start-Process explorer.exe $Path
 }
 
+<#
+  一键启动：完全静默地跑 start-bot.ps1，输出重定向进 data\logs\start-bot-manual.log。
+  以前这里是 Start-Process powershell 不带 -WindowStyle Hidden —— 那就是第一个黑框的来源。
+#>
 function Invoke-RunStartScript {
-  Start-Process powershell.exe -ArgumentList @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', (Join-Path $ScriptDir 'start-bot.ps1'), '-Wait'
-  )
-  Start-Sleep -Milliseconds 800
+  $logDir = $script:Cfg.LogDir
+  try {
+    if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+  } catch { }
+  $logPath = Join-Path $logDir 'start-bot-manual.log'
+  try {
+    Add-Content -LiteralPath $logPath -Encoding UTF8 -Value ("`r`n=== {0} 托盘「一键启动」 ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+  } catch { }
+
+  $inner = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' +
+           (Join-Path $ScriptDir 'start-bot.ps1') + '" >> "' + $logPath + '" 2>&1'
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'cmd.exe'
+  $psi.Arguments = '/c ' + $inner
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+  try { [System.Diagnostics.Process]::Start($psi) | Out-Null } catch { }
+
+  $script:Shared.trigger = $true
+  Write-TrayLog "一键启动：输出在 $logPath"
 }
 
 <#
@@ -125,6 +291,7 @@ function Invoke-RunStartScript {
 #>
 function Invoke-RestartSnowLuma {
   $cfg = Resolve-BotConfig -Force
+  $script:Cfg = $cfg
   $killed = 0
   $victims = @()
 
@@ -155,21 +322,22 @@ function Invoke-RestartSnowLuma {
 
   $started = $false
   if ($cfg.SnowLumaLauncher -and (Test-Path -LiteralPath $cfg.SnowLumaLauncher -PathType Leaf)) {
-    Start-Process -FilePath $cfg.SnowLumaLauncher -WorkingDirectory $cfg.SnowLumaDir -WindowStyle Hidden | Out-Null
+    Start-HiddenProcess -FilePath $cfg.SnowLumaLauncher -WorkingDirectory $cfg.SnowLumaDir | Out-Null
     $started = $true
   } elseif ($cfg.SnowLumaExe -and $cfg.SnowLumaScript -and
             (Test-Path -LiteralPath $cfg.SnowLumaExe -PathType Leaf) -and
             (Test-Path -LiteralPath $cfg.SnowLumaScript -PathType Leaf)) {
-    Start-Process -FilePath $cfg.SnowLumaExe -ArgumentList $cfg.SnowLumaScript `
-      -WorkingDirectory $cfg.SnowLumaDir -WindowStyle Hidden | Out-Null
+    Start-HiddenProcess -FilePath $cfg.SnowLumaExe -ArgumentList @($cfg.SnowLumaScript) `
+      -WorkingDirectory $cfg.SnowLumaDir | Out-Null
     $started = $true
   }
 
   $msg = if ($started) {
-    "已结束 $killed 个 SnowLuma 进程，正在重启。`n大约 1-3 分钟后再自检（首次 hook 要等 QQ 登录检测）。"
+    "已结束 $killed 个 SnowLuma 进程，正在静默重启。`n大约 1-3 分钟后再自检（首次 hook 要等 QQ 登录检测）。"
   } else {
     "已结束 $killed 个 SnowLuma 进程，但没找到可用的启动方式。`n到 tools\bot-config.json 里填 snowlumaDir / snowlumaExe / snowlumaScript。"
   }
+  $script:Shared.trigger = $true
   [System.Windows.Forms.MessageBox]::Show($msg, 'dsh-qq-bot 托盘') | Out-Null
 }
 
@@ -211,7 +379,13 @@ function Show-StatusWindow {
   $btnRefresh = New-Object System.Windows.Forms.Button
   $btnRefresh.Text = '立即自检'
   $btnRefresh.Width = 96
-  $btnRefresh.Add_Click({ Update-StatusWindow })
+  # 只打一个"现在就跑"的标记给后台线程，UI 立刻返回 —— 不在这里跑自检
+  $btnRefresh.Add_Click({
+      $script:Shared.trigger = $true
+      if ($null -ne $script:statusBox) {
+        $script:statusBox.Text = $script:lastReport + "`r`n`r`n（正在重新自检，2~5 秒后刷新…）"
+      }
+    })
 
   $btnCopy = New-Object System.Windows.Forms.Button
   $btnCopy.Text = '复制报告'
@@ -225,15 +399,12 @@ function Show-StatusWindow {
   $btnLogs = New-Object System.Windows.Forms.Button
   $btnLogs.Text = '打开日志目录'
   $btnLogs.Width = 110
-  $btnLogs.Add_Click({ Invoke-OpenPath (Resolve-BotConfig).LogDir })
+  $btnLogs.Add_Click({ Invoke-OpenPath $script:Cfg.LogDir })
 
   $btnStart = New-Object System.Windows.Forms.Button
   $btnStart.Text = '一键启动'
   $btnStart.Width = 96
-  $btnStart.Add_Click({
-      Invoke-RunStartScript
-      Update-StatusWindow
-    })
+  $btnStart.Add_Click({ Invoke-RunStartScript })
 
   $panel.Controls.AddRange(@($btnRefresh, $btnCopy, $btnLogs, $btnStart))
   $form.Controls.Add($box)
@@ -245,62 +416,10 @@ function Show-StatusWindow {
   $form.Show()
 }
 
+# 状态窗口只贴后台已经算好的报告，不自己跑自检 —— 否则点开窗口那一下又卡一次
 function Update-StatusWindow {
   if ($null -eq $script:statusBox -or $script:statusBox.IsDisposed) { return }
-  try {
-    $status = Get-BotStatus -Force
-    $script:statusBox.Text = Format-BotStatus -Status $status
-  } catch {
-    $script:statusBox.Text = "自检本身出错了：$($_.Exception.Message)"
-  }
-}
-
-# ── 刷新托盘 ──────────────────────────────────────────────────────────────
-$script:lastLight = ''
-
-function Get-Light($status) {
-  if ($status.AllGreen) { return 'green' }
-  # 任何一个底座没了就是红；只是某个环节没通算黄
-  if (-not $status.SnowLumaRunning -or -not $status.DshRunning) { return 'red' }
-  if (-not $status.WsPortListening -or -not $status.QqOnline) { return 'red' }
-  return 'yellow'
-}
-
-function Update-Tray {
-  try {
-    $status = Get-BotStatus
-    $light = Get-Light $status
-
-    if ($light -ne $script:lastLight) {
-      switch ($light) {
-        'green' { $script:notify.Icon = $script:iconGreen }
-        'yellow' { $script:notify.Icon = $script:iconYellow }
-        'red' { $script:notify.Icon = $script:iconRed }
-      }
-      Write-TrayLog ("状态 {0} -> {1} | 在线={2} DSH={3} WS={4} pid_snow={5} pid_dsh={6}" -f
-        $(if ($script:lastLight) { $script:lastLight } else { 'start' }), $light,
-        $status.QqOnline, $status.DshRunning, $status.OneBotLinkUp,
-        $status.SnowLumaPid, $status.DshPid)
-      $script:lastLight = $light
-    }
-
-    $qqPart = if ($status.QqOnline) { "号 $($status.QqUin) 在线" } else { '号离线' }
-    $dshPart = if ($status.DshRunning) { "DSH:$($status.DshWebPort)" } else { 'DSH 没开' }
-    $linkPart = if ($status.OneBotLinkUp) { 'WS 已连' } else { 'WS 断开' }
-    Set-TrayText "dsh-qq-bot · $qqPart · $dshPart · $linkPart"
-
-    $script:miQq.Text = "挂的号：$(if ($status.QqOnline) { "$($status.QqUin)（$($status.QqNick)）" } else { '离线' })"
-    if ($status.SelfIdWarn) { $script:miQq.Text = "挂的号：$(if ($status.QqOnline) { $status.QqUin } else { '离线' })（和 selfId 不一致）" }
-    $script:miLink.Text = "OneBot 连接：$(if ($status.OneBotLinkUp) { '已连上' } else { '断开' })"
-    $script:miSession.Text = "当前对话：$(if ($status.SessionId) { $status.SessionId.Substring(0, [Math]::Min(20, $status.SessionId.Length)) } else { '(还没建)' })"
-
-    if ($null -ne $script:statusForm -and -not $script:statusForm.IsDisposed -and $script:statusForm.Visible) {
-      Update-StatusWindow
-    }
-  } catch {
-    Write-TrayLog "刷新失败：$($_.Exception.Message)"
-    Set-TrayText "dsh-qq-bot · 自检出错"
-  }
+  if ($script:lastReport) { $script:statusBox.Text = $script:lastReport }
 }
 
 # ── 托盘本体 ──────────────────────────────────────────────────────────────
@@ -331,33 +450,16 @@ $miSnow = $menu.Items.Add('打开 SnowLuma 控制台')
 $miSnow.Add_Click({ Invoke-OpenSnowLumaUi })
 
 $miLogs = $menu.Items.Add('打开日志目录')
-$miLogs.Add_Click({ Invoke-OpenPath (Resolve-BotConfig).LogDir })
+$miLogs.Add_Click({ Invoke-OpenPath $script:Cfg.LogDir })
 
 $miData = $menu.Items.Add('打开数据目录')
-$miData.Add_Click({ Invoke-OpenPath (Resolve-BotConfig).DataDir })
+$miData.Add_Click({ Invoke-OpenPath $script:Cfg.DataDir })
 
 $miMemes = $menu.Items.Add('打开表情包目录')
-$miMemes.Add_Click({ Invoke-OpenPath (Resolve-BotConfig).MemesDir })
+$miMemes.Add_Click({ Invoke-OpenPath $script:Cfg.MemesDir })
 
 $null = $menu.Items.Add('-')
 
-$miAlive = $menu.Items.Add('活人感设置')
-$miAlive.Add_Click({
-    $aliveUi = Join-Path (Split-Path -Parent $ScriptDir) 'dsh-alive\tools\settings-alive.ps1'
-    if (-not (Test-Path $aliveUi)) { $aliveUi = Join-Path $env:USERPROFILE '.dsh\settings-alive.ps1' }
-    if (Test-Path $aliveUi) {
-      Start-Process powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$aliveUi)
-    } else {
-      [System.Windows.Forms.MessageBox]::Show('找不到 settings-alive.ps1', 'QQ Bot 托盘') | Out-Null
-    }
-  })
-$miSettings = $menu.Items.Add('设置（图形化配置）')
-$miSettings.Add_Click({
-    Start-Process powershell.exe -ArgumentList @(
-      '-NoProfile', '-ExecutionPolicy', 'Bypass',
-      '-File', (Join-Path $ScriptDir 'settings-ui.ps1')
-    )
-  })
 $miStart = $menu.Items.Add('一键启动（启动器）')
 $miStart.Add_Click({ Invoke-RunStartScript })
 
@@ -367,8 +469,9 @@ $miRestartSnow.Add_Click({ Invoke-RestartSnowLuma })
 $miRedetect = $menu.Items.Add('重新探测配置')
 $miRedetect.Add_Click({
     $cfg = Resolve-BotConfig -Force
+    $script:Cfg = $cfg
+    $script:Shared.trigger = $true
     Write-TrayLog ("重新探测：snow={0} dsh={1} onebot={2} data={3}" -f $cfg.SnowLumaDir, $cfg.DshExe, $cfg.OneBotConfigFile, $cfg.DataDir)
-    Update-Tray
     [System.Windows.Forms.MessageBox]::Show(
       "SnowLuma：$($cfg.SnowLumaDir)`nDSH：$($cfg.DshExe)`nOneBot 配置：$($cfg.OneBotConfigFile)`n数据目录：$($cfg.DataDir)",
       'dsh-qq-bot 托盘') | Out-Null
@@ -378,9 +481,11 @@ $null = $menu.Items.Add('-')
 
 $miQuit = $menu.Items.Add('退出托盘')
 $miQuit.Add_Click({
-    $script:timer.Stop()
-    $script:notify.Visible = $false
-    $script:notify.Dispose()
+    $script:uiTimer.Stop()
+    $script:Shared.stop = $true
+    try { $script:worker.Dispose() } catch { }
+    try { $script:workerRs.Close(); $script:workerRs.Dispose() } catch { }
+    try { $script:notify.Visible = $false; $script:notify.Dispose() } catch { }
     [System.Windows.Forms.Application]::Exit()
   })
 
@@ -392,14 +497,18 @@ $script:notify.ShowBalloonTip(6000, 'dsh-qq-bot 托盘已启动',
   '绿=链路全通，黄=部分不通，红=断了。没看到图标就点任务栏的 ^ 展开，右键把它固定到任务栏。双击看完整状态。',
   [System.Windows.Forms.ToolTipIcon]::Info)
 
-$script:timer = New-Object System.Windows.Forms.Timer
-$script:timer.Interval = 5000
-$script:timer.Add_Tick({ Update-Tray })
-$script:timer.Start()
+# UI 计时器只做一件事：把后台算好的结果贴上去。800 ms 一次，开销可以忽略。
+$script:uiTimer = New-Object System.Windows.Forms.Timer
+$script:uiTimer.Interval = 800
+$script:uiTimer.Add_Tick({ Apply-WorkerState })
+$script:uiTimer.Start()
 
-Update-Tray
 [System.Windows.Forms.Application]::Run()
 
 # 退出时收尾
+try { $script:Shared.stop = $true } catch { }
+try { $script:uiTimer.Stop() } catch { }
+try { $script:worker.Dispose() } catch { }
+try { $script:workerRs.Close(); $script:workerRs.Dispose() } catch { }
 try { $script:notify.Visible = $false; $script:notify.Dispose() } catch { }
 try { $mutex.ReleaseMutex() } catch { }

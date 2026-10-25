@@ -56,18 +56,20 @@ function Exit-WithWait {
 
 # 起 SnowLuma：优先 launcher.bat（它自己会处理 node 版本 / 工作目录），
 # 没有 launcher 就 node.exe + index.mjs。
+# 一律走 Start-HiddenProcess —— launcher.bat 用 Start-Process -WindowStyle Hidden 是藏不住的，
+# 那个 cmd 黑框会一直挂在任务栏上。
 function Start-SnowLuma {
   param($Config, [switch]$AsObject)
   if ($Config.SnowLumaLauncher -and (Test-Path -LiteralPath $Config.SnowLumaLauncher -PathType Leaf)) {
-    Start-Process -FilePath $Config.SnowLumaLauncher -WorkingDirectory $Config.SnowLumaDir -WindowStyle Hidden | Out-Null
-    return 'launcher.bat'
+    Start-HiddenProcess -FilePath $Config.SnowLumaLauncher -WorkingDirectory $Config.SnowLumaDir | Out-Null
+    return 'launcher.bat（静默）'
   }
   if (-not $Config.SnowLumaExe -or -not $Config.SnowLumaScript) { return $null }
   if (-not (Test-Path -LiteralPath $Config.SnowLumaExe -PathType Leaf)) { return $null }
   if (-not (Test-Path -LiteralPath $Config.SnowLumaScript -PathType Leaf)) { return $null }
-  Start-Process -FilePath $Config.SnowLumaExe -ArgumentList $Config.SnowLumaScript `
-    -WorkingDirectory $Config.SnowLumaDir -WindowStyle Hidden | Out-Null
-  return "$($Config.SnowLumaExe) $($Config.SnowLumaScript)"
+  Start-HiddenProcess -FilePath $Config.SnowLumaExe -ArgumentList @($Config.SnowLumaScript) `
+    -WorkingDirectory $Config.SnowLumaDir | Out-Null
+  return "$($Config.SnowLumaExe) $($Config.SnowLumaScript)（静默）"
 }
 
 Write-Host '========================================' -ForegroundColor DarkCyan

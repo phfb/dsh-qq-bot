@@ -297,8 +297,21 @@ Network → WebSocket 服务端
 | `check-bot.ps1` | 链路自检，打印一份中文报告（`-Json` 输出 JSON） |
 | `start-bot.ps1` | 一键拉起 SnowLuma + DSH，然后自检 |
 | `bot-tray.ps1` | 托盘图标，绿/黄/红反映链路状态，右键有常用操作 |
-| `start-bot.cmd` / `bot-tray.cmd` | 双击入口（英文提示，避免 GBK 乱码） |
+| `BOT-TRAY.vbs` | **推荐的双击入口**：WScript 拉起托盘，零窗口、零黑框 |
+| `start-bot.cmd` / `bot-tray.cmd` | 老的双击入口（`.cmd` 会先开一个控制台，双击时还是会闪一下） |
 | `bot-config.example.json` | 配置模板，复制成 `bot-config.json` 再改 |
+
+两个实现上的坑，改动这些脚本前先读一遍：
+
+- **`.cmd` / `.bat` 藏不住窗口。** `Start-Process -WindowStyle Hidden` 对它们无效（走 ShellExecute，窗口样式被忽略），
+  要静默只能用 `ProcessStartInfo` + `CreateNoWindow`，并且用 `cmd /c "x.bat" < nul` 包一层
+  （`UseShellExecute=false` 时 `Process.Start` 不能直接启动 `.bat`；`< nul` 是为了让脚本末尾的 `pause` 读到 EOF 立刻返回）。
+  仓库里的 `Start-HiddenProcess` 就是干这个的，起 SnowLuma 一律走它。
+- **托盘的自检不能跑在 UI 线程上。** 一轮自检要 2~4 秒（`Get-NetTCPConnection` 一次 300~1000 ms、
+  `Get-CimInstance Win32_Process` 一次 200~1300 ms、`get_login_info` 走 HTTP），
+  放在 WinForms 的 `Timer` 里就等于每 5 秒把消息循环钉死 4 秒 —— 表现是鼠标划过图标没反应、换个位置又不灵。
+  现在的做法是独立 runspace 后台自检、结果丢进 `[hashtable]::Synchronized`，
+  UI 线程 800 ms 轮询一次只负责贴字符串。
 
 路径来源优先级：**插件数据目录的 `config.json` → `tools\bot-config.json` → 自动探测**常见安装位置。PID、端口全部现查，不写死。
 
@@ -344,7 +357,7 @@ cd <本目录>\tools
 Copy-Item bot-config.example.json bot-config.json
 ```
 
-把 `dataDir` 填成**插件实际在用的那个绝对路径**（比如 `D:/DSHBot/data`），再开窗口。窗口里「路径」那一组的 `dataDir` 建议不要在这里改 —— 它同时也是窗口下次找配置的依据，在这儿改容易两边错位；要换目录，改 `tools\bot-config.json` 然后重启 DSH。
+把 `dataDir` 填成**插件实际在用的那个绝对路径**（比如 `D:/你的目录/data`），再开窗口。窗口里「路径」那一组的 `dataDir` 建议不要在这里改 —— 它同时也是窗口下次找配置的依据，在这儿改容易两边错位；要换目录，改 `tools\bot-config.json` 然后重启 DSH。
 
 ### 「读取」按钮
 

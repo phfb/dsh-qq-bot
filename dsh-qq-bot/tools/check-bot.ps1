@@ -432,43 +432,55 @@ function Get-LogLineTime {
 
 # ── 端口 / 进程（一律现查，不存 PID）──────────────────────────────────────
 
+<#
+  单次 Get-NetTCPConnection 就要 300 ms 上下（cmdlet 走 CIM），而一轮自检要问端口四五次：
+  两次 Test-PortListening、一次 Get-PortOwnerPid、每个 DSH 进程一次 Get-FirstListeningPort。
+  实测一轮 4.7 秒里 3.8 秒全耗在这上面 —— 托盘把自检放在 UI 线程、5 秒跑一轮，
+  等于消息循环几乎没有空闲时间，鼠标划过图标没反应、点右键要等半天，就是这个原因。
+
+  改成「一次拉全表、本地过滤」，同一次自检内的查询共用 400 ms 缓存。
+#>
+$script:ListenCache = @{ At = [datetime]::MinValue; Rows = @() }
+
+function Get-ListenTable {
+  param([int]$MaxAgeMs = 400)
+  $now = [datetime]::UtcNow
+  if (($now - $script:ListenCache.At).TotalMilliseconds -lt $MaxAgeMs) { return $script:ListenCache.Rows }
+  $rows = @()
+  try { $rows = @(Get-NetTCPConnection -State Listen -ErrorAction Stop) } catch { $rows = @() }
+  $script:ListenCache = @{ At = $now; Rows = $rows }
+  return $rows
+}
+
 function Test-PortListening {
   param([int]$Port)
   if ($Port -le 0) { return $false }
-  try {
-    $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
-    return ($null -ne $c)
-  } catch {
-    return $false
-  }
+  foreach ($r in (Get-ListenTable)) { if ($r.LocalPort -eq $Port) { return $true } }
+  return $false
 }
 
 function Get-PortOwnerPid {
   param([int]$Port)
   if ($Port -le 0) { return 0 }
-  try {
-    $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
-    if ($c) { return [int](@($c)[0].OwningProcess) }
-  } catch { }
+  foreach ($r in (Get-ListenTable)) { if ($r.LocalPort -eq $Port) { return [int]$r.OwningProcess } }
   return 0
 }
 
 function Get-FirstListeningPort {
   param([int]$ProcessId, [int[]]$ExcludePorts = @())
   if ($ProcessId -le 0) { return 0 }
+  # 跳过特权端口和 bot 自己那几个（OneBot / WebUI），剩下的才可能是 DSH 的 Web 端口
   $skip = @(3000, 3001, 5099) + @($ExcludePorts)
-  try {
-    # 跳过特权端口和 bot 自己那几个（OneBot / WebUI），剩下的才可能是 DSH 的 Web 端口
-    $c = Get-NetTCPConnection -OwningProcess $ProcessId -State Listen -ErrorAction Stop |
-      Where-Object {
-        $_.LocalAddress -in @('127.0.0.1', '0.0.0.0', '::', '::1') -and
-        $_.LocalPort -gt 1024 -and
-        $_.LocalPort -notin $skip
-      } |
-      Sort-Object LocalPort
-    if ($c) { return [int](@($c)[0].LocalPort) }
-  } catch { }
-  return 0
+  $ports = @()
+  foreach ($r in (Get-ListenTable)) {
+    if ([int]$r.OwningProcess -ne $ProcessId) { continue }
+    if ($r.LocalAddress -notin @('127.0.0.1', '0.0.0.0', '::', '::1')) { continue }
+    if ($r.LocalPort -le 1024) { continue }
+    if ($r.LocalPort -in $skip) { continue }
+    $ports += [int]$r.LocalPort
+  }
+  if ($ports.Count -eq 0) { return 0 }
+  return [int](($ports | Sort-Object)[0])
 }
 
 <#
@@ -492,6 +504,44 @@ function Get-TrayProcesses {
     }
   }
   return $out
+}
+
+# ── 静默启动外部程序（一个窗口都不许冒出来）──────────────────────────────
+
+<#
+  Start-Process -WindowStyle Hidden 对 .bat / .cmd 是无效的 —— 它走 ShellExecute，
+  窗口样式会被忽略。托盘「一键启动」时冒出来的两个黑框就是这么来的：
+  一个是 start-bot.ps1 自己的 powershell 窗口，一个是 SnowLuma launcher.bat 的 cmd 窗口。
+
+  所以这里统一走 ProcessStartInfo + CreateNoWindow；.bat 用 cmd.exe /c 包一层
+  （UseShellExecute=$false 时 Process.Start 不能直接启动 .bat）。
+#>
+function Start-HiddenProcess {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [string[]]$ArgumentList = @(),
+    [string]$WorkingDirectory = ''
+  )
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $args = @($ArgumentList | Where-Object { $null -ne $_ -and $_ -ne '' })
+  if ($FilePath -match '(?i)\.(bat|cmd)$') {
+    $psi.FileName = 'cmd.exe'
+    # 末尾的 < nul 是给 launcher.bat 这类以 pause 结尾的脚本用的：没有控制台时
+    # pause 会一直等输入，进程就成了一个看不见却永远不退的 cmd。接上 nul 读到 EOF 立刻走。
+    $psi.Arguments = '/c "' + $FilePath + '"'
+    if ($args.Count -gt 0) { $psi.Arguments += ' ' + ($args -join ' ') }
+    $psi.Arguments += ' < nul'
+  } else {
+    $psi.FileName = $FilePath
+    if ($args.Count -gt 0) {
+      $psi.Arguments = (($args | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
+    }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) { $psi.WorkingDirectory = $WorkingDirectory }
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+  return [System.Diagnostics.Process]::Start($psi)
 }
 
 # ── OneBot HTTP：问 SnowLuma 要真实账号信息 ────────────────────────────────
@@ -641,6 +691,21 @@ function Get-BotStatus {
     $st.LastErrorAt = $errTime.ToLocalTime()
   }
 
+  # ---- 4.5 演练模式（dryRun）----
+  # 开着 dryRun 时，链路每一项都是绿的，但一条消息都不会真的发到 QQ —— 只会往日志里写
+  # 「[dryRun] 本应发给 …」。2026-10-25 下午就是这么被坑的：自检报「链路全通，QQ 里发消息
+  # 她就能回」，实际他发了两条，一条回复都没收到。这一项必须进总判定。
+  # 有效值以数据目录里的 config.json 为准（它盖过 cordis.patch.yml 的出厂默认）。
+  $st.DryRun = $false
+  $st.DryRunKnown = $false
+  if ($cfg.PluginConfigFile -and (Test-Path -LiteralPath $cfg.PluginConfigFile -PathType Leaf)) {
+    $pluginCfg = Read-JsonFile -Path $cfg.PluginConfigFile
+    if ($null -ne $pluginCfg) {
+      $st.DryRunKnown = $true
+      $st.DryRun = ((Get-Prop $pluginCfg 'dryRun' $false) -eq $true)
+    }
+  }
+
   # ---- 5. 会话映射（她现在在跟哪一局聊）----
   $st.SessionId = $null
   $st.SessionGeneration = 0
@@ -667,13 +732,20 @@ function Get-BotStatus {
   }
 
   # ---- 6. 托盘在不在 ----
-  $trays = @(Get-TrayProcesses)
+  # 托盘进程自己跑自检时这一项必然为真 —— 没必要为它扫一遍全部 CIM 进程表。
+  # Get-CimInstance Win32_Process 一次 0.2~1.3 秒（波动很大），是自检里最贵的单项之一。
+  if ($script:TraySelfRunning) {
+    $trays = @([pscustomobject]@{ Id = [int]$PID })
+  } else {
+    $trays = @(Get-TrayProcesses)
+  }
   $st.TrayRunning = ($trays.Count -gt 0)
   $st.TrayPids = @($trays | ForEach-Object { $_.Id })
 
   # ---- 总判定 ----
   $st.AllGreen = [bool]($st.SnowLumaRunning -and $st.WsPortListening -and $st.QqOnline -and
-                        $st.DshRunning -and $st.QqBotLoaded -and $st.OneBotLinkUp)
+                        $st.DshRunning -and $st.QqBotLoaded -and $st.OneBotLinkUp -and
+                        (-not $st.DryRun))
 
   return [pscustomobject]$st
 }
@@ -735,6 +807,16 @@ function Format-BotStatus {
           'missing' { '没挂上 —— 「上下文到 X% 换新局」不会触发，其余照常' }
           default { '日志里还没出现自检行（插件刚启动 5 秒内正常）' }
         })))
+  if ($Status.DryRunKnown) {
+    $dryDetail = if ($Status.DryRun) {
+      '开着！只往日志里写、不发到 QQ —— 这就是「能收能处理、但一条回复都没有」的元凶。去设置窗口把「只演练不发送」取消勾选并保存，或直接把 config.json 的 dryRun 改成 false'
+    } else {
+      '关着，消息会真的发到 QQ'
+    }
+    $lines.Add(("{0} 演练模式      {1}" -f (Mark (-not $Status.DryRun)), $dryDetail))
+  } else {
+    $lines.Add("[WARN] 演练模式      读不到插件配置 $($Status.ConfigFile)，没法确认是不是被 dryRun 关住了")
+  }
   $lines.Add(("{0} 托盘          {1}" -f (MarkOpt $Status.TrayRunning),
       $(if ($Status.TrayRunning) { "在跑 pid=$($Status.TrayPids -join ',')" } else { '没开（可选，双击 bot-tray.cmd 就常驻了）' })))
 
