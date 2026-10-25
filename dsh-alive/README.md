@@ -25,19 +25,19 @@ agent 带人格 + 记忆现场说一句  →  dsh-qq-bot 转发到你手机
 
 ## 装法
 
-> 路径以本机 `D:\DSHBot\` 的布局为例，换机器就照你的实际路径替换。
-> **本机现状**：`node_modules\dsh-alive` 是指向 **本目录（`D:\DSHBot\release\dsh-alive`）** 的 junction，这样改这里的代码就等于改在跑的插件，不用再来回拷。
+> 下面是示例路径，换成你自己的实际目录。
+> **推荐做法**：让 `node_modules\dsh-alive` 直接 junction 到源码目录，这样改源码就等于改在跑的插件，不用来回拷一份。
 > 第 3 步手写的 YAML 也可以完全跳过 —— 装好之后双击 `tools\settings-alive.cmd`，在窗口里点一遍就行，见下面「工具：图形化设置」。
 
 1. 建 junction（**不做这一步 Loader 找不到包**，dsh-qq-bot 踩过）：
 
    ```powershell
    New-Item -ItemType Junction `
-     -Path   "D:\DSH\dsh-home\profiles\desktop\node_modules\dsh-alive" `
+     -Path   "<你的 profile 目录>\node_modules\dsh-alive" `
      -Target "<本目录的绝对路径>"
    ```
 
-   > ⚠️ 别用 `Copy-Item` 往 `plugins\` 里拷一份再把 junction 指过去 —— 那样会变成两份代码，改了 release 里的、跑的还是旧那份。本机 2026-10-25 就踩过：设置窗口写进去的 `alive-config.json` 一直没人读，因为 junction 指的那份是旧代码（没有配置热载）。
+   > ⚠️ 别用 `Copy-Item` 往 `plugins\` 里拷一份再把 junction 指过去 —— 那样会变成两份代码，改了 release 里的、跑的还是旧那份。这套插件就踩过：设置窗口写进去的 `alive-config.json` 一直没人读，因为 junction 指的那份是旧代码（没有配置热载）。
 
 2. `cordis.patch.yml` 末尾追加：
 
@@ -170,7 +170,7 @@ Copy-Item bot-config.example.json bot-config.json
 
 ## 日志
 
-跟着 `dataDir` 走，落在 **`<dataDir>\logs\alive.log`**（本机就是 `D:\DSHBot\data\logs\alive.log`）。和 dsh-qq-bot 的 `qq-bot.log`、托盘的 `tray.log` 在同一个目录里，排查时不用来回找。
+跟着 `dataDir` 走，落在 **`<dataDir>\logs\alive.log`**。和 dsh-qq-bot 的 `qq-bot.log`、托盘的 `tray.log` 在同一个目录里，排查时不用来回找。
 
 关键几行：
 
@@ -194,7 +194,7 @@ Copy-Item bot-config.example.json bot-config.json
 node --test "<本目录>\test\policy.test.mjs"
 ```
 
-（本机没把 `node` 放 PATH 的话，用 DSH 自带或 SnowLuma 目录里那个 exe：`D:\Astrbot\Snowluma\node.exe`。Node 24 不认 `node --test <目录>`，得给文件路径或者不带参数。）
+（`node` 不在 PATH 就用绝对路径指到你自己的 node.exe。顺带一句：Node 24 不认 `node --test <目录>`，得给文件路径，或者干脆不带参数让它自己找。）
 
 ---
 
