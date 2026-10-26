@@ -34,11 +34,16 @@ export const DEFAULTS = Object.freeze({
   maxQueue: 3,
 
   /**
-   * 分段规则（2026-10-25 下午改定）：
-   *   <= shortMax   整条发
-   *   >  shortMax   按实际语意停顿分条（换行 > 句末标点 > 逗号 > 语气词 > 均分），多长都切
-   * longMin 已停用 —— 原先"60 字以上合并成一条"那条规则他取消了，
-   * 字段留着只为不炸老配置。
+   * 分段规则（2026-10-27 统一，**别再加字数档位**）。
+   *
+   *   工作内容（[[整条]] 或自动认出代码块/列表/表格/命令）→ 整条发
+   *   其他一切 → 按实际语意停顿分条（换行 > 句末标点 > 逗号 > 语气词），多长都切
+   *
+   * `shortMax` / `longMin` 已经**彻底退出逻辑**：这条规则被他改过三轮
+   * （60 字合并 → 25 字整条 → 取消区间），两个字段留着只为不炸老配置文件，
+   * 读进来也不会影响任何切分。
+   *
+   * 真正还会用的只有 `intervalMs`：两条之间的停顿（像人在打字）。
    */
   segment: Object.freeze({ shortMax: 25, longMin: 60, intervalMs: Object.freeze([2000, 4000]) }),
 
@@ -261,10 +266,7 @@ export function parseConfig(raw) {
     imageTimeoutMs: num(input.imageTimeoutMs, DEFAULTS.imageTimeoutMs, { min: 2000, max: 120_000 }),
   }
 
-  if (config.segment.longMin <= config.segment.shortMax) {
-    problems.push('segment.longMin 不大于 shortMax，已把 longMin 拉到 shortMax + 1')
-    config.segment.longMin = config.segment.shortMax + 1
-  }
+  // 2026-10-27：shortMax / longMin 不再参与切分，那条互相拉扯的校验也一起去掉了。
 
   // 一次清理不能超过上限本身，否则一张图库里全删光比不清理更糟
   if (config.imageCachePurgeMB > config.imageCacheLimitMB) {

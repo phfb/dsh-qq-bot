@@ -263,8 +263,9 @@ $inner = $g.Inner
 Add-Bool $g.Box ([ref]$inner) 'enabled' '启用插件（关掉就不连、不转发）' 'enabled'
 Add-Bool $g.Box ([ref]$inner) 'dryRun' '只演练不发送（只写日志，不发到 QQ）' 'dryRun'
 Add-Number $g.Box ([ref]$inner) 'contextLimitPercent' '上下文用到 % 换新局' 'contextLimitPercent' 0 100 5 0
-Add-Number $g.Box ([ref]$inner) 'shortMax' '短句阈值（字）' 'segment.shortMax' 1 500 5 0
-Add-Number $g.Box ([ref]$inner) 'longMin' '长句阈值（字）' 'segment.longMin' 2 2000 5 0
+# 2026-10-27：分段规则统一成「工作整条 / 其他按语意分条」，字数档位全部取消。
+# shortMax / longMin 两个参数还留在配置文件里（不炸老配置），但改它们不会有任何效果，
+# 所以这里不再给输入框 —— 留着只会让人以为「调一下就能改分段」。
 Add-Number $g.Box ([ref]$inner) 'maxChars' '单条上限（字）' 'maxCharsPerMessage' 100 5000 100 0
 Add-Text $g.Box ([ref]$inner) 'commandPrefix' 'QQ 命令前缀' 'commandPrefix' '/qq'
 $g.Box.Height = $inner + 8

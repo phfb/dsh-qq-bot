@@ -177,44 +177,53 @@ export function cleanMarkdown(text) {
 }
 
 /**
- * 按他的发送规则分段 —— 这套规则是 2026-10-25 从 AstrBot 搬过来时逐字复述的：
+ * 按他定的发送规则分段（2026-10-27 统一后的**唯一版本**）。
  *
- *   字数 <= shortMax    整条发（一句话就一条，别拆）
- *   字数 >  shortMax    按"实际语意停顿"切成几条 —— **多长都切，不设上限**
+ * 规则就两条：
  *
- * 历史：原先是 AstrBot 那套三段式，"≥ longMin（60 字）合并成一条、中间不拆"。
- * 2026-10-25 下午他原话："大于60字的那个规则就不要了"，
- * 于是长消息不再豁免，一律走分段。longMin 这参数留着只为不炸老配置，已经不用了。
+ *   工作内容（`[[整条]]` 标记，或自动认出代码块/列表/表格/命令）→ 整条发，不切。
+ *   其他一切 → **按语意停顿分条**，多长都切，不设上限。
  *
- * 切分优先级：换行 > 句末标点（。！？!?…~～） > 逗号类（，、；;：:）
- *             > 语气词/连词 > 按字数均分。
+ * 这里只实现后半条（前半条在 index.js 的 deliverReply 里：`oneShot` 为真就不调这个函数）。
+ *
+ * ⚠ **不要再加按字数的档位。** 这条规则被他改过三轮：
+ *   ① 最初的 AstrBot 三段式："≥60 字合并成一条" → 2026-10-25 他取消
+ *   ② 之后变成 "≤shortMax 整条发 / >shortMax 才切" → 跟①的残留打架
+ *   ③ 2026-10-27 他拍板："不再设置区间规则"
+ * 于是 shortMax / longMin 两个参数**彻底退出逻辑**，只留在配置里不炸老文件。
+ * 切分只认语意，不认长度。
+ *
+ * 切分优先级：换行 > 句末标点（。！？!?…~～） > 逗号类（，、；;：:） > 语气词/连词。
  * 前一级切不动才退到下一级 —— 否则"今天真的好累啊。你都不会问我一句吗？"
  * 会先被中间那个逗号切成碎片。
  *
  * 注意：他的规则里"非必要不用句号收尾"，所以**不能只靠句号切**。
  * 大量回复里根本没有句号，硬停顿只剩换行和问号/叹号/省略号，
- * 再往下必须靠逗号和语气词接住，这就是"按语意停顿"的实际含义。
+ * 再往下必须靠逗号和语气词接住 —— 这就是"按语意停顿"的实际含义。
  *
- * 切完做两次合并：
- *   1) 贪心合并 —— 合并后仍不超过 shortMax 的相邻段并成一条（一片一片发太碎）
- *   2) 碎段回收 —— 剩不到 4 个字的小段并进前一段（"嗯"不该单独飞出去）
+ * 切完只做一件事：碎段回收（不到 4 个字的小段并进前一段，"嗯"不该单独飞出去）。
+ * 那是合并碎片，不是按字数合并段落，不算区间规则。
  *
  * @param {string} text
- * @param {{shortMax:number, longMin?:number}} cfg longMin 已停用，只为兼容老配置保留
+ * @param {{shortMax?:number, longMin?:number, intervalMs?:number[]}} _cfg 已不参与切分，保留签名兼容调用方
  * @returns {string[]}
  */
 export function segmentText(text, cfg) {
   const body = String(text ?? '').trim()
   if (body === '') return []
-  const len = [...body].length
-  if (len <= cfg.shortMax) return [body]
 
+  /* 规则只剩一条：按语意停顿分条（换行 > 句末标点 > 逗号 > 语气词）。
+     2026-10-27 统一：以前这里还有「<= shortMax 整条发」和「贪心合并到 shortMax」
+     两道按字数的闸门，跟「> shortMax 就切」互相打架 —— 同一段话按不同入口能得到
+     完全不同的分法。现在把字数分档全部拆掉，只看语意。
+
+     长度硬上限仍然有，在 splitLongText(maxCharsPerMessage) 那一层兜。 */
   let pieces = sliceByRegex(body, HARD_BREAK)
   if (pieces.length <= 1) pieces = sliceByRegex(body, SOFT_BREAK)
   if (pieces.length <= 1) pieces = sliceByPauseWord(body)
-  if (pieces.length <= 1) pieces = sliceByLength(body, cfg.shortMax)
 
-  return mergeTiny(mergeToFit(pieces, cfg.shortMax))
+  // 连标点和语气词都没有 —— 不硬切。一句完整的话不该被腰斩。
+  return mergeTiny(pieces)
 }
 
 /** 硬停顿：换行 + 句末标点。标点跟着前一段。 */
@@ -263,50 +272,10 @@ function sliceByPauseWord(body) {
 }
 
 /**
- * 无标点时的兜底 2：按字数均分。
- * 到这一步已经没有任何语意线索了，只能保证每条不超过 shortMax 太多。
- * @param {string} body
- * @param {number} shortMax
- * @returns {string[]}
- */
-function sliceByLength(body, shortMax) {
-  const chars = [...body]
-  const parts = Math.max(2, Math.ceil(chars.length / Math.max(1, shortMax)))
-  const size = Math.ceil(chars.length / parts)
-  const out = []
-  for (let i = 0; i < chars.length; i += size) out.push(chars.slice(i, i + size).join(''))
-  return out
-}
-
-/**
- * 贪心合并：相邻两段加起来还不到 shortMax 就并成一条。
- * 目的是别把一句 30 字的话拆成四五个短气团，读起来像刷屏。
- * @param {string[]} pieces
- * @param {number} shortMax
- * @returns {string[]}
- */
-function mergeToFit(pieces, shortMax) {
-  /** @type {string[]} */
-  const out = []
-  let buf = ''
-  for (const piece of pieces) {
-    if (buf === '') {
-      buf = piece
-      continue
-    }
-    if ([...buf].length + [...piece].length <= shortMax) {
-      buf += piece
-    } else {
-      out.push(buf)
-      buf = piece
-    }
-  }
-  if (buf !== '') out.push(buf)
-  return out
-}
-
-/**
  * 碎段回收：不到 4 个字的一段并进前一段（"嗯"不该自己飞出去）。
+ *
+ * 这是唯一保留下来的「合并」逻辑 —— 它合并的是**碎片**，不是按字数合并段落，
+ * 所以不算区间规则。
  * @param {string[]} pieces
  * @returns {string[]}
  */

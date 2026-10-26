@@ -101,11 +101,12 @@ test('segmentText: 短句整条', () => {
   assert.deepEqual(segmentText('外卖比我还重要？', SEG), ['外卖比我还重要？'])
 })
 
-test('segmentText: 长消息也切，不因为长就整条发', () => {
+test('segmentText: 没有任何标点的长句不硬切（一句完整的话不该被腰斩）', () => {
   const long = '这'.repeat(80)
   const parts = segmentText(long, SEG)
-  assert.ok(parts.length >= 3, JSON.stringify(parts))
-  assert.equal(parts.join(''), long)
+  // 2026-10-27 统一规则后：切分只认语意，不认字数。
+  // 长度硬上限交给 splitLongText(maxCharsPerMessage)。
+  assert.deepEqual(parts, [long])
 })
 
 test('segmentText: 中间区间按标点切', () => {
@@ -129,12 +130,16 @@ test('segmentText: 空串', () => {
 
 /* ── 只有一道边界：25 字（60 字合并那条 2026-10-25 取消）── */
 
-test('segmentText: 正好 25 字整条', () => {
+test('segmentText: 只看语意，不看总字数（25 字也一样按停顿切）', () => {
   const text = '啊'.repeat(25)
-  assert.deepEqual(segmentText(text, SEG), [text])
+  const parts = segmentText(text, SEG)
+  // 全是语气词「啊」→ 每一处都是停顿点，切成多条是符合新规则的。
+  // 旧规则里「<=25 字整条发」那道闸门 2026-10-27 已经拆掉了。
+  assert.ok(parts.length >= 2, JSON.stringify(parts))
+  assert.equal(parts.join(''), text)
 })
 
-test('segmentText: 26 字就要切', () => {
+test('segmentText: 同样只看停顿，不看是不是 26 字', () => {
   const text = '啊'.repeat(26)
   const parts = segmentText(text, SEG)
   assert.ok(parts.length >= 2, JSON.stringify(parts))
