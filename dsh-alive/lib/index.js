@@ -890,10 +890,22 @@ export function apply(ctx, rawConfig) {
         lust: '涩涩',
       }
       const label = NAME[top.key] ?? top.key
-      return [
+
+      /**
+       * 涩涩主导时额外追加的一段（2026-10-27 他要的）。
+       *
+       * 他的原话：「多一些动作和语气词，篇幅长一点，第一人称」。
+       * 只在 lust 当主情绪时加 —— 别的情绪下说一大段反而是负担。
+       */
+      const LUST_EXTRA =
+        '→ 这种时候可以多一些动作和语气词，篇幅放长一点，用第一人称写（我的手…／声音有点…／忍不住…），别只回一句短的。'
+
+      const lines = [
         `【你现在的心情】${label} ${pct}%（活人感插件自动给的，不必复述数字）`,
         `→ ${TONE_LINE[tone] ?? TONE_LINE.flat}`,
-      ].join('\n')
+      ]
+      if (top.key === 'lust') lines.push(LUST_EXTRA)
+      return lines.join('\n')
     } catch {
       return ''
     }
