@@ -98,6 +98,36 @@ export const DEFAULTS = Object.freeze({
    */
   moodSnapshotIntervalMin: 5,
 
+  /**
+   * 情绪注入：把当前情绪压成一两行进系统提示词，让她"知道自己现在什么状态"。
+   *
+   * 关掉的话情绪只用来打分（决定要不要主动开口），模型本身看不见 —— 说话语气不受影响。
+   */
+  moodInjection: true,
+
+  /**
+   * 情绪驱动能不能突破「每小时 / 每天」配额。
+   *
+   * 打开后，情绪顶上去时即使配额已经用完也照发；但**深夜、静音、他说过「别发了」永远守**，
+   * 那些闸门跟这个开关无关。
+   */
+  emotionBypassQuota: true,
+
+  /**
+   * 情绪驱动能不能连 alive 总开关（enabled / hardOff）一起绕过。
+   *
+   * **默认关**。打开之后：你亲手关掉总开关，她情绪上来了照样会找你。
+   */
+  emotionBypassMaster: false,
+
+  /**
+   * 主动开口时，先甩一张表情包的概率（0-100，0 = 永不）。
+   *
+   * 掷中之后随机二选一：一半「先发图再说文字」，一半「只发图不说话」。
+   * 表情本身还要过 qq-bot 那道频率闸门（最小间隔 / 每小时上限 / 概率）。
+   */
+  memeChancePercent: 40,
+
   /** 状态文件目录。写死，别用 volatile。 */
   dataDir: join(homedir(), '.dsh-qq-bot'),
 })
@@ -162,6 +192,10 @@ export function parseConfig(raw) {
     lustFillHours: num(input.lustFillHours, DEFAULTS.lustFillHours, { min: 0.1, max: 240 }),
     lustTeaseStepPercent: num(input.lustTeaseStepPercent, DEFAULTS.lustTeaseStepPercent, { min: 0, max: 100 }),
     moodSnapshotIntervalMin: Math.round(num(input.moodSnapshotIntervalMin, DEFAULTS.moodSnapshotIntervalMin, { min: 1, max: 1440 })),
+    moodInjection: input.moodInjection !== false,
+    emotionBypassQuota: input.emotionBypassQuota !== false,
+    emotionBypassMaster: input.emotionBypassMaster === true,
+    memeChancePercent: num(input.memeChancePercent, DEFAULTS.memeChancePercent, { min: 0, max: 100 }),
     dataDir: typeof input.dataDir === 'string' && input.dataDir.trim() !== '' ? input.dataDir.trim() : DEFAULTS.dataDir,
   }
 

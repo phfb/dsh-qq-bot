@@ -1,6 +1,6 @@
 {
   "name": "dsh-alive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "DSH 宿主插件：她心里挂着没落地的事到期时，由她自己主动开口一次。",

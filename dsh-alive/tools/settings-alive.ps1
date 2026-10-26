@@ -628,6 +628,16 @@ Add-Number $g.Box ([ref]$inner) 'maxAttempts' '同一件事最多追几次' 'max
 $g.Box.Height = $inner + 8
 $y += $g.Box.Height + 10
 
+# ── 情绪驱动（她为什么非要找你）─────────────────────────────────────────────
+
+$g = New-Group '情绪驱动（她为什么非要找你）' '她的情绪不只给自己看：写进系统提示词会影响说话语气；情绪上来了还能突破额度主动开口。' $y
+$inner = $g.Inner
+Add-Bool $g.Box ([ref]$inner) 'moodInjection' '把当前情绪写进系统提示词（她自己知道自己什么心情）' 'moodInjection' $true
+Add-Bool $g.Box ([ref]$inner) 'emotionBypassQuota' '情绪上来了可以突破每小时/每天额度（深夜和「别发了」仍然守）' 'emotionBypassQuota' $true
+Add-Bool $g.Box ([ref]$inner) 'emotionBypassMaster' '连总开关关着也照发（危险：你关了她还会找你）' 'emotionBypassMaster' $false
+Add-Number $g.Box ([ref]$inner) 'memeChancePercent' '主动开口时先甩一张表情的概率（%）' 'memeChancePercent' 0 100 5 0 40
+$g.Box.Height = $inner + 8
+$y += $g.Box.Height + 10
 # ── 时段 ─────────────────────────────────────────────────────────────────────
 
 $g = New-Group '时段' '格式 03:00-06:00，多个用逗号分隔。留空 = 不限制。' $y

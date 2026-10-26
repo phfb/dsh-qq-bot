@@ -2,7 +2,7 @@
  * dsh-alive 的判定核心。全是纯函数：不碰 IO、不碰 ctx、不碰网络。
  *
  * 想改她的"分寸"，改这个文件就够了；改完跑
- *   node --test test/mood.test.mjs test/policy.test.mjs
+ *   node --test "test/*.test.mjs"     （在 dsh-alive 目录下跑）
  */
 
 import { LUST_ENABLED } from './mood.mjs'
@@ -153,9 +153,19 @@ export function jitterMs(backInMin, kind) {
 export function checkGate(state, config, loop, env) {
   const failed = []
   const now = env.now
+  /**
+   * 情绪驱动的豁免。
+   *
+   * `master` —— 连总开关（enabled / hardOff）都绕过去，默认关。
+   * `quota`  —— 绕开每小时 / 每天配额。
+   *
+   * **能绕的只有这两类。** 静音（G3）、他刚说过话（G5）、他说「别发了」（G8b / G12）、
+   * 深夜（G11）永远不绕 —— 那是「别打扰他」的底线，不是额度问题。
+   */
+  const exempt = env?.exempt ?? {}
 
-  if (state.control?.enabled !== true) failed.push('G1:disabled')
-  if (state.control?.hardOff === true) failed.push('G2:hardOff')
+  if (state.control?.enabled !== true && exempt.master !== true) failed.push('G1:disabled')
+  if (state.control?.hardOff === true && exempt.master !== true) failed.push('G2:hardOff')
 
   const mutedUntil = state.control?.mutedUntil
   if (typeof mutedUntil === 'string' && Date.parse(mutedUntil) > now) failed.push('G3:muted')
@@ -173,8 +183,12 @@ export function checkGate(state, config, loop, env) {
   const cooldownMs = config.cooldownMin * 60_000 * Math.pow(2, ignored)
   if (lastPro !== null && now - lastPro < cooldownMs) failed.push('G6:cooldown')
 
-  if ((Number(state.quota?.hourCount) || 0) >= config.maxPerHour) failed.push('G7:hour-quota')
-  if ((Number(state.quota?.dayCount) || 0) >= config.maxPerDay) failed.push('G8:day-quota')
+  if ((Number(state.quota?.hourCount) || 0) >= config.maxPerHour && exempt.quota !== true) {
+    failed.push('G7:hour-quota')
+  }
+  if ((Number(state.quota?.dayCount) || 0) >= config.maxPerDay && exempt.quota !== true) {
+    failed.push('G8:day-quota')
+  }
   // 他今天说过"别发了"：当天封顶。用独立字段记，不占 dayCount，免得解除静音之后还不回来。
   const stopToday = parseTime(state.control?.dayQuotaSuspendedUntil)
   if (stopToday !== null && now < stopToday) failed.push('G8b:stop-today')

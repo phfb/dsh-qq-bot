@@ -223,7 +223,9 @@ test('涩涩：挑逗到顶也是 100%，不会溢出', () => {
 })
 
 test('涩涩：没启用的时候挑逗也不动（省得关着还偷偷改数）', () => {
-  const m = onTeased(fresh({ lust: 0.3 }), 0, { lust: { enabled: true } }) // codeEnabled 缺省 = 代码关着
+  // 显式写 codeEnabled: false —— 不能靠「LUST_ENABLED 缺省」这种全局状态，
+  // 运行版把代码开关打开时（LUST_ENABLED = true）这条就会假失败。
+  const m = onTeased(fresh({ lust: 0.3 }), 0, { lust: { enabled: true, codeEnabled: false } })
   assert.equal(m.lust, 0.3)
 })
 

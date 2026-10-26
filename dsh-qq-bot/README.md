@@ -1,3 +1,17 @@
+## 对外 service：`qqMeme`
+
+给别的插件（目前是 `dsh-alive`）用的口子，`ctx.get('qqMeme')` 拿到：
+
+```js
+const meme = ctx.get('qqMeme')
+if (meme?.canSend()) await meme.send('开心')   // → { ok, sent?, note? }
+```
+
+`send()` 和模型调 `send_meme` 工具走的是**同一个内核**（`sendMemeCore`）：
+同一套频率闸门、同一份记账。所以谁发都算数，不会出现两条通道互相把配额吃光。
+
+`canSend()` 只是省得调用方白掷骰子 —— 真正的判定在 `send()` 里。
+
 # dsh-qq-bot
 
 把你的 QQ **私聊**接到 DSH 的 AI agent 上。手机上像跟人聊天一样给她发消息，她带着上下文回你。

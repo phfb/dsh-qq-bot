@@ -91,6 +91,11 @@ function pickConfigForFile(config) {
     lustFillHours: config.lustFillHours,
     lustTeaseStepPercent: config.lustTeaseStepPercent,
     moodSnapshotIntervalMin: config.moodSnapshotIntervalMin,
+    // 情绪驱动那一组（注入 / 两个豁免 / 表情概率）
+    moodInjection: config.moodInjection,
+    emotionBypassQuota: config.emotionBypassQuota,
+    emotionBypassMaster: config.emotionBypassMaster,
+    memeChancePercent: config.memeChancePercent,
     dataDir: config.dataDir,
   }
 }
@@ -806,6 +811,88 @@ export function apply(ctx, rawConfig) {
   }
 
   /** 到期的 loop 能不能投。 */
+  /* ── 情绪注入：让她"知道自己现在什么状态" ── */
+
+  /** 已经注册过情绪段的 agent（agent 重建后对象会换，所以按对象存）。 */
+  const moodFibers = new WeakMap()
+
+  /** 主情绪 → 表情包关键词（发图时用）。 */
+  const MEME_KEYWORD = Object.freeze({
+    missing: '喜欢',
+    jealousy: '生气',
+    warmth: '比心',
+    worry: '难过',
+    boredom: '日常',
+    annoyance: '拒绝',
+    lust: '好色',
+    calm: '日常',
+  })
+
+  /**
+   * 渲染情绪段（进系统提示词）。
+   *
+   * 只写「现在什么状态 + 该怎么说话」，不写具体事件 —— 事件由念头负责。
+   * 情绪很淡（主情绪 < 25%）时返回空串，等于不注入，省 token 也不出戏。
+   */
+  function renderMoodSection() {
+    if (config.moodInjection !== true) return ''
+    try {
+      const opts = { lust: lustConfig() }
+      const top = moodModule.dominant(state.mood, opts)
+      if (top.key === 'calm') return ''
+      const pct = Math.round((Number(top.value) || 0) * 100)
+      const tone = moodModule.moodHintOf(state.mood, opts)
+      const TONE_LINE = {
+        clingy: '黏人、想贴着他，说话带点撒娇和「你都不理我」。',
+        pouty: '在闹小脾气，句子短一点、语气冷半分，等他来哄。',
+        warm: '心情很好，软、爱笑，愿意多说两句。',
+        worried: '有点放不下心，会追问他的状况，语气关切但不唠叨。',
+        light: '闲着没事，随口找话说，轻飘飘的那种。',
+        flirty: '有点想要他，主动、直白，但不硬来 —— 看场合收敛。',
+        sulky: '还堵着一口气，说话不客气但不会伤人，是闹不是骂。',
+        flat: '平常状态。',
+      }
+      const NAME = {
+        missing: '想他',
+        jealousy: '吃醋',
+        warmth: '暖意',
+        worry: '担心',
+        boredom: '闲',
+        annoyance: '恼火',
+        lust: '涩涩',
+      }
+      const label = NAME[top.key] ?? top.key
+      return [
+        `【你现在的心情】${label} ${pct}%（活人感插件自动给的，不必复述数字）`,
+        `→ ${TONE_LINE[tone] ?? TONE_LINE.flat}`,
+      ].join('\n')
+    } catch {
+      return ''
+    }
+  }
+
+  /** 给这个 agent 注册情绪段（幂等；agent 重建会自动重新注册）。 */
+  function ensureMoodSection(agent) {
+    if (config.moodInjection !== true) return
+    if (!agent || typeof agent !== 'object') return
+    if (moodFibers.has(agent)) return
+    if (typeof agent.ctx?.inject !== 'function') return
+    try {
+      const fiber = agent.ctx.inject(['systemPrompt'], (scope) => {
+        scope.systemPrompt.section({
+          name: 'alive-mood',
+          order: 4950,
+          text: () => renderMoodSection(),
+          interpolate: false,
+        })
+      })
+      moodFibers.set(agent, fiber)
+      writeLog('INFO', '已注册情绪段（她的心情会写进系统提示词）')
+    } catch (err) {
+      writeLog('WARN', `注册情绪段失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   async function tryDeliver(now) {
     const agents = ctx.get('agents')
     if (!agents) return
@@ -853,6 +940,9 @@ export function apply(ctx, rawConfig) {
     const agentExists = agent !== undefined && agent !== null
     const agentRunning = agentExists && agent.status === 'running'
 
+    // 顺手把情绪段挂上去：这一跳拿到 agent 就注册，之后每轮 assemble 都读最新心情。
+    if (agentExists) ensureMoodSection(agent)
+
     // 先把超期太久的 loop 作废：投过但硬到期还没回来，或者一次都没投就已经过期很久
     for (const loop of state.loops) {
       if (loop.status !== 'open' && loop.status !== 'delivered') continue
@@ -873,7 +963,17 @@ export function apply(ctx, rawConfig) {
     /** @type {{loop:any, score:number, parts:any} | null} */
     let best = null
     for (const loop of due) {
-      const gate = checkGate(state, config, loop, { now, agentRunning, agentExists })
+      const gate = checkGate(state, config, loop, {
+        now,
+        agentRunning,
+        agentExists,
+        // 情绪驱动的豁免：只放行「配额」和（可选）「总开关」两类，
+        // 深夜 / 静音 / 他说过「别发了」照旧拦 —— 那些是底线，不是额度。
+        exempt: {
+          quota: config.emotionBypassQuota === true,
+          master: config.emotionBypassMaster === true,
+        },
+      })
       if (!gate.pass) continue
       const { score, parts } = scoreImpulse(state, loop, config, now)
       if (score < config.threshold) continue
@@ -900,6 +1000,45 @@ export function apply(ctx, rawConfig) {
       loop.attempts = (Number(loop.attempts) || 0) + 1
       loop.status = 'delivered'
       save()
+      return
+    }
+
+    // ── 先甩一张表情？（概率可调，0 = 永不） ──
+    // 掷中之后随机二选一：一半「先发图再说话」，一半「只发图，这次不说话」。
+    // 表情本身还要过 qq-bot 那道闸门（最小间隔 / 每小时上限 / 概率），那边拒了就当没发生。
+    let imageOnly = false
+    if (config.memeChancePercent > 0) {
+      const qqMeme = typeof ctx.get === 'function' ? ctx.get('qqMeme') : undefined
+      if (qqMeme && typeof qqMeme.send === 'function' && Math.random() * 100 < config.memeChancePercent) {
+        try {
+          const topMood = moodModule.dominant(state.mood, { lust: lustConfig() })
+          const sent = await qqMeme.send(MEME_KEYWORD[topMood.key] ?? '日常')
+          if (sent && sent.ok === true) {
+            imageOnly = Math.random() < 0.5
+            writeLog('INFO', `先发了一张表情「${String(sent.sent ?? '')}」${imageOnly ? '（这次只发图）' : '（接着再说一句）'}`)
+          } else {
+            writeLog('INFO', `表情没发成（${String(sent?.note ?? '未知')}），照常开口`)
+          }
+        } catch (err) {
+          writeLog('WARN', `发表情失败（不影响这次开口）：${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+    }
+
+    // 「只发图」这一支：图已经出去了，这次不再投念头，但账要记（否则配额和冷却不会走）。
+    if (imageOnly) {
+      loop.attempts = (Number(loop.attempts) || 0) + 1
+      loop.lastAttemptAt = new Date(now).toISOString()
+      loop.status = 'delivered'
+      state.quota.lastProactiveAt = new Date(now).toISOString()
+      state.quota.hourCount = (Number(state.quota.hourCount) || 0) + 1
+      state.quota.dayCount = (Number(state.quota.dayCount) || 0) + 1
+      state.stats.totalDelivered = (Number(state.stats.totalDelivered) || 0) + 1
+      const bImg = state.stats.byKind[loop.kind] ?? { sent: 0, hit: 0 }
+      bImg.sent = (bImg.sent ?? 0) + 1
+      state.stats.byKind[loop.kind] = bImg
+      writeLog('INFO', `只发图：${shortForLog(loop.what, 30)}（这次不投文字）`)
+      save(true)
       return
     }
 

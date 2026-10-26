@@ -1306,6 +1306,69 @@ export function apply(ctx, rawConfig) {
     return finalPool[Math.floor(Math.random() * finalPool.length)]
   }
 
+  /**
+   * 发表情的内核。**两个入口共用**：
+   *   · 工具 `send_meme`（模型自己想起来发的时候）
+   *   · service `qqMeme.send()`（dsh-alive 主动开口前想先甩一张的时候）
+   *
+   * 闸门（最小间隔 / 每小时上限 / 概率骰子）和记账都在这里，保证两边待遇一致 ——
+   * 不然 alive 那一路会把配额用光，模型自己就再也发不出来了。
+   *
+   * @param {string} [keyword]
+   * @returns {Promise<{ok:boolean, sent?:string, note?:string}>}
+   */
+  async function sendMemeCore(keyword) {
+    const target = config.allowUsers[0]
+    if (target === undefined) return { ok: false, note: '没有配置 allowUsers，不知道发给谁。' }
+
+    // 频率闸门：不是错误，是「这次先别发」。
+    const now = Date.now()
+    const gate = canSendMeme(now)
+    if (gate.ok !== true) {
+      writeLog('INFO', `表情闸门（${gate.reason}）：这次不发`)
+      return { ok: false, note: gate.note }
+    }
+
+    const picked = pickMeme(keyword)
+    if (picked === null) return { ok: false, note: `图库是空的（${config.memesDir} 里没找到图片）。` }
+
+    const shown = `${picked.label}/${picked.name}`
+    if (config.dryRun) {
+      writeLog('INFO', `[dryRun] 本应发图：${shown}`)
+      memeSentAt.push(now)
+      saveMemeState()
+      return { ok: true, sent: shown }
+    }
+    try {
+      const fileUrl = `file:///${picked.path.replace(/\\/g, '/')}`
+      await client.call('send_private_msg', {
+        user_id: Number(target),
+        message: [{ type: 'image', data: { file: fileUrl } }],
+      })
+      memeSentAt.push(now)
+      saveMemeState()
+      writeLog('INFO', `→ QQ ${target}：[图片] ${shown}`)
+      return { ok: true, sent: shown }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      writeLog('ERROR', `发表情失败：${msg}`)
+      return { ok: false, note: `图没发出去：${msg}` }
+    }
+  }
+
+  /**
+   * 对外开口子：`ctx.get('qqMeme')` 拿到本对象。
+   *
+   * 给 dsh-alive 用的 —— 她想主动找他说话的时候，可以先甩一张表情。
+   * canSend() 是给调用方判断「现在发会不会被闸门拦」的，省得白掷骰子。
+   */
+  if (typeof ctx.provide === 'function') {
+    ctx.provide('qqMeme', {
+      send: (keyword) => sendMemeCore(keyword),
+      canSend: () => canSendMeme(Date.now()).ok === true,
+    })
+  }
+
   ctx.inject(['tools'], (scope) => {
     scope.effect(
       () =>
@@ -1339,42 +1402,8 @@ export function apply(ctx, rawConfig) {
                 : [{ type: 'text', text: value?.note ?? '没发出去。' }],
           },
           async execute(args) {
-            const target = config.allowUsers[0]
-            if (target === undefined) return { ok: false, note: '没有配置 allowUsers，不知道发给谁。' }
-
-            // 频率闸门：不是错误，是"这次先别发"。模型看到这个就当没这回事，继续说自己的话。
-            const now = Date.now()
-            const gate = canSendMeme(now)
-            if (gate.ok !== true) {
-              writeLog('INFO', `表情闸门（${gate.reason}）：这次不发`)
-              return { ok: false, note: gate.note }
-            }
-
-            const picked = pickMeme(args?.keyword)
-            if (picked === null) return { ok: false, note: `图库是空的（${config.memesDir} 里没找到图片）。` }
-
-            const shown = `${picked.label}/${picked.name}`
-            if (config.dryRun) {
-              writeLog('INFO', `[dryRun] 本应发图：${shown}`)
-              memeSentAt.push(now)
-              saveMemeState()
-              return { ok: true, sent: shown }
-            }
-            try {
-              const fileUrl = `file:///${picked.path.replace(/\\/g, '/')}`
-              await client.call('send_private_msg', {
-                user_id: Number(target),
-                message: [{ type: 'image', data: { file: fileUrl } }],
-              })
-              memeSentAt.push(now)
-              saveMemeState()
-              writeLog('INFO', `→ QQ ${target}：[图片] ${shown}`)
-              return { ok: true, sent: shown }
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err)
-              writeLog('ERROR', `发表情失败：${msg}`)
-              return { ok: false, note: `图没发出去：${msg}` }
-            }
+            // 真正的活儿在 sendMemeCore —— 和 alive 走的���个入口，闸门、记账完全一致。
+            return sendMemeCore(args?.keyword)
           },
         }),
       'dsh-qq-bot: send_meme',

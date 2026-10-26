@@ -1,7 +1,7 @@
 /**
  * dsh-alive 判定核心的单元测试。纯函数，不需要 DSH。
  *
- *   node --test "test/policy.test.mjs"
+ *   node --test "test/*.test.mjs"     （在 dsh-alive 目录下跑）
  */
 
 import { test } from 'node:test'
@@ -292,4 +292,63 @@ test('parseTime: ISO / 毫秒 / 垃圾输入', () => {
   assert.equal(parseTime(1234567890), 1234567890)
   assert.equal(parseTime(null), null)
   assert.equal(parseTime('不是时间'), null)
+})
+
+/* ───────────── 情绪驱动的豁免（G1/G2/G7/G8 可绕，其余永远不绕）───────────── */
+
+test('情绪豁免：突破每小时/每天配额（exempt.quota）', () => {
+  const st = baseState({
+    control: { enabled: true },
+    quota: { hourCount: 99, dayCount: 99, lastProactiveAt: null, consecutiveIgnored: 0 },
+  });
+  const loop = { kind: 'food', attempts: 0 }
+  const plain = checkGate(st, CFG, loop, { now: ENV.now, agentRunning: false, agentExists: true })
+  assert.equal(plain.pass, false)
+  assert.ok(plain.failed.includes('G7:hour-quota'))
+
+  const exempted = checkGate(st, CFG, loop, {
+    now: ENV.now, agentRunning: false, agentExists: true,
+    exempt: { quota: true },
+  })
+  assert.equal(exempted.failed.includes('G7:hour-quota'), false)
+  assert.equal(exempted.failed.includes('G8:day-quota'), false)
+})
+
+test('情绪豁免：连总开关都能绕（exempt.master）', () => {
+  const st = baseState({ control: { enabled: false } })
+  const loop = { kind: 'food', attempts: 0 }
+  const plain = checkGate(st, CFG, loop, { now: ENV.now, agentRunning: false, agentExists: true })
+  assert.ok(plain.failed.includes('G1:disabled'))
+
+  const exempted = checkGate(st, CFG, loop, {
+    now: ENV.now, agentRunning: false, agentExists: true,
+    exempt: { master: true },
+  })
+  assert.equal(exempted.failed.includes('G1:disabled'), false)
+})
+
+test('情绪豁免：深夜 / 他说过「别发了」/ 静音 永远不绕', () => {
+  // 深夜（deepNightHours 默认 03:00-06:00）+ 当天封顶 + 静音，三个一起来
+  const deepNight = Date.parse('2026-10-26T04:00:00+08:00')
+  const st = baseState({
+    control: {
+      enabled: true,
+      mutedUntil: new Date(deepNight + 3600_000).toISOString(),
+      dayQuotaSuspendedUntil: new Date(deepNight + 20 * 3600_000).toISOString(),
+    },
+  })
+  const loop = { kind: 'food', attempts: 0 }
+  const CFG_NIGHT = { ...CFG, deepNightHours: ['03:00-06:00'] }
+  const gate = checkGate(st, CFG_NIGHT, loop, {
+    now: deepNight,
+    agentRunning: false,
+    agentExists: true,
+    exempt: { quota: true, master: true },
+  })
+  assert.equal(gate.pass, false, '两个豁免都开着也不许在深夜/封顶/静音时开口')
+  assert.ok(gate.failed.includes('G3:muted'), '静音必须还拦着')
+  assert.ok(
+    gate.failed.some((f) => f.startsWith('G11')),
+    '深夜必须还拦着',
+  )
 })
