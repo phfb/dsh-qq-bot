@@ -86,6 +86,62 @@ function Format-Ago($iso) {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 自发开口为什么还没动（跟 lib/policy.mjs 的 buildFreeLoop 一一对应）
+#
+# 返回 $null = 三个门槛都过了，她随时可以自己找话；
+# 返回一句话 = 卡在哪一条，直接贴到「现在为什么不会发」里。
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Get-FreeTalkBlockReason($st, $nowTime) {
+  $silenceNeed = 15
+  if ($cfg.ContainsKey('freeTalkSilenceMin')) { $silenceNeed = [int]$cfg['freeTalkSilenceMin'] }
+  $gapNeed = 45
+  if ($cfg.ContainsKey('freeTalkGapMin')) { $gapNeed = [int]$cfg['freeTalkGapMin'] }
+  $moodNeed = 45
+  if ($cfg.ContainsKey('freeTalkMoodPercent')) { $moodNeed = [int]$cfg['freeTalkMoodPercent'] }
+
+  $lastQqT = $null
+  if ($st.focus) { $lastQqT = ConvertTo-LocalTime $st.focus.lastQqAt }
+  if ($null -eq $lastQqT) { return '自发开口在待命：你还没在 QQ 里说过话，它不知道该从哪一刻算你安静了' }
+  $idle = ($nowTime - $lastQqT).TotalMinutes
+  if ($idle -lt $silenceNeed) {
+    return "自发开口还没动：你 $([int]$idle) 分钟前刚在 QQ 说过话，要安静满 $silenceNeed 分钟"
+  }
+
+  $lastFree = $null
+  foreach ($lp in @($st.loops)) {
+    if (-not $lp) { continue }
+    if ($lp.source -ne 'free') { continue }
+    $t = ConvertTo-LocalTime $lp.createdAt
+    if ($null -ne $t -and ($null -eq $lastFree -or $t -gt $lastFree)) { $lastFree = $t }
+  }
+  if ($null -ne $lastFree) {
+    $since = ($nowTime - $lastFree).TotalMinutes
+    if ($since -lt $gapNeed) {
+      return "自发开口还没动：上次自发是 $([int]$since) 分钟前，两次之间至少隔 $gapNeed 分钟"
+    }
+  }
+
+  $dims = [ordered]@{ missing = '想他'; lust = '涩涩'; boredom = '闲得慌'; worry = '担心'; jealousy = '吃醋' }
+  $topKey = ''
+  $topVal = 0.0
+  if ($st.mood) {
+    foreach ($k in $dims.Keys) {
+      if ($k -eq 'lust' -and -not $script:lustOnNow) { continue }
+      $v = [double]$st.mood.$k
+      if ($v -gt $topVal) { $topVal = $v; $topKey = $k }
+    }
+  }
+  $topPct = [int][math]::Round($topVal * 100)
+  if ($topPct -lt $moodNeed) {
+    $name = if ($topKey) { $dims[$topKey] } else { '还没攒起来' }
+    return "自发开口还没动：情绪最高的一维是「$name」$topPct%，还没到 $moodNeed%"
+  }
+
+  return $null
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 状态：读 alive-state.json（插件每次投递 / 收消息 / 落盘都会刷新它）
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -183,7 +239,16 @@ function Get-AliveStatus {
   # 现在为什么不会发：跟插件里那些闸门对齐，能算的都在这里算
   $blocked = @()
   if (-not $enabled) { $blocked += '总开关关着（上面「启用活人感」没勾）' }
-  if ($openNames.Count -eq 0) { $blocked += '没有挂着的念头 —— 要说出「我去洗澡」这类带离开意思的话才会挂上一件' }
+  if ($openNames.Count -eq 0) {
+    $freeOn = $true
+    if ($cfg.ContainsKey('freeTalkEnabled')) { $freeOn = $cfg['freeTalkEnabled'] -ne $false }
+    if (-not $freeOn) {
+      $blocked += '没有挂着的念头，自发开口也关着（下面「自发开口」那组没勾）—— 要说「我去洗澡」这类话才会挂上一件'
+    } else {
+      $why = Get-FreeTalkBlockReason $st $nowTime
+      if ($why) { $blocked += $why }
+    }
+  }
   if ($muted) { $blocked += "静音中，到 $(Format-Clock $mutedUntil)（$muteReason）" }
   if ($lastWasStop) { $blocked += '上次说的是「别发了」，要你回一句「好了 / 聊会儿」才解' }
   if ($stopToday) { $blocked += '今天说过「别发了」，封顶到 24:00' }
@@ -626,6 +691,20 @@ Add-Number $g.Box ([ref]$inner) 'maxPerHour' '每小时最多几次' 'maxPerHour
 Add-Number $g.Box ([ref]$inner) 'maxPerDay' '每天最多几次' 'maxPerDay' 1 50 1 0 4
 Add-Number $g.Box ([ref]$inner) 'threshold' '打分阈值（越高越少说话）' 'threshold' 0 100 5 0 55
 Add-Number $g.Box ([ref]$inner) 'maxAttempts' '同一件事最多追几次' 'maxAttempts' 1 2 1 0 2
+$g.Box.Height = $inner + 8
+$y += $g.Box.Height + 10
+
+# ── 自发开口（没有念头也能找你）─────────────────────────────────────────────
+# 2026-10-26 晚上加。原来整条投递链只认「悬着的事」（open loop），
+# 而悬着的事只有你说「我去洗澡」这类带离开意思的话才会挂上 ——
+# 你一句「好」结束对话之后，所有念头被关成 answered，她一整晚可以一声不吭，
+# 想他 100% 也没用。这一组把那个缺口补上：不靠事件，靠情绪攒出来的劲。
+$g = New-Group '自发开口（没有悬着的事也能找你）' '三个门槛都过了才开口：你安静够久、距上次自发够久、最主导的那维情绪到线。造出来的念头一样要过静音 / 深夜 / 配额 / 冷却，一条都绕不过。' $y
+$inner = $g.Inner
+Add-Bool $g.Box ([ref]$inner) 'freeTalkEnabled' '启用自发开口（关掉就退回「只在你走了之后才追」）' 'freeTalkEnabled' $true
+Add-Number $g.Box ([ref]$inner) 'freeTalkSilenceMin' '你在 QQ 安静多久她才自己找话（分钟）' 'freeTalkSilenceMin' 1 600 1 0 15
+Add-Number $g.Box ([ref]$inner) 'freeTalkGapMin' '两次自发之间至少隔（分钟）' 'freeTalkGapMin' 1 1440 5 0 45
+Add-Number $g.Box ([ref]$inner) 'freeTalkMoodPercent' '情绪到多少才自发（%）' 'freeTalkMoodPercent' 0 100 5 0 45
 $g.Box.Height = $inner + 8
 $y += $g.Box.Height + 10
 

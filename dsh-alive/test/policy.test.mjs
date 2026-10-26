@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  buildFreeLoop,
   checkGate,
   detectControl,
   extractLoopIntent,
@@ -18,6 +19,7 @@ import {
   renderImpulse,
   scoreImpulse,
 } from '../lib/policy.mjs'
+import { LUST_ENABLED } from '../lib/mood.mjs'
 
 /* ── 抽取 ── */
 
@@ -351,4 +353,114 @@ test('情绪豁免：深夜 / 他说过「别发了」/ 静音 永远不绕', ()
     gate.failed.some((f) => f.startsWith('G11')),
     '深夜必须还拦着',
   )
+})
+
+/* ── 自发念头：没有 open loop 也能开口（2026-10-26 补的缺口） ── */
+
+const FREE_NOW = Date.parse('2026-10-26T23:00:00+08:00')
+
+/** 一个"他 30 分钟没在 QQ 说话、想他满格"的现场。 */
+function freeState(over = {}) {
+  return {
+    focus: { lastQqAt: new Date(FREE_NOW - 30 * 60_000).toISOString() },
+    mood: { missing: 1, jealousy: 0, warmth: 0, worry: 0, boredom: 0.3, lust: 0.7, annoyanceDebt: 0 },
+    loops: [],
+    stats: {},
+    rhythm: { samples: 0, hourly: [] },
+    quota: {},
+    control: { enabled: true },
+    ...over,
+  }
+}
+
+const FREE_CFG = {
+  freeTalkEnabled: true,
+  freeTalkSilenceMin: 15,
+  freeTalkGapMin: 45,
+  freeTalkMoodPercent: 45,
+  staleMin: 30,
+  targetSession: 'auto',
+  lustModeEnabled: true,
+}
+
+test('buildFreeLoop: 安静够久 + 情绪够 → 造一条 kind=free', () => {
+  const loop = buildFreeLoop(freeState(), FREE_CFG, FREE_NOW)
+  assert.ok(loop, '应该造出一条')
+  assert.equal(loop.kind, 'free')
+  assert.equal(loop.source, 'free')
+  assert.equal(loop.status, 'open')
+  assert.equal(loop.quote, '', '自发念头没有"他说的原话"')
+  assert.ok(loop.freePercent >= 45)
+  assert.equal(loop.attempts, 0)
+  assert.ok(parseTime(loop.expectedBackAt) <= FREE_NOW, '到点即到期：现在就该能投')
+  assert.ok(parseTime(loop.hardDeadlineAt) > FREE_NOW, '得留投递窗口，不能立刻自我作废')
+})
+
+test('buildFreeLoop: 总开关关着就不造', () => {
+  assert.equal(buildFreeLoop(freeState(), { ...FREE_CFG, freeTalkEnabled: false }, FREE_NOW), null)
+})
+
+test('buildFreeLoop: 他刚说完话不插嘴', () => {
+  const st = freeState({ focus: { lastQqAt: new Date(FREE_NOW - 5 * 60_000).toISOString() } })
+  assert.equal(buildFreeLoop(st, FREE_CFG, FREE_NOW), null)
+})
+
+test('buildFreeLoop: 情绪没到线不造', () => {
+  const st = freeState({
+    mood: { missing: 0.2, jealousy: 0, warmth: 0, worry: 0, boredom: 0.3, lust: 0.1, annoyanceDebt: 0 },
+  })
+  assert.equal(buildFreeLoop(st, FREE_CFG, FREE_NOW), null)
+})
+
+test('buildFreeLoop: 两次自发要隔开', () => {
+  const st = freeState({
+    loops: [{ source: 'free', status: 'answered', createdAt: new Date(FREE_NOW - 10 * 60_000).toISOString() }],
+  })
+  assert.equal(buildFreeLoop(st, FREE_CFG, FREE_NOW), null)
+
+  const old = freeState({
+    loops: [{ source: 'free', status: 'answered', createdAt: new Date(FREE_NOW - 90 * 60_000).toISOString() }],
+  })
+  assert.ok(buildFreeLoop(old, FREE_CFG, FREE_NOW), '隔够久就该再开口')
+})
+
+test('buildFreeLoop: 从没在 QQ 说过话就不乱开口', () => {
+  assert.equal(buildFreeLoop(freeState({ focus: {} }), FREE_CFG, FREE_NOW), null)
+})
+
+test('buildFreeLoop: 涩涩没启用时不吃涩涩那一维', () => {
+  const st = freeState({
+    mood: { missing: 0.1, jealousy: 0, warmth: 0, worry: 0, boredom: 0.1, lust: 0.95, annoyanceDebt: 0 },
+  })
+  // 面板上那颗正式开关没勾 → 无论源码怎么设，涩涩都不参与
+  assert.equal(buildFreeLoop(st, { ...FREE_CFG, lustModeEnabled: false }, FREE_NOW), null)
+
+  // 勾上了，还要看源码里的 LUST_ENABLED —— 发布版默认 false，
+  // 所以这里按它的实际取值断言，两种默认值下测试都要成立
+  const on = buildFreeLoop(st, FREE_CFG, FREE_NOW)
+  if (LUST_ENABLED) {
+    assert.ok(on)
+    assert.equal(on.freeMood, 'lust')
+  } else {
+    assert.equal(on, null, 'LUST_ENABLED=false 时涩涩不该驱动自发念头')
+  }
+})
+
+test('scoreImpulse: 自发念头在情绪满的时候过得了默认阈值', () => {
+  const st = freeState()
+  const loop = buildFreeLoop(st, FREE_CFG, FREE_NOW)
+  const { score } = scoreImpulse(st, loop, { threshold: 30, lustModeEnabled: true }, FREE_NOW)
+  assert.ok(score >= 30, `分数太低会永远发不出去：${score}`)
+})
+
+test('maxAttemptsFor: 自发念头只追一次', () => {
+  assert.equal(maxAttemptsFor('free'), 1)
+})
+
+test('renderImpulse: 自发念头说的是"他没说话"，不是引用一句空话', () => {
+  const loop = { kind: 'free', what: '想他了，没理由也想说一句', freePercent: 100, moodHint: 'clingy' }
+  const text = renderImpulse(loop, { silentMin: 42 })
+  assert.ok(text.includes('42 分钟'), '应该说清安静了多久')
+  assert.ok(!text.includes('「」'), '不该出现空引号（他根本没说过话）')
+  assert.ok(text.includes('想他了'), '要把驱动它的那股情绪带上')
 })

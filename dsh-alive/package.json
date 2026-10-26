@@ -1,9 +1,9 @@
 {
   "name": "dsh-alive",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "DSH 宿主插件：她心里挂着没落地的事到期时，由她自己主动开口一次。",
+  "description": "DSH 宿主插件：她心里挂着没落地的事到期了、或者闲着攒够了情绪，由她自己主动开口一次。",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",

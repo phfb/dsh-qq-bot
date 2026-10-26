@@ -128,6 +128,20 @@ export const DEFAULTS = Object.freeze({
    */
   memeChancePercent: 40,
 
+  /**
+   * 自发开口总开关。
+   *
+   * 原来整条投递链只认「悬着的事」（open loop），而没有 loop 就永远不开口。
+   * 打开这个之后：他安安静静待着、情绪攒够了，她也能自己找话。
+   */
+  freeTalkEnabled: true,
+  /** 他在 QQ 里安静多久，才允许自发开口（分钟）。 */
+  freeTalkSilenceMin: 15,
+  /** 两次自发之间至少隔多久（分钟）。自发比"他说要走"更轻，别太密。 */
+  freeTalkGapMin: 45,
+  /** 最主导的那一维情绪到这个百分比，才够自发开口的劲。 */
+  freeTalkMoodPercent: 45,
+
   /** 状态文件目录。写死，别用 volatile。 */
   dataDir: join(homedir(), '.dsh-qq-bot'),
 })
@@ -196,6 +210,10 @@ export function parseConfig(raw) {
     emotionBypassQuota: input.emotionBypassQuota !== false,
     emotionBypassMaster: input.emotionBypassMaster === true,
     memeChancePercent: num(input.memeChancePercent, DEFAULTS.memeChancePercent, { min: 0, max: 100 }),
+    freeTalkEnabled: input.freeTalkEnabled !== false,
+    freeTalkSilenceMin: num(input.freeTalkSilenceMin, DEFAULTS.freeTalkSilenceMin, { min: 1, max: 600 }),
+    freeTalkGapMin: num(input.freeTalkGapMin, DEFAULTS.freeTalkGapMin, { min: 1, max: 1440 }),
+    freeTalkMoodPercent: num(input.freeTalkMoodPercent, DEFAULTS.freeTalkMoodPercent, { min: 0, max: 100 }),
     dataDir: typeof input.dataDir === 'string' && input.dataDir.trim() !== '' ? input.dataDir.trim() : DEFAULTS.dataDir,
   }
 

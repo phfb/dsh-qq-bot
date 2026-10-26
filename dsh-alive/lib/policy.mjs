@@ -214,6 +214,9 @@ export function maxAttemptsFor(kind) {
     case 'promise':
     case 'interrupted':
       return 1
+    // 自发念头（没事件、纯粹自己想说话）：一次就够，追第二遍像催命
+    case 'free':
+      return 1
     default:
       return 2
   }
@@ -328,6 +331,97 @@ function rhythmPenaltyFor(rhythm, now) {
   return 0
 }
 
+/* ──────────────────────── 4.5 自发念头（没事件也能开口） ──────────────────────── */
+
+/**
+ * 情绪维度 → 自发念头的语气 + 一句给人看的话。
+ *
+ * 顺序就是打分时的优先级：想他第一，其次是想黏、闲、担心、吃醋。
+ */
+const FREE_MOODS = [
+  { key: 'missing', hint: 'clingy', what: '想他了，没理由也想说一句' },
+  { key: 'lust', hint: 'flirty', what: '有点黏，想凑过去' },
+  { key: 'boredom', hint: 'light', what: '闲得慌，想找点话说' },
+  { key: 'worry', hint: 'worried', what: '有点担心他' },
+  { key: 'jealousy', hint: 'pouty', what: '有点酸，想让他理我' },
+]
+
+/**
+ * 「没有念头也能开口」：他安安静静待着，光靠情绪攒出一条自发念头。
+ *
+ * 2026-10-26 晚上加的。原来整条投递链只认 open loop，而 loop 只有
+ * 「他说了带离开意思的话」才会挂上（见 extractLoopIntent）。于是：
+ * 他一句「好」结束对话 → 所有 loop 被关成 answered → 她一整晚一声不吭，
+ * 想他 100% 也没用，因为 tryDeliver 第一行就是「due 为空就 return」。
+ *
+ * 这一条补的就是那个缺口：不靠事件，靠自己攒起来的情绪。
+ *
+ * 三重门槛，缺一不进：
+ *   ① 他在 QQ 里已经安静够久（freeTalkSilenceMin）——刚聊完不插嘴
+ *   ② 距上次自发够久（freeTalkGapMin）——自发比"他说要走"轻，别太密
+ *   ③ 最主导的那一维情绪到线（freeTalkMoodPercent）
+ *
+ * 闸门（静音 / 深夜 / 配额 / 冷却 / 他刚说过话）不在这里判 —— 造出来的
+ * 这条 loop 会跟别的 loop 一样过 checkGate，一个都绕不过去。
+ *
+ * @param {object} state alive-state
+ * @param {object} config 规范化配置
+ * @param {number} now
+ * @returns {null | object} kind='free' 的 loop；没到条件返回 null
+ */
+export function buildFreeLoop(state, config, now) {
+  if (config?.freeTalkEnabled !== true) return null
+
+  // 一次都没在 QQ 里说过话 → 不知道他什么时候在，别乱开口
+  const lastQq = parseTime(state?.focus?.lastQqAt)
+  if (lastQq === null) return null
+  const silenceMin = Number(config.freeTalkSilenceMin) || 15
+  if (now - lastQq < silenceMin * 60_000) return null
+
+  // 两次自发之间至少隔这么久（自发比"他说要走"轻，别太密）
+  const gapMin = Number(config.freeTalkGapMin) || 45
+  let lastFree = null
+  for (const loop of Array.isArray(state?.loops) ? state.loops : []) {
+    if (loop?.source !== 'free') continue
+    const at = parseTime(loop.createdAt)
+    if (at !== null && (lastFree === null || at > lastFree)) lastFree = at
+  }
+  if (lastFree !== null && now - lastFree < gapMin * 60_000) return null
+
+  // 情绪门槛：取最主导的一维（涩涩两层开关没全亮就不参与）
+  const lustOn = LUST_ENABLED && config?.lustModeEnabled === true
+  let top = null
+  for (const m of FREE_MOODS) {
+    if (m.key === 'lust' && !lustOn) continue
+    const v = clamp01(Number(state?.mood?.[m.key]) || 0)
+    if (top === null || v > top.v) top = { ...m, v }
+  }
+  if (top === null) return null
+  const need = (Number(config.freeTalkMoodPercent) || 45) / 100
+  if (top.v < need) return null
+
+  // 到点即到期（现在就想说），但给 staleMin 这么长的时间窗口让人投
+  const hard = now + (Number(config.staleMin) || 30) * 60_000
+  return {
+    id: `lp_free_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    kind: 'free',
+    what: top.what,
+    quote: '',
+    createdAt: new Date(now).toISOString(),
+    expectedBackAt: new Date(now).toISOString(),
+    hardDeadlineAt: new Date(hard).toISOString(),
+    confidence: 0.85,
+    source: 'free',
+    status: 'open',
+    attempts: 0,
+    lastAttemptAt: null,
+    moodHint: top.hint,
+    sessionId: config.targetSession,
+    freeMood: top.key,
+    freePercent: Math.round(top.v * 100),
+  }
+}
+
 /* ────────────────────────────── 5. 语气与念头 ────────────────────────────── */
 
 /** 每种 mood 怎么说话。 */
@@ -352,6 +446,31 @@ const MOOD_LINE = {
  */
 export function renderImpulse(loop, ctx) {
   const mood = MOOD_LINE[ctx?.moodHint ?? loop?.moodHint] ?? MOOD_LINE.flat
+
+  // 自发念头：没有"他说了要走"这回事，纯粹是她自己想说话
+  if (loop?.kind === 'free') {
+    const lines = [
+      '[你心里冒出来的话]',
+      '',
+      `他已经 ${ctx?.silentMin ?? '?'} 分钟没在 QQ 上跟你说话了，也没交代去哪儿。`,
+      `你心里那点「${String(loop?.what ?? '想他')}」攒到了 ${loop?.freePercent ?? '?'}%。`,
+    ]
+    if (ctx?.timeNote) lines.push(ctx.timeNote)
+    if (ctx?.recallNote) lines.push(ctx.recallNote)
+    lines.push(
+      '',
+      `你现在想主动开口。${mood}`,
+      '',
+      '要求：',
+      '- 用你自己的语气说，一两句话，不超过 40 个字。',
+      '- 这是没人叫你、你自己憋不住想说话 —— 别说"你怎么不回我""我等你半天了"这种讨债的话，也别解释你为什么突然开口。',
+      '- 不要问"在吗""你在干嘛"这种空话，要有具体的东西：他手头那件事、你今天怎么样、吃了什么。',
+      '- 不要用括号写动作，不要写旁白。',
+      '- 这一轮只说话：不要调用任何工具，不要读写文件。',
+    )
+    return lines.join('\n')
+  }
+
   const quote = String(loop?.quote ?? '').slice(0, 40)
   const lines = [
     '[你心里冒出来的话]',

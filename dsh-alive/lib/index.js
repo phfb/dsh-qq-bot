@@ -20,6 +20,7 @@ import { homedir } from 'node:os'
 
 import { parseConfig } from './config.js'
 import {
+  buildFreeLoop,
   checkGate,
   detectControl,
   extractLoopIntent,
@@ -96,6 +97,11 @@ function pickConfigForFile(config) {
     emotionBypassQuota: config.emotionBypassQuota,
     emotionBypassMaster: config.emotionBypassMaster,
     memeChancePercent: config.memeChancePercent,
+    // 自发开口那一组（没有念头也能找你）
+    freeTalkEnabled: config.freeTalkEnabled,
+    freeTalkSilenceMin: config.freeTalkSilenceMin,
+    freeTalkGapMin: config.freeTalkGapMin,
+    freeTalkMoodPercent: config.freeTalkMoodPercent,
     dataDir: config.dataDir,
   }
 }
@@ -491,7 +497,10 @@ export function apply(ctx, rawConfig) {
     } catch { /* 快照坏了就当没有 */ }
   }
 
-  writeLog('INFO', `启动 enabled=${state.control.enabled} dryRun=${config.dryRun} target=${config.targetSession}`)
+  const freeTag = config.freeTalkEnabled
+    ? `开（安静满 ${config.freeTalkSilenceMin} 分 / 情绪 ${config.freeTalkMoodPercent}% / 间隔 ${config.freeTalkGapMin} 分）`
+    : '关'
+  writeLog('INFO', `启动 enabled=${state.control.enabled} dryRun=${config.dryRun} target=${config.targetSession} 自发开口=${freeTag}`)
 
   /* ───────────── 采集 ───────────── */
 
@@ -956,12 +965,29 @@ export function apply(ctx, rawConfig) {
     }
 
     // 没到点的不算候选
-    const due = state.loops.filter((l) => l.status === 'open' && now >= (parseTime(l.expectedBackAt) ?? Infinity))
-    if (due.length === 0) return
+    let due = state.loops.filter((l) => l.status === 'open' && now >= (parseTime(l.expectedBackAt) ?? Infinity))
+
+    // 一条悬着的事都没有 → 看看情绪够不够自己造一条。
+    //
+    // 2026-10-26 晚上补的缺口：原来这里直接 return，所以「他一句"好"结束对话 →
+    // 所有 loop 都关成 answered → 她一整晚一声不吭」是必然结果，想他 100% 也没用。
+    // 自发念头不靠事件，靠情绪；造出来之后跟别的 loop 一样过闸门、一样打分，
+    // 该被静音 / 深夜 / 配额 / 冷却拦住的时候一条都绕不过去。
+    let freeLoop = null
+    if (due.length === 0) {
+      freeLoop = buildFreeLoop(state, config, now)
+      if (freeLoop === null) return
+      state.loops.push(freeLoop)
+      if (state.loops.length > 40) state.loops = state.loops.slice(-40)
+      due = [freeLoop]
+      writeLog('INFO', `没有悬着的事，靠情绪攒出一条自发念头：${freeLoop.what}（${freeLoop.freePercent}%）`)
+    }
 
     // 逐个过闸门 + 打分，取最高分
     /** @type {{loop:any, score:number, parts:any} | null} */
     let best = null
+    /** 自发念头被拦的原因。攒着写日志 —— 面板上"为什么还不发"要用得上。 */
+    const freeFailed = []
     for (const loop of due) {
       const gate = checkGate(state, config, loop, {
         now,
@@ -974,15 +1000,35 @@ export function apply(ctx, rawConfig) {
           master: config.emotionBypassMaster === true,
         },
       })
-      if (!gate.pass) continue
+      if (!gate.pass) {
+        if (loop === freeLoop) freeFailed.push(...gate.failed)
+        continue
+      }
       const { score, parts } = scoreImpulse(state, loop, config, now)
-      if (score < config.threshold) continue
+      if (score < config.threshold) {
+        if (loop === freeLoop) freeFailed.push(`分数 ${score} < 阈值 ${config.threshold}`)
+        continue
+      }
       if (best === null || score > best.score) best = { loop, score, parts }
     }
-    if (best === null) return
+    if (best === null) {
+      if (freeLoop !== null) {
+        // 留着但标成 stale：这一条不投，但要让 buildFreeLoop 的 gapMin 记住"刚试过了"，
+        // 否则每跳心跳都会重造一条、重算一遍、再拦一遍，日志能刷满。
+        freeLoop.status = 'stale'
+        freeLoop.closedAt = new Date(now).toISOString()
+        freeLoop.staleReason = freeFailed.join(', ') || '分数不够'
+        save()
+        writeLog('INFO', `自发的念头这次没投：${freeLoop.staleReason}`)
+      }
+      return
+    }
 
     const { loop, score, parts } = best
-    const silentMin = Math.round((now - (parseTime(loop.createdAt) ?? now)) / 60_000)
+    // 自发念头没有"他说了要走"这回事，沉默的时间要从他上次在 QQ 说话算
+    const silentMin = loop.kind === 'free'
+      ? Math.round((now - (parseTime(state.focus.lastQqAt) ?? now)) / 60_000)
+      : Math.round((now - (parseTime(loop.createdAt) ?? now)) / 60_000)
     const text = renderImpulse(loop, {
       moodHint: moodModule.moodHintOf(state.mood, { lust: lustConfig() }),
       silentMin,
@@ -1120,6 +1166,60 @@ export function apply(ctx, rawConfig) {
 
   /* ───────────── 设置页 API（面板画在 dsh-qq-bot 那一页） ───────────── */
 
+  /**
+   * 自发开口为什么还没动 —— 全通了返回 null（意思是"她现在随时可以自己找话"）。
+   *
+   * 跟 buildFreeLoop 的判定一一对应，只是这里不造 loop、只解释原因，
+   * 好让设置面板把"卡在哪一条"直接摊给他看，不用他猜。
+   */
+  function freeTalkBlockReason(now) {
+    const lastQq = parseTime(state.focus.lastQqAt)
+    if (lastQq === null) return '自发开口在待命：你还没在 QQ 里说过话，它不知道该几点算你安静了'
+
+    const idleMin = Math.round((now - lastQq) / 60_000)
+    if (idleMin < config.freeTalkSilenceMin) {
+      return `自发开口还没动：你 ${idleMin} 分钟前刚在 QQ 说过话，要安静满 ${config.freeTalkSilenceMin} 分钟`
+    }
+
+    let lastFree = null
+    for (const loop of state.loops) {
+      if (loop?.source !== 'free') continue
+      const at = parseTime(loop.createdAt)
+      if (at !== null && (lastFree === null || at > lastFree)) lastFree = at
+    }
+    if (lastFree !== null && now - lastFree < config.freeTalkGapMin * 60_000) {
+      const since = Math.round((now - lastFree) / 60_000)
+      return `自发开口还没动：上次自发是 ${since} 分钟前，两次之间至少隔 ${config.freeTalkGapMin} 分钟`
+    }
+
+    // 情绪：跟 buildFreeLoop 一样取最主导的一维（涩涩要两层开关全亮）
+    const lustOn = moodModule.LUST_ENABLED === true && config.lustModeEnabled === true
+    const dims = [
+      ['missing', '想他'],
+      ['lust', '涩涩'],
+      ['boredom', '闲得慌'],
+      ['worry', '担心'],
+      ['jealousy', '吃醋'],
+    ]
+    let topKey = ''
+    let topLabel = ''
+    let topVal = 0
+    for (const [key, label] of dims) {
+      if (key === 'lust' && !lustOn) continue
+      const v = Number(state.mood[key]) || 0
+      if (v > topVal) {
+        topVal = v
+        topKey = key
+        topLabel = label
+      }
+    }
+    const need = config.freeTalkMoodPercent / 100
+    if (topVal < need) {
+      return `自发开口还没动：情绪最高的一维是「${topLabel || topKey}」${Math.round(topVal * 100)}%，还没到 ${config.freeTalkMoodPercent}%`
+    }
+    return null
+  }
+
   /** 一条人能看懂的状态快照。 */
   function collectState() {
     const now = Date.now()
@@ -1137,7 +1237,14 @@ export function apply(ctx, rawConfig) {
     const blocked = []
     if (!state.control.enabled) blocked.push('总开关关着')
     if (config.dryRun) blocked.push('dryRun 开着：只算不投')
-    if (openLoops.length === 0) blocked.push('没有挂着的念头（要说出「我去洗澡」这类话才会挂上一件）')
+    if (openLoops.length === 0) {
+      if (config.freeTalkEnabled !== true) {
+        blocked.push('没有挂着的念头，自发开口也关着（「自发开口」那组没勾）—— 要说「我去洗澡」这类话才会挂上一件')
+      } else {
+        const why = freeTalkBlockReason(now)
+        if (why !== null) blocked.push(why)
+      }
+    }
     if (muted) blocked.push(`静音中，到 ${fmtClock(state.control.mutedUntil)}（${state.control.muteReason ?? '—'}）`)
     if (stopToday) blocked.push(`今天说过「别发了」，封顶到 24:00`)
     if (dayLeft <= 0) blocked.push(`今日额度用完（${dayCount}/${config.maxPerDay}）`)
