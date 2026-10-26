@@ -219,8 +219,6 @@ Copy-Item bot-config.example.json bot-config.json
 | 状态 | 怎么到 | 面板上什么样 |
 |---|---|---|
 
-| 开关 | 在哪 | 默认 | 管什么 |
-|---|---|---|---|
 | ① 整组不存在 | `LUST_ENABLED`（`lib/mood.mjs` 顶上）保持 `false` | 设置窗口里根本没有「涩涩」这一组 |
 | ② 显示但滑条锁着 | `LUST_ENABLED = true`，面板上那颗正式开关**没勾** | 这一组露出来了，涩涩那行倍率滑条灰着、不可拖（按 1.0x 显示） |
 | ③ 可调且生效 | 再勾上组里第一行 `lustModeEnabled`（存 `alive-config.json`） | 滑条能拖了，拖完**立刻参与演化** |
