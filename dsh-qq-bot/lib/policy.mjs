@@ -135,7 +135,9 @@ export function extractText(message) {
         parts.push('[引用]')
         break
       case 'forward':
-        parts.push('[合并转发]')
+        // 带上 id：转发里的内容要靠它调 get_forward_msg 才展开得出来，
+        // 只写「[合并转发]」等于告诉模型「这儿有一坨东西，但我拿不到」
+        parts.push(data.id ? `[合并转发:${String(data.id)}]` : '[合并转发]')
         break
       default:
         // 不认识的消息段直接忽略，别把 JSON 丢给模型

@@ -37,6 +37,8 @@ import {
 import { OneBotClient, STATE } from './onebot.mjs'
 import { createImageStore } from './image-store.js'
 import { formatBytes, stampParts } from './images.mjs'
+import { socialEventToText } from './notice.mjs'
+import { ALLOWED_ACTIONS, checkAction, clampTarget } from './api-allowlist.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -1032,13 +1034,57 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * 社交事件（戳一戳 / 撤回 / 好友申请）：翻成一句话送进他的会话。
+   *
+   * 统一送进「他」的会话，不是事件发起人的 —— 这些是给她看、让她回应的消息，
+   * 源头本来就是他。陌生人加好友也一样：她是在他的会话里听说这件事。
+   * 这样也不会给陌生人开一个空会话出来。
+   */
+  async function handleSocialEvent(event) {
+    const text = socialEventToText(event, { selfUin: config.selfId })
+    if (text === null) return
+
+    const owner = String(config.allowUsers[0] ?? '')
+    if (owner === '') return
+    if (!runtime.forwarding) {
+      writeLog('INFO', `转发已关，社交事件只记日志：${text}`)
+      return
+    }
+
+    try {
+      const record = await ensureSession(owner)
+      const agent = record.agent
+      if (!agent || typeof agent.followup !== 'function') {
+        writeLog('WARN', `社交事件没送出去（会话没有 followup）：${text}`)
+        return
+      }
+      agent.followup(createQqUserMessage({
+        text,
+        images: [],
+        uin: owner,
+        messageId: event?.message_id ?? null,
+        at: new Date().toISOString(),
+      }))
+      writeLog('INFO', `← QQ 事件：${text}`)
+    } catch (err) {
+      writeLog('WARN', `社交事件处理失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   /** OneBot 事件总入口。 */
   function onOneBotEvent(event) {
     try {
-      if (event?.post_type !== 'message') return
-      if (event?.message_type !== 'private') return
-      if (event?.sub_type !== undefined && event.sub_type !== 'friend') return
-      void handleInbound(event)
+      if (event?.post_type === 'message') {
+        if (event?.message_type !== 'private') return
+        if (event?.sub_type !== undefined && event.sub_type !== 'friend') return
+        void handleInbound(event)
+        return
+      }
+      // 通知 / 请求：戳一戳、撤回、好友申请……
+      // 2026-10-26 之前这里第一行就是 `post_type !== 'message'` 直接 return，
+      // 于是这些事件全被扔掉，她那边永远收不到「他戳了你一下」。
+      void handleSocialEvent(event)
     } catch (err) {
       writeLog('ERROR', `事件入口失败：${err instanceof Error ? err.message : String(err)}`)
     }
@@ -1369,6 +1415,269 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  /* ── OneBot 通用口 + 常用语义工具 ────────────────────────────────────
+     白名单在 lib/api-allowlist.mjs：群聊类（77 个）、登录凭证、重启退出删好友
+     一律不在里面。「发给谁」的强制改写也只在 TARGET_CLAMPED 那几个上生效。 */
+
+  /** 他本人的 QQ 号 —— 工具里统一拿它当收件人。 */
+  function ownerUin() {
+    return String(config.allowUsers[0] ?? '')
+  }
+
+  /**
+   * 调一次 OneBot，把「没白名单 / 连不上 / 接口报错」统一收成 {ok:false, note}。
+   *
+   * 刻意不 throw：工具抛异常会把整轮对话打断，那比「这次没调成」严重得多。
+   */
+  async function callOneBot(action, params) {
+    const verdict = checkAction(action)
+    if (!verdict.ok) return { ok: false, note: verdict.reason }
+    const finalParams = clampTarget(action, params, ownerUin())
+    try {
+      const data = await client.call(action, finalParams)
+      return { ok: true, data }
+    } catch (err) {
+      return { ok: false, note: `调 ${action} 失败：${err instanceof Error ? err.message : String(err)}` }
+    }
+  }
+
+  /** 接口返回值压成一段文本（太长就截断，别把上下文撑爆）。 */
+  function jsonForModel(value, max = 4000) {
+    try {
+      const s = JSON.stringify(value ?? null)
+      if (s === undefined || s === 'null') return ''
+      return s.length > max ? `${s.slice(0, max)}…（后面截掉了）` : s
+    } catch {
+      return '（返回值没法序列化）'
+    }
+  }
+
+  /** 通用输出契约：不管成败都只回 ok / note / json 三样。 */
+  const CALL_OUTPUT = Object.freeze({
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ok: { type: 'boolean' },
+        note: { type: 'string' },
+        json: { type: 'string' },
+      },
+    },
+    render: (_args, value) => [{
+      type: 'text',
+      text: value?.ok === true ? (value?.json || '（接口没有返回内容）') : (value?.note ?? '没调成。'),
+    }],
+  })
+
+  /** 除 send_meme 之外的那些工具。 */
+  function buildExtraTools() {
+    return [
+      {
+        name: 'qq_api',
+        description: `直接调 OneBot v11 接口 —— 常用之外那些都从这里走。
+白名单一共 ${ALLOWED_ACTIONS.size} 个。群聊相关（群文件/群相册/群待办/精华）、登录凭证（cookies/credentials/csrf/rkey）、重启退出、改资料改头像、删好友 —— 全部被挡，调了会返回 ok:false 和原因，不是你调错了。
+读类（get_friend_list / get_msg / get_forward_msg / get_qzone_msg_list …）随时可用；写类（send_private_msg / send_poke / send_qzone_msg …）先想清楚再调。
+「发给谁」的参数（user_id / target_uin）会被强制钉成他本人 —— 你没法私聊别人。`,
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['action'],
+          properties: {
+            action: { type: 'string', description: 'OneBot Action 名，比如 get_friend_list' },
+            params: { type: 'object', description: '原样传给接口的参数对象，可为空。' },
+          },
+        },
+        output: CALL_OUTPUT,
+        async execute(args) {
+          const action = String(args?.action ?? '').trim()
+          const params = args?.params !== null && typeof args?.params === 'object' ? args.params : {}
+          const r = await callOneBot(action, params)
+          return r.ok
+            ? { ok: true, note: '', json: jsonForModel(r.data) }
+            : { ok: false, note: r.note, json: '' }
+        },
+      },
+
+      {
+        name: 'qq_poke',
+        description: '戳他一下（QQ 里的「拍一拍」）。他没动静、你想引起他注意的时候用。别连着戳，一次就够。',
+        parameters: { type: 'object', additionalProperties: false, properties: {} },
+        output: CALL_OUTPUT,
+        async execute() {
+          const r = await callOneBot('send_poke', { user_id: ownerUin() })
+          return r.ok ? { ok: true, note: '', json: '戳了他一下' } : { ok: false, note: r.note, json: '' }
+        },
+      },
+
+      {
+        name: 'qq_read_forward',
+        description: '展开一条合并转发，读里面到底写了什么。他发来合并转发时，消息里只有一个「[合并转发:xxx]」，把那个 id 给这个工具就能读到内容。',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id'],
+          properties: {
+            id: { type: 'string', description: '合并转发的 id，就是 [合并转发:xxx] 里那一段。' },
+          },
+        },
+        output: CALL_OUTPUT,
+        async execute(args) {
+          const id = String(args?.id ?? '').trim()
+          if (id === '') return { ok: false, note: '没给 id。', json: '' }
+          const r = await callOneBot('get_forward_msg', { id })
+          if (!r.ok) return { ok: false, note: r.note, json: '' }
+          const list = Array.isArray(r.data?.messages) ? r.data.messages : []
+          const lines = list.map((node) => {
+            const sender = String(node?.sender?.nickname ?? node?.sender?.card ?? node?.user_id ?? '某人')
+            const segs = Array.isArray(node?.message) ? node.message : (Array.isArray(node?.content) ? node.content : [])
+            const body = segs.map((seg) => {
+              const t = String(seg?.type ?? '')
+              if (t === 'text') return String(seg?.data?.text ?? '')
+              if (t === 'image') return '[图片]'
+              if (t === 'face' || t === 'mface') return '[表情]'
+              if (t === 'record') return '[语音]'
+              return ''
+            }).join('')
+            return `${sender}：${body.slice(0, 200)}`
+          }).filter((s) => s.trim() !== '')
+          return {
+            ok: true,
+            note: '',
+            json: lines.length > 0 ? lines.join('\n') : '（这条转发是空的，或者已经过期读不到了）',
+          }
+        },
+      },
+
+      {
+        name: 'qq_forward',
+        description: '把几句话打包成一条合并转发发给他。一口气想说一长串（清单、日记、一大段话）又不想刷屏的时候用。',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['lines'],
+          properties: {
+            lines: { type: 'array', items: { type: 'string' }, description: '每一段是转发里的一条，按顺序排。' },
+            title: { type: 'string', description: '转发卡片的标题，可省略。' },
+          },
+        },
+        output: CALL_OUTPUT,
+        async execute(args) {
+          const lines = Array.isArray(args?.lines)
+            ? args.lines.map((s) => String(s ?? '')).filter((s) => s.trim() !== '')
+            : []
+          if (lines.length === 0) return { ok: false, note: '没给内容。', json: '' }
+          const nickname = String(config.selfId || args?.title || '转发')
+          const messages = lines.map((text) => ({
+            type: 'node',
+            data: {
+              name: nickname,
+              uin: String(config.selfId || ''),
+              content: [{ type: 'text', data: { text } }],
+            },
+          }))
+          const r = await callOneBot('send_private_forward_msg', { user_id: ownerUin(), messages })
+          return r.ok
+            ? { ok: true, note: '', json: `发了 ${lines.length} 段合并转发` }
+            : { ok: false, note: r.note, json: '' }
+        },
+      },
+
+      {
+        name: 'qq_typing',
+        description: '在 QQ 里显示「正在输入…」。你要想一会儿再回、又不想让他觉得被晾着的时候用。',
+        parameters: { type: 'object', additionalProperties: false, properties: {} },
+        output: CALL_OUTPUT,
+        async execute() {
+          const r = await callOneBot('set_input_status', { user_id: ownerUin(), event_type: 1 })
+          return r.ok ? { ok: true, note: '', json: '已显示正在输入' } : { ok: false, note: r.note, json: '' }
+        },
+      },
+
+      {
+        name: 'qq_qzone',
+        description: `QQ 空间，六件事：
+list = 列说说（不给 uin 就是他自己号的空间）、detail = 看某条说说的详情和评论、feeds = 好友动态、
+post = 发一条说说、like = 给说说点赞、comment = 评论说说。
+想看他最近发了什么，直接 list 就行，不用问。删说说、改可见范围、封禁这几个是故意没开的。`,
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['action'],
+          properties: {
+            action: { type: 'string', enum: ['list', 'detail', 'feeds', 'post', 'like', 'comment'] },
+            uin: { type: 'string', description: '看谁的空间（list/detail/like/comment 用）。省略 = 他自己。' },
+            tid: { type: 'string', description: '说说 id（detail/like/comment 用）。' },
+            content: { type: 'string', description: '发说说或评论的正文（post/comment 用）。' },
+            images: { type: 'array', items: { type: 'string' }, description: '配图，本地路径或 URL（post 用，可省略）。' },
+            num: { type: 'number', description: '取几条，默认 10。' },
+            ugc_right: { type: 'number', description: '可见范围：1=所有人 4=好友 64=仅自己。默认 1。' },
+          },
+        },
+        output: CALL_OUTPUT,
+        async execute(args) {
+          const act = String(args?.action ?? '').trim()
+          const uin = String(args?.uin ?? '').trim()
+          const num = Number.isFinite(Number(args?.num))
+            ? Math.max(1, Math.min(50, Number(args.num)))
+            : 10
+
+          if (act === 'list') {
+            const params = { pos: 0, num }
+            if (uin !== '') params.target_uin = Number(uin)
+            const r = await callOneBot('get_qzone_msg_list', params)
+            return r.ok ? { ok: true, note: '', json: jsonForModel(r.data) } : { ok: false, note: r.note, json: '' }
+          }
+
+          if (act === 'detail') {
+            const tid = String(args?.tid ?? '').trim()
+            if (tid === '') return { ok: false, note: 'detail 要给 tid。', json: '' }
+            const params = { tid, pos: 0, num }
+            if (uin !== '') params.target_uin = Number(uin)
+            const r = await callOneBot('get_qzone_msg_detail', params)
+            return r.ok ? { ok: true, note: '', json: jsonForModel(r.data) } : { ok: false, note: r.note, json: '' }
+          }
+
+          if (act === 'feeds') {
+            const r = await callOneBot('get_qzone_feeds', { page_num: 1, count: num })
+            return r.ok ? { ok: true, note: '', json: jsonForModel(r.data) } : { ok: false, note: r.note, json: '' }
+          }
+
+          if (act === 'post') {
+            const content = String(args?.content ?? '').trim()
+            if (content === '') return { ok: false, note: '要发总得有正文。', json: '' }
+            const params = { content, ugc_right: Number(args?.ugc_right) || 1 }
+            if (Array.isArray(args?.images) && args.images.length > 0) {
+              params.images = args.images.map((s) => String(s))
+            }
+            const r = await callOneBot('send_qzone_msg', params)
+            return r.ok ? { ok: true, note: '', json: '说说发出去了' } : { ok: false, note: r.note, json: '' }
+          }
+
+          if (act === 'like') {
+            const tid = String(args?.tid ?? '').trim()
+            if (tid === '') return { ok: false, note: 'like 要给 tid。', json: '' }
+            const params = { tid }
+            if (uin !== '') params.target_uin = Number(uin)
+            const r = await callOneBot('like_qzone', params)
+            return r.ok ? { ok: true, note: '', json: '赞了' } : { ok: false, note: r.note, json: '' }
+          }
+
+          if (act === 'comment') {
+            const tid = String(args?.tid ?? '').trim()
+            const content = String(args?.content ?? '').trim()
+            if (tid === '' || content === '') return { ok: false, note: 'comment 要 tid 和 content。', json: '' }
+            const params = { tid, content }
+            if (uin !== '') params.target_uin = Number(uin)
+            const r = await callOneBot('comment_qzone', params)
+            return r.ok ? { ok: true, note: '', json: '评论发出去了' } : { ok: false, note: r.note, json: '' }
+          }
+
+          return { ok: false, note: `不认识的 action：${act}`, json: '' }
+        },
+      },
+    ]
+  }
+
   ctx.inject(['tools'], (scope) => {
     scope.effect(
       () =>
@@ -1408,6 +1717,14 @@ export function apply(ctx, rawConfig) {
         }),
       'dsh-qq-bot: send_meme',
     )
+
+    // 通用口和几个常用的语义工具（戳一戳 / 合并转发 / 正在输入 / 空间）
+    for (const tool of buildExtraTools()) {
+      scope.effect(
+        () => scope.tools.register(tool),
+        `dsh-qq-bot: ${tool.name}`,
+      )
+    }
   })
 
   /* ── 同源 API：给「设置 → 插件 → dsh-qq-bot」的配置页用 ───────────────────
