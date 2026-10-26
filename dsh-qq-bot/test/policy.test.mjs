@@ -17,6 +17,9 @@ import {
   randomIn,
   segmentText,
   splitLongText,
+  stripTrailingPeriod,
+  takeMergeMarker,
+  looksLikeWork,
 } from '../lib/policy.mjs'
 
 const SEG = { shortMax: 25, longMin: 60 }
@@ -98,9 +101,11 @@ test('segmentText: 短句整条', () => {
   assert.deepEqual(segmentText('外卖比我还重要？', SEG), ['外卖比我还重要？'])
 })
 
-test('segmentText: 超长整条不拆', () => {
+test('segmentText: 长消息也切，不因为长就整条发', () => {
   const long = '这'.repeat(80)
-  assert.deepEqual(segmentText(long, SEG), [long])
+  const parts = segmentText(long, SEG)
+  assert.ok(parts.length >= 3, JSON.stringify(parts))
+  assert.equal(parts.join(''), long)
 })
 
 test('segmentText: 中间区间按标点切', () => {
@@ -120,6 +125,90 @@ test('segmentText: 碎段并进前一段', () => {
 
 test('segmentText: 空串', () => {
   assert.deepEqual(segmentText('   ', SEG), [])
+})
+
+/* ── 只有一道边界：25 字（60 字合并那条 2026-10-25 取消）── */
+
+test('segmentText: 正好 25 字整条', () => {
+  const text = '啊'.repeat(25)
+  assert.deepEqual(segmentText(text, SEG), [text])
+})
+
+test('segmentText: 26 字就要切', () => {
+  const text = '啊'.repeat(26)
+  const parts = segmentText(text, SEG)
+  assert.ok(parts.length >= 2, JSON.stringify(parts))
+  assert.equal(parts.join(''), text)
+})
+
+test('segmentText: 60 字不再合并成一条', () => {
+  const text = '啊'.repeat(60)
+  const parts = segmentText(text, SEG)
+  assert.ok(parts.length >= 2, JSON.stringify(parts))
+  assert.equal(parts.join(''), text)
+})
+
+test('segmentText: 只有逗号也能分条（不用句号同样切得开）', () => {
+  const text = '我先去洗个澡，回来再跟你说这个事，你先别急着跑去睡觉啊'
+  const parts = segmentText(text, SEG)
+  assert.ok(parts.length >= 2, JSON.stringify(parts))
+  assert.equal(parts.join(''), text)
+})
+
+test('segmentText: 一个标点都没有时按语气词/连词切', () => {
+  const text = '我今天真的特别想你可是一直都没有等到你发来的任何一条消息'
+  const parts = segmentText(text, SEG)
+  assert.ok(parts.length >= 2, JSON.stringify(parts))
+  assert.equal(parts.join(''), text)
+})
+
+/* ── 结尾不留句号 ── */
+
+test('stripTrailingPeriod: 抹句号，放过问号 / 叹号 / 省略号', () => {
+  assert.equal(stripTrailingPeriod('你真行。'), '你真行')
+  assert.equal(stripTrailingPeriod('你真行。。'), '你真行')
+  assert.equal(stripTrailingPeriod('你真行？'), '你真行？')
+  assert.equal(stripTrailingPeriod('你真行！'), '你真行！')
+  assert.equal(stripTrailingPeriod('我等你很久了……'), '我等你很久了……')
+  assert.equal(stripTrailingPeriod('我等你很久了~'), '我等你很久了~')
+  assert.equal(stripTrailingPeriod('ok.'), 'ok')
+  assert.equal(stripTrailingPeriod('wait...'), 'wait...')
+  assert.equal(stripTrailingPeriod(''), '')
+})
+
+test('segmentText + stripTrailingPeriod: 拼回后每条都不带句号', () => {
+  const text = '今天真的好累啊。你都不会问我一句的吗？我等你很久了诶。'
+  const parts = segmentText(text, SEG)
+  const sent = parts.map((p) => stripTrailingPeriod(p))
+  assert.ok(sent.length >= 2, JSON.stringify(sent))
+  for (const s of sent) assert.ok(!s.endsWith('。'), JSON.stringify(sent))
+})
+
+/* ── 正事整条发（2026-10-25 晚上加的通道）── */
+
+test('takeMergeMarker: 认标记并剥掉', () => {
+  assert.deepEqual(takeMergeMarker('[[整条]]看这个参数'), { merge: true, text: '看这个参数' })
+  assert.deepEqual(takeMergeMarker('  [[merge]] 改好了'), { merge: true, text: '改好了' })
+  assert.deepEqual(takeMergeMarker('[[整条]]'), { merge: true, text: '' })
+})
+
+test('takeMergeMarker: 没有标记原样返回', () => {
+  assert.deepEqual(takeMergeMarker('外卖比我还重要？'), { merge: false, text: '外卖比我还重要？' })
+  assert.deepEqual(takeMergeMarker(''), { merge: false, text: '' })
+})
+
+test('looksLikeWork: 代码块 / 列表 / 表格 / 命令行都算正事', () => {
+  assert.equal(looksLikeWork('改这里\n```js\nconst a = 1\n```'), true)
+  assert.equal(looksLikeWork('- 第一项\n- 第二项\n- 第三项'), true)
+  assert.equal(looksLikeWork('| 参数 | 值 |\n|---|---|\n| a | 1 |'), true)
+  assert.equal(looksLikeWork('$ npm install\n$ npm run build'), true)
+})
+
+test('looksLikeWork: 闲聊不算正事', () => {
+  assert.equal(looksLikeWork('外卖比我还重要？'), false)
+  assert.equal(looksLikeWork('今天真的好累啊\n你都不会问我一句的吗'), false)
+  assert.equal(looksLikeWork('嗯'), false)
+  assert.equal(looksLikeWork(''), false)
 })
 
 /* ── markdown 清洗 ── */

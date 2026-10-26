@@ -12,7 +12,7 @@
 '  Shell.Run with intWindowStyle=0 never creates one.
 '
 '  It finds bot-tray.ps1 next to itself, in .\scripts\, or in
-'  .\tools\ -- so the same file works both in D:\DSHBot\ and
+'  .\tools\ -- so the same file works both in a dev checkout and
 '  inside a published release package.
 ' ============================================================
 Option Explicit

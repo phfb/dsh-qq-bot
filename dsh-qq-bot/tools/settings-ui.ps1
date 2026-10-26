@@ -279,6 +279,17 @@ Add-Number $g.Box ([ref]$inner) 'memeProb' '通过率（0~1）' 'memeProbability
 $g.Box.Height = $inner + 8
 $y += $g.Box.Height + 10
 
+# --- 收图 -----------------------------------------------------------------
+$g = New-Group '收图（他发来的图片）' '收到图片先下载到本地，再把绝对路径贴进消息让她自己 read_image 看。同目录的 INDEX.md 记着每张图什么时候来的、他说了什么、她怎么回的。' $y
+$inner = $g.Inner
+Add-Bool $g.Box ([ref]$inner) 'imageEnabled' '收图并让她看（关掉就只剩「[图片]」占位）' 'imageEnabled'
+Add-Number $g.Box ([ref]$inner) 'imageLimit' '缓存上限（MB，512 ~ 6144）' 'imageCacheLimitMB' 512 6144 128 0
+Add-Number $g.Box ([ref]$inner) 'imagePurge' '一次清理掉（MB）' 'imageCachePurgeMB' 50 6144 50 0
+Add-Number $g.Box ([ref]$inner) 'imageMaxMB' '单张上限（MB）' 'imageMaxMB' 1 200 1 0
+Add-Text $g.Box ([ref]$inner) 'imageDir' '图片目录' 'imageDir' '默认 <数据目录>\images'
+$g.Box.Height = $inner + 8
+$y += $g.Box.Height + 10
+
 # --- 路径 -----------------------------------------------------------------
 $g = New-Group '路径' '留空就用默认值。' $y
 $inner = $g.Inner

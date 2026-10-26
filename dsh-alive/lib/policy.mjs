@@ -2,8 +2,10 @@
  * dsh-alive 的判定核心。全是纯函数：不碰 IO、不碰 ctx、不碰网络。
  *
  * 想改她的"分寸"，改这个文件就够了；改完跑
- *   D:\Astrbot\Snowluma\node.exe --test "D:\DSHBot\plugin\dsh-alive\test\*.test.mjs"
+ *   node --test test/mood.test.mjs test/policy.test.mjs
  */
+
+import { LUST_ENABLED } from './mood.mjs'
 
 /* ────────────────────────────── 1. open loop 抽取 ────────────────────────────── */
 
@@ -161,7 +163,9 @@ export function checkGate(state, config, loop, env) {
   if (!env.agentExists) failed.push('G4:no-agent')
   else if (env.agentRunning) failed.push('G4:agent-running')
 
-  const lastHuman = parseTime(state.focus?.lastHumanAt)
+  // 静默期只认 QQ 里的话：他在 GUI 里跟 agent 干别的活，不代表他在 QQ 里陪她。
+  // 以前这里读的是 lastHumanAt（任意渠道），结果他一边在 GUI 干活，她一边永远闭嘴。
+  const lastHuman = parseTime(state.focus?.lastQqAt)
   if (lastHuman !== null && now - lastHuman < config.minSilenceMin * 60_000) failed.push('G5:he-just-spoke')
 
   const lastPro = parseTime(state.quota?.lastProactiveAt)
@@ -171,6 +175,9 @@ export function checkGate(state, config, loop, env) {
 
   if ((Number(state.quota?.hourCount) || 0) >= config.maxPerHour) failed.push('G7:hour-quota')
   if ((Number(state.quota?.dayCount) || 0) >= config.maxPerDay) failed.push('G8:day-quota')
+  // 他今天说过"别发了"：当天封顶。用独立字段记，不占 dayCount，免得解除静音之后还不回来。
+  const stopToday = parseTime(state.control?.dayQuotaSuspendedUntil)
+  if (stopToday !== null && now < stopToday) failed.push('G8b:stop-today')
   if ((Number(state.mood?.annoyanceDebt) || 0) >= 45) failed.push('G9:debt')
 
   const attempts = Number(loop?.attempts) || 0
@@ -259,7 +266,17 @@ export function scoreImpulse(state, loop, config, now) {
 
   const missing = clamp01(Number(state.mood?.missing) || 0)
   const jealousy = clamp01(Number(state.mood?.jealousy) || 0)
-  const moodWarmth = (missing * 0.6 + jealousy * 0.4) * 18
+  // 情绪模块加的另外两维：闲得慌和担心也会推着她开口，但分量比想念、吃醋轻
+  const boredom = clamp01(Number(state.mood?.boredom) || 0)
+  const worry = clamp01(Number(state.mood?.worry) || 0)
+  const moodWarmth = (missing * 0.5 + jealousy * 0.3 + boredom * 0.15 + worry * 0.05) * 18
+
+  // 涩涩：独立一项，不抢想念/吃醋的权重，单独最多加 12 分。**它一高她就更想主动开口。**
+  // 两层开关（lib/mood.mjs 的 LUST_ENABLED + config.lustModeEnabled）没全亮时恒 0；
+  // 外加 LUST_SLIDER_ENABLED 管那颗速率滑条能不能拖（默认锁死）。
+  const lustOn = LUST_ENABLED && config?.lustModeEnabled === true
+  const lust = lustOn ? clamp01(Number(state.mood?.lust) || 0) : 0
+  const lustPart = lust * 12
 
   const confidence = clamp01(Number(loop?.confidence) || 0)
   const confidencePart = confidence * 12
@@ -276,11 +293,11 @@ export function scoreImpulse(state, loop, config, now) {
 
   const rhythmPenalty = rhythmPenaltyFor(state.rhythm, now)
 
-  const score = 30 + urgency + moodWarmth + confidencePart + kindBonus + replyRateBonus - debtPenalty - rhythmPenalty
+  const score = 30 + urgency + moodWarmth + lustPart + confidencePart + kindBonus + replyRateBonus - debtPenalty - rhythmPenalty
 
   return {
     score: Number(clamp(score, 0, 100).toFixed(1)),
-    parts: { urgency: round(urgency), moodWarmth: round(moodWarmth), confidence: round(confidencePart), kindBonus, replyRateBonus: round(replyRateBonus), debtPenalty: round(debtPenalty), rhythmPenalty: round(rhythmPenalty) },
+    parts: { urgency: round(urgency), moodWarmth: round(moodWarmth), lustPart: round(lustPart), confidence: round(confidencePart), kindBonus, replyRateBonus: round(replyRateBonus), debtPenalty: round(debtPenalty), rhythmPenalty: round(rhythmPenalty) },
   }
 }
 
@@ -305,6 +322,9 @@ const MOOD_LINE = {
   warm: '（现在的语气：黏。可以说想他，可以软一点。）',
   worried: '（现在的语气：关心。只关心，不追究，不问他为什么没回。）',
   sulky: '（现在的语气：有点不高兴。句子短一点、冷一点，但不出恶言。）',
+  clingy: '（现在的语气：想他。直接说想，不绕弯，可以带一点撒娇。）',
+  pouty: '（现在的语气：吃醋。酸一点、提一句别的，但不质问、不查岗。）',
+  flirty: '（现在的语气：黏得有点不安分。话可以贴得更近、更直接，带一点点撩，但不露骨、不写身体细节。）',
   flat: '（现在的语气：平平的，说一句就好。）',
 }
 
@@ -376,22 +396,33 @@ const UNMUTE_RULES = [
  *      否则"我忙完了"会被「我先忙」那条规则误判成静音 60 分钟（踩过）
  *   3. 最后看软静音
  */
-export function detectControl(text) {
+export function detectControl(text, options = {}) {
   const raw = String(text ?? '')
   if (raw === '') return null
 
-  const hardMute = MUTE_RULES.find((r) => r.hard === true && r.re.test(raw))
-  if (hardMute !== undefined) {
-    return { action: 'mute', minutes: hardMute.minutes, reason: hardMute.reason, hard: true }
+  const opts = options !== null && typeof options === 'object' ? options : {}
+  const muteEnabled = opts.muteEnabled !== false
+  const softMuteEnabled = opts.softMuteEnabled !== false
+  const hardMuteMin = Number.isFinite(Number(opts.hardMuteMin)) ? Number(opts.hardMuteMin) : 120
+
+  // 设置页里把「禁言机制」关掉：他说什么都只当聊天，不静音、不封当天额度。
+  // 但"好了/聊会儿"照旧认 —— 关掉开关的时候更需要这条来兜住历史上的静音状态。
+  if (muteEnabled) {
+    const hardMute = MUTE_RULES.find((r) => r.hard === true && r.re.test(raw))
+    if (hardMute !== undefined) {
+      return { action: 'mute', minutes: hardMuteMin, reason: hardMute.reason, hard: true }
+    }
   }
 
   for (const re of UNMUTE_RULES) {
     if (re.test(raw)) return { action: 'unmute' }
   }
 
-  for (const r of MUTE_RULES) {
-    if (r.hard === true) continue // 硬静音上面已经查过
-    if (r.re.test(raw)) return { action: 'mute', minutes: r.minutes, reason: r.reason, hard: false }
+  if (softMuteEnabled) {
+    for (const r of MUTE_RULES) {
+      if (r.hard === true) continue // 硬静音上面已经查过
+      if (r.re.test(raw)) return { action: 'mute', minutes: r.minutes, reason: r.reason, hard: false }
+    }
   }
   return null
 }

@@ -1,7 +1,7 @@
 /**
  * dsh-alive 判定核心的单元测试。纯函数，不需要 DSH。
  *
- *   D:\Astrbot\Snowluma\node.exe --test "D:\DSHBot\plugin\dsh-alive\test\policy.test.mjs"
+ *   node --test "test/policy.test.mjs"
  */
 
 import { test } from 'node:test'
@@ -181,10 +181,21 @@ test('checkGate: 他正在跑 turn 就拦', () => {
   assert.ok(r.failed.some((f) => f.startsWith('G4')))
 })
 
-test('checkGate: 他刚说完话就拦', () => {
-  const r = checkGate(baseState({ focus: { lastHumanAt: new Date(Date.now() - 3 * 60_000).toISOString() } }), CFG, LOOP, ENV)
+test('checkGate: 他刚在 QQ 说完话就拦', () => {
+  const r = checkGate(baseState({ focus: { lastQqAt: new Date(Date.now() - 3 * 60_000).toISOString() } }), CFG, LOOP, ENV)
   assert.equal(r.pass, false)
   assert.ok(r.failed.some((f) => f.startsWith('G5')))
+})
+
+test('checkGate: 他只在 GUI 里说话不算 —— 静默期不被 GUI 重置', () => {
+  // 老 bug：G5 读的是 lastHumanAt（任意渠道），他在 GUI 干活就等于"一直在说话"，她永远不开口
+  const r = checkGate(baseState({
+    focus: {
+      lastHumanAt: new Date(Date.now() - 3 * 60_000).toISOString(),
+      lastQqAt: new Date(Date.now() - 180 * 60_000).toISOString(),
+    },
+  }), CFG, LOOP, ENV)
+  assert.equal(r.pass, true)
 })
 
 test('checkGate: 冷却期内拦', () => {

@@ -33,8 +33,27 @@ export const DEFAULTS = Object.freeze({
   /** 排队上限：上一轮还在跑时最多积压几条，超了丢最老的。 */
   maxQueue: 3,
 
-  /** 分段规则：<= shortMax 整条发；shortMax..longMin 之间按标点切；> longMin 整条发。 */
+  /**
+   * 分段规则（2026-10-25 下午改定）：
+   *   <= shortMax   整条发
+   *   >  shortMax   按实际语意停顿分条（换行 > 句末标点 > 逗号 > 语气词 > 均分），多长都切
+   * longMin 已停用 —— 原先"60 字以上合并成一条"那条规则他取消了，
+   * 字段留着只为不炸老配置。
+   */
   segment: Object.freeze({ shortMax: 25, longMin: 60, intervalMs: Object.freeze([2000, 4000]) }),
+
+  /**
+   * 非特殊必要场景不用句号收尾。
+   * 开着的时候，每条消息发出去之前会把结尾的「。」抹掉（问号 / 感叹号 / 省略号不动）。
+   */
+  stripTrailingPeriod: true,
+
+  /**
+   * 聊正事 / 干活时整条发，不分条（2026-10-25 晚上加）。
+   * 两条通道：回复以 [[整条]] 开头；或者内容像正事（代码围栏、三行以上列表、
+   * 表格、命令行清单）。命中就整条发 —— 清单被切成三段反而看不清，也慢。
+   */
+  mergeOnWork: true,
 
   /** 发出前的"在打字"延迟（毫秒区间）。 */
   typingDelayMs: Object.freeze([800, 2200]),
@@ -73,6 +92,23 @@ export const DEFAULTS = Object.freeze({
   /** QQ 里控制 bot 的命令前缀。 */
   commandPrefix: '/qq',
 
+  /* ── 入站图片（2026-10-25 加）── */
+  /** 总开关：收到图片时下载、存本地、交给模型看、记索引。关掉就退回原来的「[图片]」占位。 */
+  imageEnabled: true,
+  /** 图片目录。空串 = `<dataDir>/images`。 */
+  imageDir: '',
+  /**
+   * 缓存上限（MB）。超出就从最老的开始删。
+   * 允许范围 512 MB ~ 6144 MB（6 GB）—— 再小会连一天的图都存不下，再大不如直接换块盘。
+   */
+  imageCacheLimitMB: 2048,
+  /** 一次清理掉多少（MB）。他定的是 300：超一点点就删 300，不会把图库清空。 */
+  imageCachePurgeMB: 300,
+  /** 单张图片存盘上限（MB），超了不存（防那种几十兆的长图把盘吃满）。 */
+  imageMaxMB: 20,
+  /** 单张下载超时（毫秒）。腾讯图床偶尔很慢，别让她等太久。 */
+  imageTimeoutMs: 20_000,
+
   /* ── 表情包频率闸门（防止一句话一个表情包）── */
   /** 两张表情之间的最小间隔（分钟）。0 = 不限间隔。 */
   memeMinIntervalMin: 6,
@@ -82,10 +118,15 @@ export const DEFAULTS = Object.freeze({
   memeProbability: 0.75,
 });
 
-/** 取一个正数，非法就用默认值。 */
-function num(value, fallback, { min = 0 } = {}) {
+/** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
+export const IMAGE_LIMIT_MIN_MB = 512
+export const IMAGE_LIMIT_MAX_MB = 6144
+
+/** 取一个正数，非法就用默认值；超上限按上限算。 */
+function num(value, fallback, { min = 0, max = Number.POSITIVE_INFINITY } = {}) {
   const n = Number(value)
-  return Number.isFinite(n) && n >= min ? n : fallback
+  if (!Number.isFinite(n) || n < min) return fallback
+  return n > max ? max : n
 }
 
 /** 取一个 [a, b] 区间。 */
@@ -161,6 +202,8 @@ export function parseConfig(raw) {
     typingDelayMs: range(input.typingDelayMs, DEFAULTS.typingDelayMs),
 
     cleanMarkdown: input.cleanMarkdown !== false,
+    stripTrailingPeriod: input.stripTrailingPeriod !== false,
+    mergeOnWork: input.mergeOnWork !== false,
     maxCharsPerMessage: Math.max(100, Math.floor(num(input.maxCharsPerMessage, DEFAULTS.maxCharsPerMessage, { min: 100 }))),
 
     rateLimitReply: typeof input.rateLimitReply === 'string' ? input.rateLimitReply : DEFAULTS.rateLimitReply,
@@ -181,11 +224,26 @@ export function parseConfig(raw) {
     memeMinIntervalMin: num(input.memeMinIntervalMin, DEFAULTS.memeMinIntervalMin, { min: 0, max: 600 }),
     memeMaxPerHour: Math.floor(num(input.memeMaxPerHour, DEFAULTS.memeMaxPerHour, { min: 1, max: 60 })),
     memeProbability: num(input.memeProbability, DEFAULTS.memeProbability, { min: 0, max: 1 }),
+
+    imageEnabled: input.imageEnabled !== false,
+    imageDir: typeof input.imageDir === 'string' ? input.imageDir.trim() : '',
+    // 上限夹在 512 MB ~ 6 GB：这是他在 2026-10-25 明确给的范围
+    imageCacheLimitMB: Math.round(num(input.imageCacheLimitMB, DEFAULTS.imageCacheLimitMB, { min: IMAGE_LIMIT_MIN_MB, max: IMAGE_LIMIT_MAX_MB })),
+    // 一次清多少：至少 50 MB，最多不超过上限本身
+    imageCachePurgeMB: Math.round(num(input.imageCachePurgeMB, DEFAULTS.imageCachePurgeMB, { min: 50, max: IMAGE_LIMIT_MAX_MB })),
+    imageMaxMB: num(input.imageMaxMB, DEFAULTS.imageMaxMB, { min: 1, max: 200 }),
+    imageTimeoutMs: num(input.imageTimeoutMs, DEFAULTS.imageTimeoutMs, { min: 2000, max: 120_000 }),
   }
 
   if (config.segment.longMin <= config.segment.shortMax) {
     problems.push('segment.longMin 不大于 shortMax，已把 longMin 拉到 shortMax + 1')
     config.segment.longMin = config.segment.shortMax + 1
+  }
+
+  // 一次清理不能超过上限本身，否则一张图库里全删光比不清理更糟
+  if (config.imageCachePurgeMB > config.imageCacheLimitMB) {
+    problems.push(`imageCachePurgeMB（${config.imageCachePurgeMB}）大于上限 ${config.imageCacheLimitMB} MB，已压到上限`)
+    config.imageCachePurgeMB = config.imageCacheLimitMB
   }
 
   return { config, problems }

@@ -25,13 +25,18 @@ import {
   cleanMarkdown,
   extractText,
   isAllowedUser,
+  looksLikeWork,
   looksRejected,
   randomIn,
   segmentText,
   sleep,
   splitLongText,
+  stripTrailingPeriod,
+  takeMergeMarker,
 } from './policy.mjs'
 import { OneBotClient, STATE } from './onebot.mjs'
+import { createImageStore } from './image-store.js'
+import { formatBytes, stampParts } from './images.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -169,6 +174,13 @@ function writeJsonFile(file, value) {
     memeMinIntervalMin: config.memeMinIntervalMin,
     memeMaxPerHour: config.memeMaxPerHour,
     memeProbability: config.memeProbability,
+    // 入站图片（2026-10-25）
+    imageEnabled: config.imageEnabled,
+    imageDir: config.imageDir,
+    imageCacheLimitMB: config.imageCacheLimitMB,
+    imageCachePurgeMB: config.imageCachePurgeMB,
+    imageMaxMB: config.imageMaxMB,
+    imageTimeoutMs: config.imageTimeoutMs,
   }
 }
 
@@ -176,12 +188,23 @@ function writeJsonFile(file, value) {
  * 造一条 user 角色消息。
  * 不用 @deepseek-ai/dsh-llm 的 createUserMessage（profile 里没有这个包），
  * 但结构照着它来：{ id, role, content, source }，id 是 uuid 字符串。
+ *
+ * content 里可以放原生 image block —— 这是模型**不用调工具就直接看得见**的通道
+ * （结构是从 DSH 自己落盘的会话记录里挖出来的实证，见 lib/attachment.js 的注释）。
  */
-function createQqUserMessage({ text, uin, messageId, at }) {
+function createQqUserMessage({ text, images = [], uin, messageId, at }) {
+  /** @type {Array<object>} */
+  const content = []
+  for (const img of Array.isArray(images) ? images : []) {
+    if (img && img.block) content.push(img.block)
+  }
+  if (typeof text === 'string' && text !== '') content.push({ type: 'text', text })
+  if (content.length === 0) content.push({ type: 'text', text: '（空消息）' })
+
   return Object.freeze({
     id: randomUUID(),
     role: 'user',
-    content: [{ type: 'text', text }],
+    content,
     source: Object.freeze({
       kind: SOURCE_KIND,
       uin: String(uin),
@@ -189,6 +212,61 @@ function createQqUserMessage({ text, uin, messageId, at }) {
       at: at ?? new Date().toISOString(),
     }),
   })
+}
+
+/**
+ * 把「他说的原话」和「他发来的东西」拼成一条给模型看的正文。
+ *
+ * 两条路径要分开说：
+ *   - 原生附件成功 → 图已经在 content 数组里，这里只报个文件名，帮她以后回忆
+ *   - 原生附件失败 → 必须把绝对路径 + `read_image` 指令写清楚，否则她只能瞎猜
+ * 语音和视频是**明着说做不到**：模型没有耳朵、也吃不下视频，
+ * 与其让她编一段"我听到了"，不如让她老实说"这条我听不了，打字给我"。
+ */
+export function buildInboundText(text, collected, { nativeImages = false } = {}) {
+  const lines = []
+  if (typeof text === 'string' && text !== '') lines.push(text)
+
+  const images = collected?.images ?? []
+  if (images.length > 0) {
+    lines.push(nativeImages
+      ? `[他发来 ${images.length} 张图片，已经贴在这条消息里了，直接看]`
+      : `[他发来 ${images.length} 张图片，存在下面这些路径：]`)
+    images.forEach((img, i) => {
+      const dims = img.width > 0 && img.height > 0 ? `${img.width}×${img.height}` : '尺寸未知'
+      const kind = img.kind === 'mface' ? '表情' : '图片'
+      const where = nativeImages ? img.file : img.path
+      lines.push(`  ${i + 1}. ${where}（${kind}，${dims}，${formatBytes(img.bytes)}）`)
+    })
+    if (nativeImages) {
+      // 原生附件是走 DSH 内部格式的，万一宿主不认这套（升级 / 换实现），
+      // 这一行是她最后的退路 —— 一个看不见的图库比多一次工具调用糟得多
+      const firstPath = images[0]?.path ?? ''
+      const dir = firstPath !== '' ? dirname(firstPath) : ''
+      if (dir !== '') lines.push(`[如果上面那几张没显示出来，本地备份在 ${dir}，用 read_image 按文件名读]`)
+    } else {
+      lines.push('[用 read_image 逐张看清楚再回答；别装作看过，也别只按文件名猜内容]')
+    }
+  }
+
+  const files = collected?.files ?? []
+  if (files.length > 0) {
+    lines.push(`[他发来 ${files.length} 个文件，已存到本地：]`)
+    files.forEach((f, i) => lines.push(`  ${i + 1}. ${f.path}（${f.name}，${formatBytes(f.bytes)}）`))
+    lines.push('[先看文件类型再决定怎么开：纯文本直接读，pdf / docx / xlsx 用对应的工具]')
+  }
+
+  const voices = collected?.voices ?? []
+  if (voices.length > 0) {
+    lines.push(`[他发来 ${voices.length} 条语音 —— 我这边听不了音频，别假装听懂，直接跟他说清楚，让他打字]`)
+  }
+
+  const videos = collected?.videos ?? []
+  if (videos.length > 0) {
+    lines.push(`[他发来 ${videos.length} 段视频 —— 我看不了视频，别假装看过，直接跟他说清楚]`)
+  }
+
+  return lines.join('\n')
 }
 
 /**
@@ -244,6 +322,47 @@ export function apply(ctx, rawConfig) {
   if (config.memesDir === '') config.memesDir = join(DATA_DIR, 'memes')
   ensureDir(config.memesDir)
 
+  /* ── 入站图片仓库（2026-10-25 加）──────────────────────────────────────
+     收到图片 → 下载存本地 → 把路径贴进消息让模型 read_image → 记一份索引。
+     建不起来不影响聊天，退回原来的「[图片]」占位。 */
+  if (config.imageDir === '') config.imageDir = join(DATA_DIR, 'images')
+
+  /** @type {ReturnType<typeof createImageStore> | null} */
+  let imageStore = null
+
+  function rebuildImageStore(reason) {
+    imageStore = null
+    if (!config.imageEnabled) {
+      writeLog('INFO', `图片功能关着（${reason}）—— 收到图只写「[图片]」占位`)
+      return
+    }
+    try {
+      imageStore = createImageStore({
+        dir: config.imageDir,
+        limitBytes: config.imageCacheLimitMB * 1024 * 1024,
+        purgeBytes: config.imageCachePurgeMB * 1024 * 1024,
+        maxBytes: config.imageMaxMB * 1024 * 1024,
+        timeoutMs: config.imageTimeoutMs,
+        // 原生附件：写进 <DSH_HOME>/attachments/v1/objects/，模型直接看得见图
+        dshHome: process.env.DSH_HOME ?? '',
+        // 他发来的 zip / pdf / docx 存这儿
+        filesDir: join(DATA_DIR, 'files'),
+        log: writeLog,
+      })
+      const st = imageStore.startup()
+      writeLog('INFO', `图片仓库就绪（${reason}）：${st.dir} —— 现有 ${st.count} 张 / ${formatBytes(st.bytes)}，`
+        + `上限 ${formatBytes(st.limitBytes)}，超了从最老的删起（一次约 ${formatBytes(st.purgeBytes)}）`)
+      writeLog('INFO', process.env.DSH_HOME
+        ? `原生识图：开 —— 图片会写成 DSH 附件（${process.env.DSH_HOME}），模型不用 read_image 也看得见`
+        : '原生识图：关 —— 没拿到 DSH_HOME，退回「存本地 + 让模型 read_image」')
+    } catch (err) {
+      imageStore = null
+      writeLog('WARN', `图片仓库没起来（${err instanceof Error ? err.message : String(err)}），这次按纯文本处理图片`)
+    }
+  }
+
+  rebuildImageStore('启动')
+
   /* 没有配置文件时先落一份基线：这样「托盘设置窗口」一打开读到的就是**当前真实生效**的
      那套值，而不是一堆空控件让人以为自己配置丢了。 */
   if (savedConfig === null) {
@@ -259,8 +378,13 @@ export function apply(ctx, rawConfig) {
       if (next === null || typeof next !== 'object') return
       try {
         const parsed = parseConfig({ ...(rawConfig ?? {}), ...next })
+        const beforeImageKey = `${config.imageEnabled}|${config.imageDir}|${config.imageCacheLimitMB}|${config.imageCachePurgeMB}|${config.imageMaxMB}`
         Object.assign(config, parsed.config)
         if (config.memesDir === '') config.memesDir = join(DATA_DIR, 'memes')
+        if (config.imageDir === '') config.imageDir = join(DATA_DIR, 'images')
+        const afterImageKey = `${config.imageEnabled}|${config.imageDir}|${config.imageCacheLimitMB}|${config.imageCachePurgeMB}|${config.imageMaxMB}`
+        // 图片那几项变了才重建仓库 —— 每存一次配置就重建会白白重扫一遍目录
+        if (afterImageKey !== beforeImageKey) rebuildImageStore('配置热应用')
         writeLog('INFO', '配置文件变了，已热应用（连接参数请点「重新连接」）')
       } catch (err) {
         writeLog('WARN', `配置文件热载失败：${err instanceof Error ? err.message : String(err)}`)
@@ -538,7 +662,37 @@ export function apply(ctx, rawConfig) {
       ]
       return lines.join('\n')
     }
-    return `不认识的命令。能用的：${p} off / ${p} on / ${p} status`
+    if (cmd.name === 'pic' || cmd.name === 'img' || cmd.name === 'image') {
+      if (imageStore === null) {
+        return config.imageEnabled
+          ? '图片仓库没起来，看日志里的警告。'
+          : '图片功能关着（设置里「收图存本地」没打开）。'
+      }
+      const sub = (cmd.args[0] ?? '').toLowerCase()
+      if (sub === 'clean' || sub === '清' || sub === '清理') {
+        const r = imageStore.sweep()
+        const st = imageStore.stats()
+        if (r.purged === 0) {
+          return `没到上限，不用清。\n现在 ${st.count} 张 / ${formatBytes(st.bytes)}，上限 ${formatBytes(st.limitBytes)}。`
+        }
+        return `清掉 ${r.purged} 张，腾出 ${formatBytes(r.freedBytes)}。\n现在 ${st.count} 张 / ${formatBytes(st.bytes)}。`
+      }
+      const st = imageStore.stats()
+      const pct = st.limitBytes > 0 ? Math.round((st.bytes / st.limitBytes) * 100) : 0
+      const recent = imageStore.list().filter((e) => !e.purged).slice(-3).reverse()
+      const lines = [
+        `图库：${st.count} 张 / ${formatBytes(st.bytes)}（占上限 ${pct}%，上限 ${formatBytes(st.limitBytes)}）`,
+        `超了自动删最老的，一次约 ${formatBytes(st.purgeBytes)}`,
+        `目录：${st.dir}`,
+      ]
+      if (recent.length > 0) {
+        lines.push('最近三张：')
+        for (const e of recent) lines.push(`· ${e.file}（${stampParts(new Date(e.at)).full}）`)
+      }
+      lines.push(`手动清一次：${p} pic clean`)
+      return lines.join('\n')
+    }
+    return `不认识的命令。能用的：${p} off / ${p} on / ${p} status / ${p} pic`
   }
 
   for (const p of problems) writeLog('WARN', `配置：${p}`)
@@ -710,17 +864,39 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** 把一条回复按规则分段、延时、依次发出。 */
+  /**
+   * 把一条回复按规则分段、延时、依次发出。
+   *
+   * 规则（2026-10-25 改定）：
+   *   <= segment.shortMax（25 字）  整条发
+   *   >    segment.shortMax         按实际语意停顿分条，多长都切
+   * 例外（2026-10-25 晚上加的"正事"通道）：
+   *   回复以 [[整条]] 开头，或者内容像正事（代码围栏 / 三行以上列表 /
+   *   表格 / 命令行清单），就整条发、不切 —— 聊正事、干活讲究效率，
+   *   清单被切成三段反而看不清
+   *   非特殊必要场景不用句号收尾 → stripTrailingPeriod 在这里落地
+   *
+   * 每一段各自过一遍去尾句号：分段时「。」本来就是切点，留在尾巴上会变成
+   * 每条消息都以句号结尾 —— 正好是规则里要去掉的那个东西。
+   */
   async function deliverReply(uin, text) {
-    const cleaned = config.cleanMarkdown ? cleanMarkdown(text) : text
+    // 先认标记再洗 markdown —— 标记是给他看不见的，清洗顺序不能反
+    const marked = takeMergeMarker(text)
+    const oneShot = marked.merge || (config.mergeOnWork && looksLikeWork(marked.text))
+    const cleaned = config.cleanMarkdown ? cleanMarkdown(marked.text) : marked.text
     if (cleaned === '') return
 
     const pieces = splitLongText(cleaned, config.maxCharsPerMessage)
     /** @type {string[]} */
     const outgoing = []
     for (const piece of pieces) {
-      outgoing.push(...segmentText(piece, config.segment))
+      const segments = oneShot ? [piece] : segmentText(piece, config.segment)
+      for (const segment of segments) {
+        const finalText = config.stripTrailingPeriod ? stripTrailingPeriod(segment) : segment
+        if (finalText.trim() !== '') outgoing.push(finalText)
+      }
     }
+    if (outgoing.length === 0) return
 
     const typing = randomIn(config.typingDelayMs)
     await sleep(typing)
@@ -757,10 +933,37 @@ export function apply(ctx, rawConfig) {
     if (config.selfId && userId === config.selfId) return
 
     const text = extractText(event.message)
-    if (text === '') {
-      writeLog('INFO', `忽略空消息（可能只有图片/表情）uin=${userId}`)
+
+    /* 他发来的东西：图片 / 商城表情 / 文件 / 语音 / 视频，一次全收下来。
+       extractText 只给出「[图片]」「[表情]」「[语音]」这种占位，模型靠它等于什么都没看见。
+       collectFromMessage 会把图（含带 url 的表情）下载、写进 DSH 附件库，
+       文件下载到 files 目录，语音视频只报个数。 */
+    /** @type {{images:Array<object>, files:Array<object>, voices:Array<object>, videos:Array<object>, skipped:number}} */
+    let collected = { images: [], files: [], voices: [], videos: [], skipped: 0 }
+    if (imageStore !== null) {
+      const msgTime = Number(event.time)
+      try {
+        collected = await imageStore.collectFromMessage(event.message, {
+          uin: userId,
+          said: text,
+          at: Number.isFinite(msgTime) && msgTime > 0 ? msgTime * 1000 : Date.now(),
+        })
+      } catch (err) {
+        writeLog('WARN', `图片/文件处理失败：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
+    const nativeImages = collected.images.some((img) => img && img.block)
+    const gotAnything = collected.images.length > 0 || collected.files.length > 0 ||
+      collected.voices.length > 0 || collected.videos.length > 0
+
+    if (text === '' && !gotAnything) {
+      writeLog('INFO', `忽略空消息（可能只有小黄脸/引用）uin=${userId}`)
       return
     }
+
+    /* 拼进会话的正文。光有图没文字的消息也要发 —— 那种以前会被上面这个空判断直接丢掉。 */
+    const promptText = buildInboundText(text, collected, { nativeImages })
 
     // /qq 命令在插件本地处理，不送进 agent（关掉之后也还能用它开回来）
     const cmd = parseCommand(text)
@@ -806,13 +1009,20 @@ export function apply(ctx, rawConfig) {
         return
       }
       const message = createQqUserMessage({
-        text,
+        text: promptText,
+        images: collected.images,
         uin: userId,
         messageId: event.message_id,
         at: new Date().toISOString(),
       })
       agent.followup(message)
-      writeLog('INFO', `← QQ ${userId}：${text.slice(0, 120)}（排队 ${depth + 1}）`)
+      const tags = []
+      if (collected.images.length > 0) tags.push(`图 ${collected.images.length}${nativeImages ? ' 原生' : ' 路径'}`)
+      if (collected.files.length > 0) tags.push(`文件 ${collected.files.length}`)
+      if (collected.voices.length > 0) tags.push(`语音 ${collected.voices.length}`)
+      if (collected.videos.length > 0) tags.push(`视频 ${collected.videos.length}`)
+      const tag = tags.length > 0 ? ` [${tags.join(' · ')}]` : ''
+      writeLog('INFO', `← QQ ${userId}：${text.slice(0, 120)}${tag}（排队 ${depth + 1}）`)
     } catch (err) {
       writeLog('ERROR', `入站失败：${err instanceof Error ? err.message : String(err)}`)
     } finally {
@@ -899,6 +1109,15 @@ export function apply(ctx, rawConfig) {
       // 否则只会看到"她没回话"，分不清是模型没说话还是出站把他吞了。
       writeLog('INFO', `出站：${sessionId.slice(0, 13)}… 匹配 QQ ${uin}，本段 ${text.length} 字`)
       if (text !== '') enqueueReply(uin, text)
+
+      // 把"这一轮我怎么回的"回填进图片索引 —— 索引里那列空着，过一个月就没人记得那张图是干嘛的
+      if (text !== '' && imageStore !== null) {
+        try {
+          imageStore.noteReply(uin, text)
+        } catch (err) {
+          writeLog('WARN', `图片索引回填失败：${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
 
       // 一轮结束，顺手量一下上下文；快满了就换新局（异步，不挡这轮回复）。
       // 只在"这一轮真说出了话"时才考虑换局 —— 多步 agent 的中间 step 也会发

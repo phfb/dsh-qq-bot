@@ -5,6 +5,8 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+import { DEFAULT_FILL_HOURS, DEFAULT_RATES, LUST_DEFAULTS, normalizeFillHours, normalizeRates } from './mood.mjs'
+
 export const DEFAULTS = Object.freeze({
   /** 总开关（运行时真值在 alive-state.json，这里只是首次默认）。 */
   enabled: true,
@@ -16,6 +18,13 @@ export const DEFAULTS = Object.freeze({
 
   /** 他本人的 QQ 号（从 qq-bot 那条消息的 source.uin 兜底用）。 */
   selfUin: '',
+
+  /** 禁言机制总开关。false = 他说"别发了"也不再静音、不封当天额度（设置页里能关）。 */
+  muteEnabled: true,
+  /** 软静音开关：开会 / 室友在 / 我在忙这类场景。 */
+  softMuteEnabled: true,
+  /** 硬静音时长（分钟）。他说"别发了"之后闭嘴多久。 */
+  hardMuteMin: 120,
 
   /** 他刚说完话之后的静默期。 */
   minSilenceMin: 12,
@@ -41,6 +50,53 @@ export const DEFAULTS = Object.freeze({
 
   /** 是否调用 ebbinghaus 记忆召回。第一版默认关。 */
   includeRecall: false,
+
+  /**
+   * 情绪速率的基准：1.0x 倍率下，从 0 攒到 100% 要几个小时。
+   * 设置窗口里每颗滑条旁边那句"满值约 X 小时"就是它除以倍率算出来的。
+   */
+  moodFillHours: DEFAULT_FILL_HOURS,
+
+  /**
+   * 每个情绪维度的速率倍率（0.1x ~ 10x）。详见 lib/mood.mjs。
+   * 涩涩（lust）在 LUST_SLIDER_ENABLED = false 时会被强制拉回 1.0。
+   */
+  moodRates: DEFAULT_RATES,
+
+  /**
+   * 涩涩（lust）mode 的那颗真开关。**默认 false**。
+   *
+   * 只有 lib/mood.mjs 的 LUST_ENABLED（代码开关）也亮着，面板上才会露出这一组；
+   * 露出来之后勾不勾，看这一个。两层都亮才算真启用。
+   */
+  lustModeEnabled: LUST_DEFAULTS.enabled,
+  /**
+   * 余温下限（%）：事后回落到这儿就停住，不再往下掉。
+   */
+  lustFloorPercent: LUST_DEFAULTS.floorPercent,
+  /**
+   * 自涨封顶（%）：靠自己随「想他」爬，最多爬到这儿；再往上只能靠他挑逗。
+   */
+  lustSelfCapPercent: LUST_DEFAULTS.selfCapPercent,
+  /**
+   * 回落耗时（小时）：从 100% 落回余温下限要多久。这就是"事后慢慢回落"那份时间。
+   */
+  lustDecayHours: LUST_DEFAULTS.decayHours,
+  /**
+   * 自涨基准（小时）：从余温下限爬到自涨封顶要多久（想他越高爬得越快）。
+   */
+  lustFillHours: LUST_DEFAULTS.fillHours,
+  /**
+   * 单次涨幅（%）：他挑逗一次顶上去多少。
+   */
+  lustTeaseStepPercent: LUST_DEFAULTS.teaseStepPercent,
+
+  /**
+   * 情绪快照（alive-mood.json）最短多久写一次，单位分钟。
+   * 百分比有变化仍然照旧立刻写；这个数只卡"同一组数字反复重写"的最小间隔。
+   * 1 = 每跳心跳都写；1440 = 一天最多写一次。
+   */
+  moodSnapshotIntervalMin: 5,
 
   /** 状态文件目录。写死，别用 volatile。 */
   dataDir: join(homedir(), '.dsh-qq-bot'),
@@ -79,6 +135,10 @@ export function parseConfig(raw) {
     targetSession,
     selfUin: String(input.selfUin ?? DEFAULTS.selfUin).trim(),
 
+    muteEnabled: input.muteEnabled !== false,
+    softMuteEnabled: input.softMuteEnabled !== false,
+    hardMuteMin: num(input.hardMuteMin, DEFAULTS.hardMuteMin, { min: 5, max: 1440 }),
+
     minSilenceMin: num(input.minSilenceMin, DEFAULTS.minSilenceMin, { min: 1, max: 600 }),
     cooldownMin: num(input.cooldownMin, DEFAULTS.cooldownMin, { min: 1, max: 720 }),
     maxPerHour: Math.floor(num(input.maxPerHour, DEFAULTS.maxPerHour, { min: 1, max: 20 })),
@@ -93,6 +153,15 @@ export function parseConfig(raw) {
     tickMs: num(input.tickMs, DEFAULTS.tickMs, { min: 10_000, max: 600_000 }),
     staleMin: num(input.staleMin, DEFAULTS.staleMin, { min: 5, max: 600 }),
     includeRecall: input.includeRecall === true,
+    moodFillHours: normalizeFillHours(input.moodFillHours),
+    moodRates: normalizeRates(input.moodRates),
+    lustModeEnabled: input.lustModeEnabled === true,
+    lustFloorPercent: num(input.lustFloorPercent, DEFAULTS.lustFloorPercent, { min: 0, max: 100 }),
+    lustSelfCapPercent: num(input.lustSelfCapPercent, DEFAULTS.lustSelfCapPercent, { min: 0, max: 100 }),
+    lustDecayHours: num(input.lustDecayHours, DEFAULTS.lustDecayHours, { min: 0.1, max: 240 }),
+    lustFillHours: num(input.lustFillHours, DEFAULTS.lustFillHours, { min: 0.1, max: 240 }),
+    lustTeaseStepPercent: num(input.lustTeaseStepPercent, DEFAULTS.lustTeaseStepPercent, { min: 0, max: 100 }),
+    moodSnapshotIntervalMin: Math.round(num(input.moodSnapshotIntervalMin, DEFAULTS.moodSnapshotIntervalMin, { min: 1, max: 1440 })),
     dataDir: typeof input.dataDir === 'string' && input.dataDir.trim() !== '' ? input.dataDir.trim() : DEFAULTS.dataDir,
   }
 
