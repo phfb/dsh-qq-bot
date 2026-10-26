@@ -22,7 +22,7 @@
  *               LUST_ENABLED（下面那行，写在代码里的） = 面板上要不要露出「涩涩」这一组设置。
  *                                                        关着的话面板里看不见它，功能也不生效。
  *               lustModeEnabled（alive-config.json）    = 面板上那颗真开关，勾上才算真启用。
- *             再加第三样：LUST_SLIDER_ENABLED 管那颗速率滑条能不能拖（默认锁死，和上面两样不相干）。
+ *             再加第三样：LUST_SLIDER_ENABLED 管那颗速率滑条在不在；能不能拖看面板上的正式开关。
  *
  * ── 速度怎么算（2026-10-26 改） ───────────────────────────────────────────
  * 每个维度都有一个"速率倍率"（设置窗口里的滑条，0.1x ~ 10x，默认 1.0x）。
@@ -50,7 +50,18 @@ const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
  *
  * 改这一行然后重启 DSH 就生效（设置窗口也会跟着变，它读的是这行源码）。
  */
-export const LUST_SLIDER_ENABLED = false
+/**
+ * 涩涩那颗速率滑条**存不存在**。
+ *
+ * 2026-10-26 改语义：以前这个是「滑条锁」，false 就把倍率死死钉在 1.0x ——
+ * 结果面板上那颗正式开关就算勾上了，滑条也拖不动，等于这一维永远只能按基准速度走。
+ *
+ * 现在它只管「这颗控件在不在」，**能不能拖交给面板上的正式开关（lustModeEnabled）**：
+ *   隐藏开关（LUST_ENABLED）关  → 整组不显示
+ *   隐藏开 + 正式关             → 显示，但滑条锁着（locked）
+ *   隐藏开 + 正式开             → 可拖，拖了立刻参与演化
+ */
+export const LUST_SLIDER_ENABLED = true
 
 /**
  * 涩涩这一层的代码开关（2026-10-26 加）。
@@ -167,7 +178,7 @@ function clampRate(v) {
 
 /**
  * 把配置里的倍率洗成合法值。缺的补 1.0，越界的夹到 0.1 / 10。
- * 涩涩在 LUST_SLIDER_ENABLED = false 时强制 1.0 —— 写多少都不作数。
+ * 涩涩倍率只要代码层允许就按写进去的值走；这条维没启用时它本来就不参与演化。
  *
  * @param {unknown} raw
  * @param {{allowLust?:boolean}} [opts]
@@ -509,7 +520,7 @@ export function digest(mood, opts = {}) {
  * 面板要的完整快照：每一维的百分比 + 当前倍率 + 满值时间。
  *
  * 涩涩那行带两个标记：
- *   locked   滑条锁着（LUST_SLIDER_ENABLED = false），倍率固定 1.0x
+ *   locked   滑条锁着（正式开关没勾），倍率按 1.0x 显示但不参与演化
  *   disabled 两层开关没全亮，这一维冻结、不打分
  * 涩涩的 fillHours 是「自涨基准」（从余温下限爬到自涨封顶要多久），不是攒满时间。
  *
@@ -533,7 +544,8 @@ export function snapshot(mood, opts = {}) {
   for (const row of rows) {
     const rateKey = row.key === 'annoyance' ? 'annoyanceDecay' : row.key
     row.rate = rates[rateKey] ?? 1
-    row.locked = row.key === 'lust' && !LUST_SLIDER_ENABLED
+    // 能不能拖：看面板上那颗正式开关（两层都亮才可拖），不是看代码常量。
+    row.locked = row.key === 'lust' && !lust.enabled
     row.disabled = row.key === 'lust' && !lust.enabled
     row.fillHours = fillTimeHours(rateKey, { rates, fillHours: fill, lust })
   }

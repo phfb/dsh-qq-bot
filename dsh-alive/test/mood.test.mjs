@@ -193,10 +193,9 @@ test('fillTimeHours: 满值时间 = 基准 ÷ 倍率', () => {
   assert.equal(fillTimeHours('missing', { fillHours: 12 }), DEFAULT_FILL_HOURS * 2)
 })
 
-test('涩涩默认锁死：配置里写 10x 也不作数', () => {
+test('涩涩倍率：代码层允许就按填的值走（能不能调看面板那颗正式开关）', () => {
   const rates = normalizeRates({ lust: 10 })
-  if (LUST_SLIDER_ENABLED) assert.equal(rates.lust, 10)
-  else assert.equal(rates.lust, 1)
+  assert.equal(rates.lust, LUST_SLIDER_ENABLED ? 10 : 1)
 })
 
 /* ─────────────── 涩涩：对话驱动 + 两层开关（2026-10-26 重做） ───────────────
@@ -266,7 +265,7 @@ test('涩涩没启用就不参与主情绪，启用才参与', () => {
 test('snapshot: 涩涩那行带锁 / 未启用标记，五个参数原样给面板', () => {
   const snap = snapshot(fresh({ lust: 0.3 }), { fillHours: 6 })
   const row = snap.rows.find((r) => r.key === 'lust')
-  assert.equal(row.locked, !LUST_SLIDER_ENABLED)
+  assert.equal(row.locked, true, '没启用 → 滑条锁着')
   assert.equal(row.disabled, true)
   assert.equal(snap.lustEnabled, false)
   assert.equal(snap.lust.floorPercent, 20)
@@ -277,6 +276,7 @@ test('snapshot: 涩涩那行带锁 / 未启用标记，五个参数原样给面�
   const on = snapshot(fresh({ lust: 0.3 }), { fillHours: 6, lust: LUST_ON })
   assert.equal(on.lustEnabled, true)
   assert.equal(on.rows.find((r) => r.key === 'lust').disabled, false)
+  assert.equal(on.rows.find((r) => r.key === 'lust').locked, false, '启用了 → 滑条可拖')
 })
 
 test('snapshot: 每行都有百分比、倍率和满值时间，涩涩带锁', () => {
@@ -287,6 +287,6 @@ test('snapshot: 每行都有百分比、倍率和满值时间，涩涩带锁', (
   assert.equal(row.rate, 1)
   assert.equal(row.fillHours, 6)
   const lust = snap.rows.find((r) => r.key === 'lust')
-  assert.equal(lust.locked, !LUST_SLIDER_ENABLED)
+  assert.equal(lust.locked, true, '没启用 → 滑条锁着')
   assert.equal(lust.percent, 30)
 })

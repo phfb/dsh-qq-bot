@@ -400,7 +400,7 @@ $y += $g.Box.Height + 10
 #
 # 涩涩有两道互不相干的开关，都在 lib\mood.mjs 顶上：
 #   LUST_ENABLED        = 总开关（默认 false）→ 关着就冻结，不涨不掉、不参与打分
-#   LUST_SLIDER_ENABLED = 滑条锁（默认 false）→ 锁着就固定 1.0x
+#   滑条能不能拖：由面板上那颗正式开关（lustModeEnabled）决定，勾上才可拖
 # 涩涩的两层开关都在 lib\mood.mjs 顶上：LUST_ENABLED 决定面板露不露这一组，
 # 露出来之后面板上那颗勾选（lustModeEnabled）才是真启用。涩涩的时间参数也全在它自己那组里。
 
@@ -485,8 +485,8 @@ function Update-RateRow($row) {
       $row.TimeLabel.Text = '[关] 未启用 · 勾下面那组'
       return
     }
-    if (-not $script:lustUnlocked) {
-      $row.TimeLabel.Text = '[锁] 固定 1.0x · 时间见下面那组'
+    if (-not $script:lustOnNow) {
+      $row.TimeLabel.Text = '[锁] 正式开关没勾 · 时间见下面那组'
       return
     }
     $row.TimeLabel.Text = '1.0x 以上可拖 · 时间见下面那组'
@@ -531,7 +531,8 @@ foreach ($spec in $rowSpecs) {
   if ($cfg.ContainsKey('moodRates') -and $null -ne $cfg['moodRates'] -and $null -ne $cfg['moodRates'][$key]) {
     try { $mul = [double]$cfg['moodRates'][$key] } catch { }
   }
-  if ($key -eq 'lust' -and -not $script:lustUnlocked) { $mul = 1.0; $track.Enabled = $false }
+  // 涩涩这条路：正式开关没勾就不让拖（隐藏开关只决定这一组露不露）。
+  if ($key -eq 'lust' -and -not $script:lustOnNow) { $mul = 1.0; $track.Enabled = $false }
   try { $track.Value = [int][math]::Max(1, [math]::Min(100, [math]::Round($mul * 10))) } catch { }
 
   $valLbl = New-Object System.Windows.Forms.Label
