@@ -116,6 +116,27 @@ export const DEFAULTS = Object.freeze({
   memeMaxPerHour: 3,
   /** 满足间隔和配额后，再掷一次骰子；0 = 必发，1 = 永不发。 */
   memeProbability: 0.75,
+
+  /* ── 「小动作」的每日额度（2026-10-26 加的）──────────────────────────
+     戳一戳 / 发说说 / 分享链接，这三样不走说话的额度，各记各的。
+     0 = 关掉这一项。
+     说说那条尤其要小：它是所有人可见的，等于替他在社交圈发言。 */
+  /** 一天最多戳几次。 */
+  interactPokeMaxPerDay: 5,
+  /** 一天最多发几条说说。 */
+  interactQzoneMaxPerDay: 1,
+  /** 一天最多分享几个链接卡片。 */
+  interactLinkMaxPerDay: 1,
+  /** 主动发的说说默认给谁看：1=所有人 4=好友 64=仅自己。 */
+  interactQzoneUgcRight: 1,
+
+  /**
+   * 道别闭环的有效期（分钟）。
+   *
+   * 她说了「晚安」、他也说了「晚安」之后，这条就不再回了 —— 道别是句号。
+   * 超过这么久就算新的一轮，不再拦（免得一句午睡把一整个下午都封掉）。
+   */
+  farewellGapMin: 180,
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -224,6 +245,11 @@ export function parseConfig(raw) {
     memeMinIntervalMin: num(input.memeMinIntervalMin, DEFAULTS.memeMinIntervalMin, { min: 0, max: 600 }),
     memeMaxPerHour: Math.floor(num(input.memeMaxPerHour, DEFAULTS.memeMaxPerHour, { min: 1, max: 60 })),
     memeProbability: num(input.memeProbability, DEFAULTS.memeProbability, { min: 0, max: 1 }),
+    interactPokeMaxPerDay: Math.floor(num(input.interactPokeMaxPerDay, DEFAULTS.interactPokeMaxPerDay, { min: 0, max: 100 })),
+    interactQzoneMaxPerDay: Math.floor(num(input.interactQzoneMaxPerDay, DEFAULTS.interactQzoneMaxPerDay, { min: 0, max: 20 })),
+    interactLinkMaxPerDay: Math.floor(num(input.interactLinkMaxPerDay, DEFAULTS.interactLinkMaxPerDay, { min: 0, max: 20 })),
+    interactQzoneUgcRight: Math.floor(num(input.interactQzoneUgcRight, DEFAULTS.interactQzoneUgcRight, { min: 1, max: 128 })),
+    farewellGapMin: num(input.farewellGapMin, DEFAULTS.farewellGapMin, { min: 10, max: 1440 }),
 
     imageEnabled: input.imageEnabled !== false,
     imageDir: typeof input.imageDir === 'string' ? input.imageDir.trim() : '',

@@ -39,6 +39,8 @@ import { createImageStore } from './image-store.js'
 import { formatBytes, stampParts } from './images.mjs'
 import { socialEventToText } from './notice.mjs'
 import { ALLOWED_ACTIONS, checkAction, clampTarget } from './api-allowlist.mjs'
+import { checkBudget, emptyBudget, rollDay, takeBudget } from './interact-budget.mjs'
+import { isFarewell, shouldStopHere } from './goodnight.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -850,6 +852,15 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * 她最后真正发出去的那句话（文本 + 时刻）。
+   *
+   * 只为了一件事：判断「道别是不是已经闭环了」——
+   * 她说了晚安、他也说了晚安，那这条晚安就不该再触发她回一句。
+   */
+  /** @type {{text:string, at:number}} */
+  let lastAssistantSaid = { text: '', at: 0 }
+
   /** 把一段文本发到 QQ。dryRun 时只记日志。 */
   async function sendText(uin, text) {
     const body = String(text ?? '').trim()
@@ -860,6 +871,8 @@ export function apply(ctx, rawConfig) {
     }
     try {
       await client.sendPrivateMsg(uin, body)
+      // 记住她最后说的是什么 —— 道别闭环要靠它判断
+      lastAssistantSaid = { text: body, at: Date.now() }
       writeLog('INFO', `→ QQ ${uin}：${body.slice(0, 120)}`)
     } catch (err) {
       writeLog('ERROR', `发送失败（${uin}）：${err instanceof Error ? err.message : String(err)}`)
@@ -935,6 +948,20 @@ export function apply(ctx, rawConfig) {
     if (config.selfId && userId === config.selfId) return
 
     const text = extractText(event.message)
+
+    /* 道别闭环（2026-10-27 加的）：她说了晚安、他也说了晚安 —— 这条就不回了。
+       以前这种情况会被当成一轮新对话，于是她再回一句「晚安呀」，他没完没了。
+       道别是句号，不是逗号。 */
+    const farewell = shouldStopHere({
+      text,
+      lastAssistant: lastAssistantSaid,
+      now: Date.now(),
+      gapMin: config.farewellGapMin,
+    })
+    if (farewell.stop) {
+      writeLog('INFO', `不追了：${farewell.reason}（他这条：${text.slice(0, 40)}）`)
+      return
+    }
 
     /* 他发来的东西：图片 / 商城表情 / 文件 / 语音 / 视频，一次全收下来。
        extractText 只给出「[图片]」「[表情]」「[语音]」这种占位，模型靠它等于什么都没看见。
@@ -1256,6 +1283,55 @@ export function apply(ctx, rawConfig) {
 
   loadMemeState()
 
+  /* ── 小动作的每日额度（戳一戳 / 说说 / 链接卡片）───────────────────────
+     跟说话的额度完全分开记。理由见 lib/interact-budget.mjs —— 一句话：
+     戳一戳不是说话，发说说更是**替他在社交圈公开发言**，不该跟聊天挤一个池子。 */
+  const interactPath = join(DATA_DIR, 'qq-bot-interact.json')
+  /** @type {{dayStart:number, poke:number, qzone:number, link:number}} */
+  let interactBudget = emptyBudget(Date.now())
+
+  function loadInteractBudget() {
+    try {
+      const raw = JSON.parse(readFileSync(interactPath, 'utf8'))
+      if (raw !== null && typeof raw === 'object') {
+        interactBudget = rollDay({
+          dayStart: Number(raw.dayStart) || 0,
+          poke: Number(raw.poke) || 0,
+          qzone: Number(raw.qzone) || 0,
+          link: Number(raw.link) || 0,
+        }, Date.now())
+      }
+    } catch {
+      // 第一次跑没有这个文件，就用空的
+    }
+  }
+
+  function saveInteractBudget() {
+    try {
+      mkdirSync(DATA_DIR, { recursive: true })
+      writeFileSync(interactPath, `${JSON.stringify(interactBudget, null, 2)}\n`, 'utf8')
+    } catch {
+      // 落盘失败不影响这一轮，最多重启后额度回滚
+    }
+  }
+
+  /**
+   * 先滚日、再看额度、过了就记一笔。
+   * @param {'poke'|'qzone'|'link'} kind
+   * @param {number} max
+   * @returns {{ok:true} | {ok:false, note:string}}
+   */
+  function takeInteract(kind, max) {
+    interactBudget = rollDay(interactBudget, Date.now())
+    const verdict = checkBudget(interactBudget, kind, max)
+    if (!verdict.ok) return { ok: false, note: verdict.reason ?? '这一项今天用完了' }
+    interactBudget = takeBudget(interactBudget, kind)
+    saveInteractBudget()
+    return { ok: true }
+  }
+
+  loadInteractBudget()
+
   /**
    * 现在能不能发表情。
    * 三道闸：最小间隔 → 每小时上限 → 概率。
@@ -1504,6 +1580,8 @@ export function apply(ctx, rawConfig) {
         parameters: { type: 'object', additionalProperties: false, properties: {} },
         output: CALL_OUTPUT,
         async execute() {
+          const gate = takeInteract('poke', config.interactPokeMaxPerDay)
+          if (!gate.ok) return { ok: false, note: gate.note, json: '' }
           const r = await callOneBot('send_poke', { user_id: ownerUin() })
           return r.ok ? { ok: true, note: '', json: '戳了他一下' } : { ok: false, note: r.note, json: '' }
         },
@@ -1645,7 +1723,9 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
           if (act === 'post') {
             const content = String(args?.content ?? '').trim()
             if (content === '') return { ok: false, note: '要发总得有正文。', json: '' }
-            const params = { content, ugc_right: Number(args?.ugc_right) || 1 }
+            const gate = takeInteract('qzone', config.interactQzoneMaxPerDay)
+            if (!gate.ok) return { ok: false, note: gate.note, json: '' }
+            const params = { content, ugc_right: Number(args?.ugc_right) || config.interactQzoneUgcRight }
             if (Array.isArray(args?.images) && args.images.length > 0) {
               params.images = args.images.map((s) => String(s))
             }
@@ -1673,6 +1753,52 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
           }
 
           return { ok: false, note: `不认识的 action：${act}`, json: '' }
+        },
+      },
+
+      {
+        name: 'qq_share',
+        description:
+          '分享一个网页给他 —— 发成一张图文卡片（标题 + 一句说明 + 点开能跳）。' +
+          '链接必须是你真搜到、真能打开的；编一个会被 QQ 拦成「该链接不安全」，他点开是空的。' +
+          '一天最多一次。',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['title', 'jump_url'],
+          properties: {
+            title: { type: 'string', description: '卡片标题。' },
+            jump_url: { type: 'string', description: '真实链接，必须 http:// 或 https:// 开头。' },
+            desc: { type: 'string', description: '一两句说明，可省略（默认用标题）。' },
+            preview_url: { type: 'string', description: '封面图 URL，可省略。' },
+            summary: { type: 'string', description: '卡片角标文字，默认 [分享]。' },
+          },
+        },
+        output: CALL_OUTPUT,
+        async execute(args) {
+          const title = String(args?.title ?? '').trim()
+          const jump = String(args?.jump_url ?? '').trim()
+          if (title === '' || jump === '') return { ok: false, note: 'title 和 jump_url 都得给。', json: '' }
+          if (!/^https?:\/\//i.test(jump)) {
+            return { ok: false, note: 'jump_url 必须是 http/https 开头的真实链接。', json: '' }
+          }
+          const gate = takeInteract('link', config.interactLinkMaxPerDay)
+          if (!gate.ok) return { ok: false, note: gate.note, json: '' }
+
+          const params = {
+            user_id: ownerUin(),
+            title,
+            desc: String(args?.desc ?? title),
+            summary: String(args?.summary ?? '[分享]'),
+            jump_url: jump,
+          }
+          const preview = String(args?.preview_url ?? '').trim()
+          if (preview !== '') params.preview_url = preview
+
+          const r = await callOneBot('send_tuwen_ark', params)
+          return r.ok
+            ? { ok: true, note: '', json: '卡片发出去了' }
+            : { ok: false, note: r.note, json: '' }
         },
       },
     ]

@@ -705,6 +705,7 @@ Add-Bool $g.Box ([ref]$inner) 'freeTalkEnabled' '启用自发开口（关掉就�
 Add-Number $g.Box ([ref]$inner) 'freeTalkSilenceMin' '你在 QQ 安静多久她才自己找话（分钟）' 'freeTalkSilenceMin' 1 600 1 0 15
 Add-Number $g.Box ([ref]$inner) 'freeTalkGapMin' '两次自发之间至少隔（分钟）' 'freeTalkGapMin' 1 1440 5 0 45
 Add-Number $g.Box ([ref]$inner) 'freeTalkMoodPercent' '情绪到多少才自发（%）' 'freeTalkMoodPercent' 0 100 5 0 45
+Add-Number $g.Box ([ref]$inner) 'goodnightSilenceMin' '说完晚安后多久不再找你（分钟，0 不禁）' 'goodnightSilenceMin' 10 1440 10 0 600
 $g.Box.Height = $inner + 8
 $y += $g.Box.Height + 10
 

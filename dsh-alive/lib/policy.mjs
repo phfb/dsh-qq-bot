@@ -444,8 +444,78 @@ const MOOD_LINE = {
  * @param {{moodHint?:string, silentMin:number, timeNote?:string, recallNote?:string}} ctx
  * @returns {string}
  */
+/**
+ * 这一轮她能用的动作 → 提示词里那一段。
+ *
+ * 2026-10-26 晚上加的：以前她「主动」只有两条路 —— 说一句话、或者发一张表情。
+ * 现在 qq-bot 给了她手（戳一戳 / 发说说 / 分享卡片），主动就不该只剩「开口」。
+ *
+ * 菜单由调用方按情绪和当日额度算出来，这里只负责把菜单翻成人话。
+ * 菜单里没有的动作一个字都不提 —— 提了她就会去试，试了被拒是浪费她一轮。
+ */
+function interactionLines(menu) {
+  const has = (k) => Array.isArray(menu) && menu.includes(k)
+  const lines = []
+  if (has('speak')) lines.push('- 说一句话：用你自己的语气，一两句，不超过 40 个字。')
+  if (has('poke')) lines.push('- 戳他一下：调 `qq_poke`。**这个不用说任何话**，戳完就戳完了。')
+  if (has('meme')) lines.push('- 发一张表情：调 `send_meme`，关键词挑最像你现在心情的。')
+  if (has('qzone')) lines.push('- 发一条说说：调 `qq_qzone`（action=post）。**所有人可见**，规则见下面。')
+  if (has('link')) lines.push('- 分享个东西给他：调 `qq_share`（title + jump_url）。链接必须是你真搜到的，不许编。')
+  return lines
+}
+
+/** 菜单里除「说话」之外没别的（或者根本没给菜单）→ 退回老行为。 */
+function onlySpeak(menu) {
+  return !Array.isArray(menu) || menu.filter((m) => m !== 'speak').length === 0
+}
+
+/**
+ * 「要求」那一段。有菜单就给菜单，没菜单就还是「只说一句话」。
+ * 发说说的内容闸门也在这里 —— 因为那条是所有人可见的，不能让她随手写。
+ */
+function requirementsSection(menu) {
+  if (onlySpeak(menu)) {
+    return [
+      '- 用你自己的语气说，一两句话，不超过 40 个字。',
+      '- 不要用括号写动作，不要写旁白。',
+      '- 这一轮只说话：不要调用任何工具，不要读写文件。',
+    ]
+  }
+
+  const lines = [
+    '你现在不一定要说话 —— 从下面挑一个最像「你此刻真会做的事」：',
+    ...interactionLines(menu),
+    '- 只挑一件，别一次全用上。',
+    '- 选了「戳一戳」就真的不用说话，别为了凑一句而凑。',
+    '- 如果某个动作返回 ok:false（今天用完了 / 被挡了），别纠缠，改成直接跟他说话。',
+    '- 不要用括号写动作，不要写旁白。',
+  ]
+
+  if (Array.isArray(menu) && menu.includes('qzone')) {
+    lines.push(
+      '',
+      '【发说说前必读】这条是所有人可见的，等于替他在社交圈公开说话：',
+      '- 不许出现「他」「我对象」「男朋友」这类关系词',
+      '- 不许出现学校、课程、住址、具体行程',
+      '- 只能写抽象心情、风景、吃的、日常感想（比如「今天下雨，突然很安静」）',
+      '- 写不出这样的内容就别发，改成戳他一下，或者直接跟他说话',
+    )
+  }
+
+  return lines
+}
+
+/**
+ * 生成投给模型的那条"她自己的念头"。
+ * 注意：这不是系统提醒，是第一人称的心里话。
+ *
+ * @param {object} loop
+ * @param {{moodHint?:string, silentMin:number, timeNote?:string, recallNote?:string, menu?:string[]}} ctx
+ * @returns {string}
+ */
 export function renderImpulse(loop, ctx) {
   const mood = MOOD_LINE[ctx?.moodHint ?? loop?.moodHint] ?? MOOD_LINE.flat
+  const requirements = requirementsSection(ctx?.menu)
 
   // 自发念头：没有"他说了要走"这回事，纯粹是她自己想说话
   if (loop?.kind === 'free') {
@@ -459,14 +529,12 @@ export function renderImpulse(loop, ctx) {
     if (ctx?.recallNote) lines.push(ctx.recallNote)
     lines.push(
       '',
-      `你现在想主动开口。${mood}`,
+      `你现在想主动找他。${mood}`,
       '',
       '要求：',
-      '- 用你自己的语气说，一两句话，不超过 40 个字。',
-      '- 这是没人叫你、你自己憋不住想说话 —— 别说"你怎么不回我""我等你半天了"这种讨债的话，也别解释你为什么突然开口。',
+      '- 这是没人叫你、你自己憋不住 —— 别说"你怎么不回我""我等你半天了"这种讨债的话，也别解释你为什么突然开口。',
       '- 不要问"在吗""你在干嘛"这种空话，要有具体的东西：他手头那件事、你今天怎么样、吃了什么。',
-      '- 不要用括号写动作，不要写旁白。',
-      '- 这一轮只说话：不要调用任何工具，不要读写文件。',
+      ...requirements,
     )
     return lines.join('\n')
   }
@@ -481,16 +549,63 @@ export function renderImpulse(loop, ctx) {
   if (ctx?.recallNote) lines.push(ctx.recallNote)
   lines.push(
     '',
-    `你现在有点想他了，想开口。${mood}`,
+    `你现在有点想他了。${mood}`,
     '',
     '要求：',
-    '- 用你自己的语气说，一两句话，不超过 40 个字。',
     '- 不要解释你为什么突然说话，不要说"我注意到"。',
     '- 不要问"在吗""你在干嘛"这种空话，要有具体的东西。',
-    '- 不要用括号写动作，不要写旁白。',
-    '- 这一轮只说话：不要调用任何工具，不要读写文件。',
+    ...requirements,
   )
   return lines.join('\n')
+}
+
+/* ──────────────────────── 6.5 道别闭环（说完晚安就别再找了） ──────────────────────── */
+
+/**
+ * 道别词。跟 qq-bot 的 lib/goodnight.mjs 是同一套判断 ——
+ * 两个插件各存一份，因为它们是独立包，不该互相 import。
+ */
+const FAREWELL_RE = /(晚安|睡了|睡啦|睡觉|先睡|去睡|眯一会|眯了|困了|拜拜|再见|明天见|回聊|早点睡|我下了|下线了|安啦|睡咯|歇了)/
+
+/**
+ * 这句话是不是道别。
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isFarewell(text) {
+  const t = String(text ?? '').trim()
+  if (t === '') return false
+  // 太长的多半在说事，不是单纯道别
+  if ([...t].length > 30) return false
+  return FAREWELL_RE.test(t)
+}
+
+/**
+ * 她最后说的那句话是不是道别（而且之后他没再说话）。
+ *
+ * 场景：她说「晚安」→ 他回「晚安」→ qq-bot 那边把这条吞了（不再回），
+ * 于是最后一条 assistant 还是她的晚安。这时候她绝不该再主动发任何东西 ——
+ * 不然就是「道完别还追着聊」。
+ *
+ * @param {Array<{role:string, text:string, at:string}>} shortTerm
+ * @param {{now?:number, gapMin?:number}} [opts]
+ * @returns {boolean}
+ */
+export function saidGoodbyeLast(shortTerm, opts = {}) {
+  const list = Array.isArray(shortTerm) ? shortTerm : []
+  const now = Number(opts.now) || Date.now()
+  // 默认 10 小时：一句话把一整个睡着的时间段都封住，天亮他说话了就自然恢复
+  const gapMin = Number(opts.gapMin) > 0 ? Number(opts.gapMin) : 600
+
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const m = list[i]
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue
+    if (m.role === 'user') return false // 最后一句是他说的 → 没闭环，照常
+    const at = Date.parse(String(m.at ?? ''))
+    if (Number.isFinite(at) && now - at > gapMin * 60_000) return false // 隔太久，算新的一轮
+    return isFarewell(m.text)
+  }
+  return false
 }
 
 /** 深夜 / 清早 / 饭点的时间感提示。 */

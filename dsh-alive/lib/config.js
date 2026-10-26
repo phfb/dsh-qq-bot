@@ -142,6 +142,14 @@ export const DEFAULTS = Object.freeze({
   /** 最主导的那一维情绪到这个百分比，才够自发开口的劲。 */
   freeTalkMoodPercent: 45,
 
+  /**
+   * 说完晚安之后，多久之内不再主动（分钟）。
+   *
+   * 她最后一句是道别、之后他没再说话 —— 那就是闭环了，别追着聊。
+   * 默认 600 分钟（10 小时）：一句话封住整晚，天亮他说话了自然恢复。
+   */
+  goodnightSilenceMin: 600,
+
   /** 状态文件目录。写死，别用 volatile。 */
   dataDir: join(homedir(), '.dsh-qq-bot'),
 })
@@ -214,6 +222,7 @@ export function parseConfig(raw) {
     freeTalkSilenceMin: num(input.freeTalkSilenceMin, DEFAULTS.freeTalkSilenceMin, { min: 1, max: 600 }),
     freeTalkGapMin: num(input.freeTalkGapMin, DEFAULTS.freeTalkGapMin, { min: 1, max: 1440 }),
     freeTalkMoodPercent: num(input.freeTalkMoodPercent, DEFAULTS.freeTalkMoodPercent, { min: 0, max: 100 }),
+    goodnightSilenceMin: num(input.goodnightSilenceMin, DEFAULTS.goodnightSilenceMin, { min: 10, max: 1440 }),
     dataDir: typeof input.dataDir === 'string' && input.dataDir.trim() !== '' ? input.dataDir.trim() : DEFAULTS.dataDir,
   }
 

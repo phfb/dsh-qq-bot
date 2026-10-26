@@ -13,10 +13,12 @@ import {
   detectControl,
   extractLoopIntent,
   inQuietHours,
+  isFarewell,
   jitterMs,
   maxAttemptsFor,
   parseTime,
   renderImpulse,
+  saidGoodbyeLast,
   scoreImpulse,
 } from '../lib/policy.mjs'
 import { LUST_ENABLED } from '../lib/mood.mjs'
@@ -432,11 +434,7 @@ test('buildFreeLoop: 涩涩没启用时不吃涩涩那一维', () => {
   const st = freeState({
     mood: { missing: 0.1, jealousy: 0, warmth: 0, worry: 0, boredom: 0.1, lust: 0.95, annoyanceDebt: 0 },
   })
-  // 面板上那颗正式开关没勾 → 无论源码怎么设，涩涩都不参与
   assert.equal(buildFreeLoop(st, { ...FREE_CFG, lustModeEnabled: false }, FREE_NOW), null)
-
-  // 勾上了，还要看源码里的 LUST_ENABLED —— 发布版默认 false，
-  // 所以这里按它的实际取值断言，两种默认值下测试都要成立
   const on = buildFreeLoop(st, FREE_CFG, FREE_NOW)
   if (LUST_ENABLED) {
     assert.ok(on)
@@ -463,4 +461,97 @@ test('renderImpulse: 自发念头说的是"他没说话"，不是引用一句空
   assert.ok(text.includes('42 分钟'), '应该说清安静了多久')
   assert.ok(!text.includes('「」'), '不该出现空引号（他根本没说过话）')
   assert.ok(text.includes('想他了'), '要把驱动它的那股情绪带上')
+})
+
+/* ── 主动不只是开口：互动菜单（2026-10-26 晚上加的） ── */
+
+const MENU_LOOP = { kind: 'free', what: '想他了，没理由也想说一句', freePercent: 100, moodHint: 'clingy' }
+
+test('renderImpulse: 没给菜单时还是老行为 —— 只说话', () => {
+  const text = renderImpulse(MENU_LOOP, { silentMin: 30 })
+  assert.match(text, /这一轮只说话/)
+  assert.ok(!text.includes('qq_poke'), '没给菜单就不该提工具')
+})
+
+test('renderImpulse: 菜单里有戳一戳，就告诉她可以不用说话', () => {
+  const text = renderImpulse(MENU_LOOP, { silentMin: 30, menu: ['speak', 'poke'] })
+  assert.match(text, /qq_poke/)
+  assert.match(text, /不用说任何话/)
+  assert.ok(!text.includes('这一轮只说话'), '有动作可选时不该再说“只说话”')
+})
+
+test('renderImpulse: 菜单里没有的动作一个字都不提', () => {
+  const text = renderImpulse(MENU_LOOP, { silentMin: 30, menu: ['speak', 'poke'] })
+  assert.ok(!text.includes('qq_qzone'), '没给 qzone 就不该提')
+  assert.ok(!text.includes('qq_share'), '没给 link 就不该提')
+})
+
+test('renderImpulse: 发说说时把“所有人可见”的闸门带上', () => {
+  const text = renderImpulse(MENU_LOOP, { silentMin: 30, menu: ['speak', 'qzone'] })
+  assert.match(text, /所有人可见/)
+  assert.match(text, /不许出现「他」/)
+  assert.match(text, /学校、课程、住址/)
+})
+
+test('renderImpulse: 不给 qzone 就不啰嗦那条闸门', () => {
+  const text = renderImpulse(MENU_LOOP, { silentMin: 30, menu: ['speak', 'poke', 'meme'] })
+  assert.ok(!text.includes('所有人可见'), '没发说说就不该提可见范围')
+})
+
+test('renderImpulse: 工具被拒时让她改说话，别卡死', () => {
+  const text = renderImpulse(MENU_LOOP, { silentMin: 30, menu: ['speak', 'poke'] })
+  assert.match(text, /ok:false/)
+})
+/* ── 道别闭环：说完晚安就别再找了（2026-10-27 加的） ── */
+
+const NOW = Date.parse('2026-10-27T00:30:00+08:00')
+
+test('saidGoodbyeLast: 她最后一句是晚安 → 闭嘴', () => {
+  const term = [
+    { role: 'user', text: '我睡了', at: new Date(NOW - 5 * 60_000).toISOString() },
+    { role: 'assistant', text: '晚安，早点睡', at: new Date(NOW - 4 * 60_000).toISOString() },
+  ]
+  assert.equal(saidGoodbyeLast(term, { now: NOW }), true)
+})
+
+test('saidGoodbyeLast: 最后一句是他说的 → 没闭环', () => {
+  const term = [
+    { role: 'assistant', text: '晚安', at: new Date(NOW - 5 * 60_000).toISOString() },
+    { role: 'user', text: '晚安', at: new Date(NOW - 2 * 60_000).toISOString() },
+  ]
+  assert.equal(saidGoodbyeLast(term, { now: NOW }), false)
+})
+
+test('saidGoodbyeLast: 她最后说的是别的事 → 照常', () => {
+  const term = [
+    { role: 'assistant', text: '那你记得吃饭', at: new Date(NOW - 3 * 60_000).toISOString() },
+  ]
+  assert.equal(saidGoodbyeLast(term, { now: NOW }), false)
+})
+
+test('saidGoodbyeLast: 隔太久就不算了（新的一轮）', () => {
+  const term = [
+    { role: 'assistant', text: '晚安', at: new Date(NOW - 11 * 3600_000).toISOString() },
+  ]
+  assert.equal(saidGoodbyeLast(term, { now: NOW }), false)
+})
+
+test('saidGoodbyeLast: 短间隔配置生效', () => {
+  const term = [
+    { role: 'assistant', text: '晚安', at: new Date(NOW - 30 * 60_000).toISOString() },
+  ]
+  assert.equal(saidGoodbyeLast(term, { now: NOW, gapMin: 60 }), true)
+  assert.equal(saidGoodbyeLast(term, { now: NOW, gapMin: 10 }), false)
+})
+
+test('saidGoodbyeLast: 空历史不炸', () => {
+  assert.equal(saidGoodbyeLast([], { now: NOW }), false)
+  assert.equal(saidGoodbyeLast(null, { now: NOW }), false)
+  assert.equal(saidGoodbyeLast(undefined, { now: NOW }), false)
+})
+
+test('isFarewell: 两边口径一致（alive 侧）', () => {
+  assert.equal(isFarewell('晚安'), true)
+  assert.equal(isFarewell('那个参数改好了'), false)
+  assert.equal(isFarewell(''), false)
 })

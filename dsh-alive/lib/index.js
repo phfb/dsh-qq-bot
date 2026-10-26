@@ -29,6 +29,7 @@ import {
   maxAttemptsFor,
   parseTime,
   renderImpulse,
+  saidGoodbyeLast,
   scoreImpulse,
   shortForLog,
   timeNoteFor,
@@ -102,6 +103,7 @@ function pickConfigForFile(config) {
     freeTalkSilenceMin: config.freeTalkSilenceMin,
     freeTalkGapMin: config.freeTalkGapMin,
     freeTalkMoodPercent: config.freeTalkMoodPercent,
+    goodnightSilenceMin: config.goodnightSilenceMin,
     dataDir: config.dataDir,
   }
 }
@@ -902,9 +904,53 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * 这一轮可以提哪些动作给她挑。
+   *
+   * 注意：这里**不是**在做额度硬限制 —— 真正的额度在 qq-bot 那边，
+   * 只有它知道她真调了什么。这里只回答一个问题：
+   * 「现在这个情绪下，她最可能想做哪几件事」。
+   * 给多了她会乱选，给少了又绑手绑脚，所以按情绪一维一维地放。
+   */
+  function buildInteractionMenu(now) {
+    const menu = ['speak']
+    const mood = state.mood
+    const missing = Number(mood.missing) || 0
+    const lust = Number(mood.lust) || 0
+    const jealousy = Number(mood.jealousy) || 0
+    const boredom = Number(mood.boredom) || 0
+    const warmth = Number(mood.warmth) || 0
+
+    // 想他 / 涩涩 / 吃醋 → 戳一下最自然，而且不用说任何话
+    if (missing >= 0.3 || lust >= 0.35 || jealousy >= 0.3) menu.push('poke')
+
+    // 表情：跟原来一样，由 memeChancePercent 说了算
+    if (config.memeChancePercent > 0) menu.push('meme')
+
+    // 凌晨发说说太怪，也容易让别人多想；分享东西同理
+    const hour = new Date(now).getHours()
+    const isNight = hour >= 23 || hour < 7
+
+    // 闲得慌 / 心里暖 → 才会想发条说说
+    if (!isNight && (boredom >= 0.3 || warmth >= 0.4)) menu.push('qzone')
+
+    // 闲到发慌 → 才会去翻东西分享给他
+    if (!isNight && boredom >= 0.5) menu.push('link')
+
+    return menu
+  }
+
   async function tryDeliver(now) {
     const agents = ctx.get('agents')
     if (!agents) return
+
+    /* 说完晚安就别再找了（2026-10-27 加的）。
+       她最后一句是道别、之后他没再说话 —— 那就是闭环了。
+       qq-bot 那边会把他的「晚安」吞掉（不再回），于是这里看到的就是
+       「她说了晚安」结尾，正好用来判断。 */
+    if (saidGoodbyeLast(state.focus.shortTerm, { now, gapMin: config.goodnightSilenceMin })) {
+      return
+    }
 
     const sessionId = resolveTargetSession()
     if (sessionId === '') {
@@ -1034,6 +1080,8 @@ export function apply(ctx, rawConfig) {
       silentMin,
       timeNote: timeNoteFor(now),
       recallNote: config.includeRecall ? recallNote(loop) : '',
+      // 「主动」不只是开口：这一轮她还能戳他、发说说、分享东西
+      menu: buildInteractionMenu(now),
     })
 
     if (config.dryRun) {
