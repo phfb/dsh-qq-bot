@@ -21,13 +21,18 @@ import { homedir } from 'node:os'
 import { parseConfig } from './config.js'
 import {
   buildFreeLoop,
+  buildGreetingLoop,
   checkGate,
+  dayKey,
   detectControl,
   extractLoopIntent,
+  greetingLabelOf,
+  greetingSlotOf,
   inQuietHours,
   jitterMs,
   maxAttemptsFor,
   parseTime,
+  pickGreetingMinute,
   renderImpulse,
   saidGoodbyeLast,
   scoreImpulse,
@@ -104,6 +109,9 @@ function pickConfigForFile(config) {
     freeTalkGapMin: config.freeTalkGapMin,
     freeTalkMoodPercent: config.freeTalkMoodPercent,
     goodnightSilenceMin: config.goodnightSilenceMin,
+    greetingEnabled: config.greetingEnabled,
+    greetingChancePercent: config.greetingChancePercent,
+    greetingWindows: config.greetingWindows,
     dataDir: config.dataDir,
   }
 }
@@ -230,6 +238,7 @@ function emptyState(config) {
       lastTeasedAt: null,
     },
     rhythm: { hourly: new Array(24).fill(0), samples: 0 },
+    greetings: { day: '', slots: {} },
     loops: [],
     episodes: [],
     stats: { byKind: {}, totalDelivered: 0, totalReplied: 0, abandoned: 0 },
@@ -250,6 +259,14 @@ function normalizeState(state, config) {
     rhythm: { ...base.rhythm, ...(state.rhythm ?? {}) },
     focus: { ...base.focus, ...(state.focus ?? {}) },
     stats: { ...base.stats, ...(state.stats ?? {}) },
+    greetings: state.greetings !== null && typeof state.greetings === 'object'
+      ? {
+          day: String(state.greetings.day ?? ''),
+          slots: state.greetings.slots !== null && typeof state.greetings.slots === 'object'
+            ? state.greetings.slots
+            : {},
+        }
+      : base.greetings,
     loops: Array.isArray(state.loops) ? state.loops : [],
     episodes: Array.isArray(state.episodes) ? state.episodes : [],
   }
@@ -940,6 +957,70 @@ export function apply(ctx, rawConfig) {
     return menu
   }
 
+  /** 本地当天 00:00 的毫秒时间戳。 */
+  function startOfLocalDay(now) {
+    const d = new Date(now)
+    d.setHours(0, 0, 0, 0)
+    return d.getTime()
+  }
+
+  /**
+   * 时段问候：早上 / 中午 / 晚上，随机，不是到点必发。
+   *
+   * 三个要点：
+   *   ① 每个窗口每天只**掷一次**骰子（rolled 标记）——
+   *      要是每跳都掷，概率会累积成必然，那就成闹钟了
+   *   ② 掷中之后不立刻发，排在窗口里的**随机一分钟**（七点整准时问好太假）
+   *   ③ 它走自己那条路：不占说话额度、不看打分阈值
+   *
+   * 但它**绕不过**静音 / 深夜 / 「别发了」/ 道别闭环 ——
+   * 「到点了」不是打扰他的理由。
+   */
+  function rollGreetings(now) {
+    if (config.greetingEnabled !== true) return
+
+    const today = dayKey(now)
+    if (state.greetings.day !== today) {
+      state.greetings = { day: today, slots: {} }
+    }
+
+    const slot = greetingSlotOf(now, config.greetingWindows)
+    if (slot < 0) return
+
+    const key = String(slot)
+    let rec = state.greetings.slots[key]
+
+    if (rec === undefined) {
+      const hit = Math.random() * 100 < config.greetingChancePercent
+      const minute = hit ? pickGreetingMinute(config.greetingWindows[slot]) : null
+      const plannedAt = minute === null ? null : startOfLocalDay(now) + minute * 60_000
+      state.greetings.slots[key] = { rolled: true, plannedAt, sent: false }
+      if (plannedAt !== null) {
+        const hh = String(new Date(plannedAt).getHours()).padStart(2, '0')
+        const mm = String(new Date(plannedAt).getMinutes()).padStart(2, '0')
+        writeLog('INFO', `今天「${greetingLabelOf(slot)}」这个窗口掷中了，排在 ${hh}:${mm}`)
+      }
+      save()
+      return
+    }
+
+    if (rec.sent === true || rec.plannedAt === null) return
+    if (now < rec.plannedAt) return
+
+    // 同一条问候还没投出去就别再造了
+    if (state.loops.some((l) => l.kind === 'greeting' && l.status === 'open')) return
+
+    const loop = buildGreetingLoop(now, slot, {
+      targetSession: config.targetSession,
+      staleMin: config.staleMin,
+    })
+    state.loops.push(loop)
+    if (state.loops.length > 40) state.loops = state.loops.slice(-40)
+    rec.sent = true
+    writeLog('INFO', `到点了，攒一条「${loop.what}」的念头`)
+    save()
+  }
+
   async function tryDeliver(now) {
     const agents = ctx.get('agents')
     if (!agents) return
@@ -949,7 +1030,9 @@ export function apply(ctx, rawConfig) {
        qq-bot 那边会把他的「晚安」吞掉（不再回），于是这里看到的就是
        「她说了晚安」结尾，正好用来判断。 */
     if (saidGoodbyeLast(state.focus.shortTerm, { now, gapMin: config.goodnightSilenceMin })) {
-      return
+      // 但「早上好」这种按时段来的问候不算追着聊 —— 它是新的一天，不是旧话题的续集
+      const greetingWaiting = state.loops.some((l) => l.kind === 'greeting' && l.status === 'open')
+      if (!greetingWaiting) return
     }
 
     const sessionId = resolveTargetSession()
@@ -1042,7 +1125,8 @@ export function apply(ctx, rawConfig) {
         // 情绪驱动的豁免：只放行「配额」和（可选）「总开关」两类，
         // 深夜 / 静音 / 他说过「别发了」照旧拦 —— 那些是底线，不是额度。
         exempt: {
-          quota: config.emotionBypassQuota === true,
+          // 问候是「到点了」，不是「情绪上来了」—— 它不占说话额度
+          quota: config.emotionBypassQuota === true || loop.kind === 'greeting',
           master: config.emotionBypassMaster === true,
         },
       })
@@ -1051,7 +1135,9 @@ export function apply(ctx, rawConfig) {
         continue
       }
       const { score, parts } = scoreImpulse(state, loop, config, now)
-      if (score < config.threshold) {
+      // 问候不走打分：它该不该发由时钟和骰子决定，不是「值不值得」
+      const need = loop.kind === 'greeting' ? 0 : config.threshold
+      if (score < need) {
         if (loop === freeLoop) freeFailed.push(`分数 ${score} < 阈值 ${config.threshold}`)
         continue
       }
@@ -1124,9 +1210,12 @@ export function apply(ctx, rawConfig) {
       loop.attempts = (Number(loop.attempts) || 0) + 1
       loop.lastAttemptAt = new Date(now).toISOString()
       loop.status = 'delivered'
-      state.quota.lastProactiveAt = new Date(now).toISOString()
-      state.quota.hourCount = (Number(state.quota.hourCount) || 0) + 1
-      state.quota.dayCount = (Number(state.quota.dayCount) || 0) + 1
+      // 问候不占说话额度（hour/day / 冷却都不算它的），只进统计
+      if (loop.kind !== 'greeting') {
+        state.quota.lastProactiveAt = new Date(now).toISOString()
+        state.quota.hourCount = (Number(state.quota.hourCount) || 0) + 1
+        state.quota.dayCount = (Number(state.quota.dayCount) || 0) + 1
+      }
       state.stats.totalDelivered = (Number(state.stats.totalDelivered) || 0) + 1
       const bImg = state.stats.byKind[loop.kind] ?? { sent: 0, hit: 0 }
       bImg.sent = (bImg.sent ?? 0) + 1
@@ -1554,6 +1643,8 @@ export function apply(ctx, rawConfig) {
       const now = Date.now()
       rollWindows(now)
       evolveMood(now)
+      // 时段问候：到窗口里掷一次骰子、到点就攒一条念头（不占说话额度）
+      rollGreetings(now)
       // 每跳都把演化后的情绪落盘：这样不管 DSH 是正常关、还是被强杀，
       // 下次启动读到的都是"关掉前最后一跳"的数值，而不是最早的快照。
       save()

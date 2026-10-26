@@ -9,14 +9,20 @@ import assert from 'node:assert/strict'
 
 import {
   buildFreeLoop,
+  buildGreetingLoop,
   checkGate,
+  dayKey,
   detectControl,
   extractLoopIntent,
+  greetingLabelOf,
+  greetingSlotOf,
   inQuietHours,
   isFarewell,
   jitterMs,
   maxAttemptsFor,
+  parseClockWindow,
   parseTime,
+  pickGreetingMinute,
   renderImpulse,
   saidGoodbyeLast,
   scoreImpulse,
@@ -554,4 +560,75 @@ test('isFarewell: 两边口径一致（alive 侧）', () => {
   assert.equal(isFarewell('晚安'), true)
   assert.equal(isFarewell('那个参数改好了'), false)
   assert.equal(isFarewell(''), false)
+})
+/* ── 时段问候：早上 / 中午 / 晚上（2026-10-27 加的） ── */
+
+test('parseClockWindow: 正常区间', () => {
+  assert.deepEqual(parseClockWindow('07:00-09:00'), { start: 420, end: 540 })
+  assert.deepEqual(parseClockWindow('11:30-13:00'), { start: 690, end: 780 })
+})
+
+test('parseClockWindow: 垃圾输入返回 null', () => {
+  assert.equal(parseClockWindow(''), null)
+  assert.equal(parseClockWindow('7点-9点'), null)
+  assert.equal(parseClockWindow('09:00-07:00'), null, '跨午夜不算问候窗口')
+})
+
+test('greetingSlotOf: 落在窗口里', () => {
+  const seven30 = new Date(2026, 9, 27, 7, 30, 0).getTime()
+  assert.equal(greetingSlotOf(seven30, undefined), 0)
+  const noon = new Date(2026, 9, 27, 12, 0, 0).getTime()
+  assert.equal(greetingSlotOf(noon, undefined), 1)
+  const eight = new Date(2026, 9, 27, 19, 0, 0).getTime()
+  assert.equal(greetingSlotOf(eight, undefined), 2)
+})
+
+test('greetingSlotOf: 窗口外返回 -1', () => {
+  const three = new Date(2026, 9, 27, 3, 0, 0).getTime()
+  assert.equal(greetingSlotOf(three, undefined), -1)
+  const six = new Date(2026, 9, 27, 6, 59, 0).getTime()
+  assert.equal(greetingSlotOf(six, undefined), -1)
+})
+
+test('pickGreetingMinute: 落在窗口内，而且不是开头', () => {
+  for (let i = 0; i < 40; i += 1) {
+    const m = pickGreetingMinute('07:00-09:00')
+    assert.ok(m >= 420 && m < 540, `超出窗口：${m}`)
+  }
+  // 固定随机数时能精确断言
+  assert.equal(pickGreetingMinute('07:00-09:00', () => 0), 420)
+  assert.equal(pickGreetingMinute('07:00-09:00', () => 0.999), 539)
+})
+
+test('dayKey: 同一天同一个键', () => {
+  const a = dayKey(new Date(2026, 9, 27, 1, 0, 0).getTime())
+  const b = dayKey(new Date(2026, 9, 27, 23, 59, 0).getTime())
+  assert.equal(a, b)
+  assert.equal(a, '2026-10-27')
+})
+
+test('greetingLabelOf: 三个窗口各自的问法', () => {
+  assert.equal(greetingLabelOf(0), '早上好')
+  assert.equal(greetingLabelOf(1), '中午好')
+  assert.equal(greetingLabelOf(2), '晚上好')
+  assert.equal(greetingLabelOf(9), '打个招呼')
+})
+
+test('buildGreetingLoop: 结构对，且不带"他说了什么"', () => {
+  const loop = buildGreetingLoop(NOW, 0, { targetSession: 'auto', staleMin: 30 })
+  assert.equal(loop.kind, 'greeting')
+  assert.equal(loop.source, 'greeting')
+  assert.equal(loop.status, 'open')
+  assert.equal(loop.quote, '')
+  assert.equal(loop.what, '早上好')
+  assert.ok(parseTime(loop.expectedBackAt) <= NOW, '到点即可投')
+  assert.ok(parseTime(loop.hardDeadlineAt) > NOW)
+})
+
+test('renderImpulse: 问候走自己的话术，不引用他的话', () => {
+  const loop = buildGreetingLoop(NOW, 0, { targetSlon: '', staleMin: 30 })
+  const text = renderImpulse(loop, {})
+  assert.match(text, /现在是早上/)
+  assert.match(text, /一句问候就够/)
+  assert.ok(!text.includes('「」'), '不该出现空引号')
 })

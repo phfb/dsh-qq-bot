@@ -517,6 +517,32 @@ export function renderImpulse(loop, ctx) {
   const mood = MOOD_LINE[ctx?.moodHint ?? loop?.moodHint] ?? MOOD_LINE.flat
   const requirements = requirementsSection(ctx?.menu)
 
+  // 时段问候：不是因为想他，是因为「现在这个时候」
+  if (loop?.kind === 'greeting') {
+    const label = String(loop?.what ?? '打个招呼')
+    const when = label === '早上好' ? '早上' : label === '中午好' ? '中午' : label === '晚上好' ? '晚上' : '这会儿'
+    const lines = [
+      '[你心里冒出来的话]',
+      '',
+      `现在是${when}。`,
+      '你想主动跟他说一句 —— 不是他找你，也不是你想他想得难受，就是到这个时候了。',
+    ]
+    if (ctx?.timeNote) lines.push(ctx.timeNote)
+    if (ctx?.recallNote) lines.push(ctx.recallNote)
+    lines.push(
+      '',
+      `你这会儿的心情：${mood}`,
+      '',
+      '要求：',
+      '- 一句问候就够，口语一点，别像客服群发（不要"您好，祝您今天愉快"）。',
+      '- 不要问"在吗""你在干嘛"这种空话。',
+      '- 可以带一句你自己此刻的状态：刚醒、在吃早饭、外面天气、刚忙完。',
+      '- 不要用括号写动作，不要写旁白。',
+      '- 这一轮只说话：不要调用任何工具，不要读写文件。',
+    )
+    return lines.join('\n')
+  }
+
   // 自发念头：没有"他说了要走"这回事，纯粹是她自己想说话
   if (loop?.kind === 'free') {
     const lines = [
@@ -557,6 +583,110 @@ export function renderImpulse(loop, ctx) {
     ...requirements,
   )
   return lines.join('\n')
+}
+
+/* ──────────────────────── 6.6 时段问候（早上 / 中午 / 晚上） ──────────────────────── */
+
+/**
+ * 问候窗口。每天每个窗口**最多**发一次，而且要先掷骰子 —— 不是到点必发。
+ *
+ * 为什么单独一条路：这是**时间驱动**的，跟情绪驱动不一样。
+ * 「想他 100%」是一种原因，「现在是早上七点」是另一种原因。
+ * 后者不该占前者那份额度，也不该被前者的冷却压住。
+ */
+export const DEFAULT_GREETING_WINDOWS = Object.freeze([
+  '07:00-09:00', // 早上
+  '11:30-13:00', // 中午
+  '18:00-20:00', // 晚上
+])
+
+/** "07:00-09:00" → { start: 420, end: 540 }（当天第几分钟）。格式不对返回 null。 */
+export function parseClockWindow(text) {
+  const m = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/.exec(String(text ?? '').trim())
+  if (m === null) return null
+  const start = Number(m[1]) * 60 + Number(m[2])
+  const end = Number(m[3]) * 60 + Number(m[4])
+  if (start < 0 || start >= 1440 || end <= 0 || end > 1440) return null
+  // 问候窗口不跨午夜（跨午夜那叫睡觉，不叫问候）
+  if (end <= start) return null
+  return { start, end }
+}
+
+/** 现在落在第几个问候窗口里？不在任何窗口里返回 -1。 */
+export function greetingSlotOf(now, windows) {
+  const list = Array.isArray(windows) && windows.length > 0 ? windows : DEFAULT_GREETING_WINDOWS
+  const d = new Date(now)
+  const minutes = d.getHours() * 60 + d.getMinutes()
+  for (let i = 0; i < list.length; i += 1) {
+    const w = parseClockWindow(list[i])
+    if (w === null) continue
+    if (minutes >= w.start && minutes < w.end) return i
+  }
+  return -1
+}
+
+/** 本地日期键（用来判「今天这个窗口处理过没有」）。 */
+export function dayKey(now) {
+  const d = new Date(now)
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${mm}-${dd}`
+}
+
+/**
+ * 在窗口里挑一个随机时刻（当天第几分钟）。
+ *
+ * 不取窗口开头 —— 七点整准时问好，比闹钟还假。
+ */
+export function pickGreetingMinute(windowText, rand = Math.random) {
+  const w = parseClockWindow(windowText)
+  if (w === null) return null
+  const span = Math.max(1, w.end - w.start)
+  return w.start + Math.floor(rand() * span)
+}
+
+/** 问候语按窗口轮着来，写死这三句就够（具体怎么说还是她自己组织）。 */
+export function greetingLabelOf(slotIndex) {
+  switch (Number(slotIndex)) {
+    case 0: return '早上好'
+    case 1: return '中午好'
+    case 2: return '晚上好'
+    default: return '打个招呼'
+  }
+}
+
+/**
+ * 造一条问候念头。
+ *
+ * 跟自发念头（kind='free'）的区别：
+ *   - 它来自时钟，不来自情绪，所以打分时**不看阈值**、也**不占说话额度**
+ *   - 它仍然要过静音 / 深夜 / 「别发了」/ 道别闭环这些底线闸门，
+ *     一条都绕不过去 —— 「到点了」不是打扰他的理由
+ *
+ * @param {number} now
+ * @param {number} slotIndex
+ * @param {{targetSession?:string, staleMin?:number}} opts
+ */
+export function buildGreetingLoop(now, slotIndex, opts = {}) {
+  const hard = now + (Number(opts.staleMin) || 30) * 60_000
+  const label = greetingLabelOf(slotIndex)
+  return {
+    id: `lp_greet_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    kind: 'greeting',
+    what: label,
+    quote: '',
+    createdAt: new Date(now).toISOString(),
+    expectedBackAt: new Date(now).toISOString(),
+    hardDeadlineAt: new Date(hard).toISOString(),
+    confidence: 0.9,
+    source: 'greeting',
+    status: 'open',
+    attempts: 0,
+    lastAttemptAt: null,
+    moodHint: 'warm',
+    sessionId: opts.targetSession ?? 'auto',
+    greetingSlot: Number(slotIndex),
+  }
 }
 
 /* ──────────────────────── 6.5 道别闭环（说完晚安就别再找了） ──────────────────────── */

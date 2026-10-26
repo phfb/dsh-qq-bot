@@ -709,6 +709,18 @@ Add-Number $g.Box ([ref]$inner) 'goodnightSilenceMin' '说完晚安后多久不�
 $g.Box.Height = $inner + 8
 $y += $g.Box.Height + 10
 
+# ── 时段问候（早上 / 中午 / 晚上）────────────────────────────────────────────
+# 2026-10-27 加。跟情绪驱动是两条路：这条是「到点了」，那条是「憋不住了」。
+# 所以它不占说话额度（小时/天/冷却都不算），只过静音、深夜、「别发了」这些底线。
+# 关键：每个窗口每天**先掷一次骰子**，掷中才排一个随机时刻 —— 不是到点必发。
+$g = New-Group '时段问候（早上 / 中午 / 晚上）' '到点了才可能问一句好，但先掷骰子再决定 —— 不会每天都问。它不占说话额度，静音 / 深夜 / 「别发了」 / 说完晚安 照样拦得住。' $y
+$inner = $g.Inner
+Add-Bool $g.Box ([ref]$inner) 'greetingEnabled' '启用时段问候' 'greetingEnabled' $true
+Add-Number $g.Box ([ref]$inner) 'greetingChancePercent' '每个窗口掷中的概率（%）' 'greetingChancePercent' 0 100 5 0 35
+Add-Text $g.Box ([ref]$inner) 'greetingWindows' '问候窗口（本地时间，逗号分隔）' 'greetingWindows' '例如 07:00-09:00, 11:30-13:00' $true
+$g.Box.Height = $inner + 8
+$y += $g.Box.Height + 10
+
 # ── 情绪驱动（她为什么非要找你）─────────────────────────────────────────────
 
 $g = New-Group '情绪驱动（她为什么非要找你）' '她的情绪不只给自己看：写进系统提示词会影响说话语气；情绪上来了还能突破额度主动开口。' $y

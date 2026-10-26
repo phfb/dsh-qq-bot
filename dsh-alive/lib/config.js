@@ -150,6 +150,19 @@ export const DEFAULTS = Object.freeze({
    */
   goodnightSilenceMin: 600,
 
+  /**
+   * 时段问候（早上 / 中午 / 晚上）。
+   *
+   * 它跟情绪驱动是两条路：这条是「到点了」，那条是「憋不住了」。
+   * 所以它**不占说话额度**（小时/天/冷却都不算它的），只过底线闸门。
+   * 而且每天每个窗口先掷一次骰子 —— 不是到点必发。
+   */
+  greetingEnabled: true,
+  /** 每个窗口掷中的概率（%）。35 = 三次里大概一次。 */
+  greetingChancePercent: 35,
+  /** 问候窗口，本地时间。每天每个窗口最多一次。 */
+  greetingWindows: Object.freeze(['07:00-09:00', '11:30-13:00', '18:00-20:00']),
+
   /** 状态文件目录。写死，别用 volatile。 */
   dataDir: join(homedir(), '.dsh-qq-bot'),
 })
@@ -223,6 +236,9 @@ export function parseConfig(raw) {
     freeTalkGapMin: num(input.freeTalkGapMin, DEFAULTS.freeTalkGapMin, { min: 1, max: 1440 }),
     freeTalkMoodPercent: num(input.freeTalkMoodPercent, DEFAULTS.freeTalkMoodPercent, { min: 0, max: 100 }),
     goodnightSilenceMin: num(input.goodnightSilenceMin, DEFAULTS.goodnightSilenceMin, { min: 10, max: 1440 }),
+    greetingEnabled: input.greetingEnabled !== false,
+    greetingChancePercent: num(input.greetingChancePercent, DEFAULTS.greetingChancePercent, { min: 0, max: 100 }),
+    greetingWindows: strArray(input.greetingWindows, DEFAULTS.greetingWindows),
     dataDir: typeof input.dataDir === 'string' && input.dataDir.trim() !== '' ? input.dataDir.trim() : DEFAULTS.dataDir,
   }
 
