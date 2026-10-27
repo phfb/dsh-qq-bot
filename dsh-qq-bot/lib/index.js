@@ -14,7 +14,7 @@
  * @module dsh-qq-bot
  */
 
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, unwatchFile, watchFile, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
@@ -91,6 +91,11 @@ export const TASK_SOURCE_KIND = 'dsh-qq-bot'
 let DATA_DIR = ''
 let LOG_DIR = ''
 let LOG_FILE = ''
+/**
+ * 当前生效的配置对象（就是 apply 里那个，热载会原地改它）。
+ * 模块级的 writeLog 要读 logRotateMB，只留这一个引用，别复制。
+ */
+let activeConfig = null
 
 /** 保证目录存在（失败只忽略，不能因此不启动）。 */
 function ensureDir(dir) {
@@ -101,12 +106,47 @@ function ensureDir(dir) {
   }
 }
 
+/**
+ * 日志轮转：超过上限就把 qq-bot.log 改名成 qq-bot.log.1（只留一份旧的），重新开始写。
+ *
+ * 为什么要有：这个文件只长不缩，一天几千行，跑久了排查反而更难 ——
+ * 2026-10-28 之前它已经几百 KB，而且 WARN（零正文 / 看门狗）会越来越多。
+ *
+ * 用累加字节数判断，不每行 stat 一次：写日志是热路径，别为它多做一次系统调用。
+ */
+let logBytes = 0
+
+/** 挂上日志文件时调用一次：把已有大小算进计数，别一启动就先轮转一次。 */
+function noteLogFile(file) {
+  LOG_FILE = file
+  logBytes = 0
+  try {
+    logBytes = statSync(file).size
+  } catch {
+    // 还没有这个文件，从 0 开始
+  }
+}
+
+function rotateLogIfNeeded(limitBytes) {
+  if (!(limitBytes > 0)) return
+  if (logBytes <= limitBytes) return
+  logBytes = 0
+  try {
+    // 只保留一份旧的：第二次轮转时直接覆盖 .1，不做 qq-bot.log.9 那种堆叠
+    renameSync(LOG_FILE, `${LOG_FILE}.1`)
+  } catch {
+    // 改不了名就继续往原文件写（总比丢日志强），下次再试
+  }
+}
+
 /** 写一行日志：文件 + 控制台。文件写失败不影响运行。 */
 function writeLog(level, message) {
   const line = `${new Date().toISOString()} [${level}] ${message}`
   if (LOG_FILE !== '') {
     try {
       appendFileSync(LOG_FILE, `${line}\n`)
+      logBytes += Buffer.byteLength(line) + 1
+      rotateLogIfNeeded(activeConfig !== null ? Math.round(Number(activeConfig.logRotateMB) || 0) * 1024 * 1024 : 0)
     } catch {
       // 磁盘满 / 没权限：放弃文件日志
     }
@@ -391,7 +431,7 @@ export function apply(ctx, rawConfig) {
   LOG_DIR = join(DATA_DIR, 'logs')
   ensureDir(DATA_DIR)
   ensureDir(LOG_DIR)
-  LOG_FILE = join(LOG_DIR, 'qq-bot.log')
+  noteLogFile(join(LOG_DIR, 'qq-bot.log'))
   CONFIG_FILE = join(DATA_DIR, 'config.json')
 
   /* 设置页保存过的值优先于 cordis.patch.yml 里的出厂默认 —— 这样用户在界面上
@@ -400,6 +440,9 @@ export function apply(ctx, rawConfig) {
   const { config, problems } = savedConfig !== null && typeof savedConfig === 'object'
     ? parseConfig({ ...(rawConfig ?? {}), ...savedConfig })
     : parsedBase
+
+  // 让模块级的 writeLog 能读到日志轮转上限（热载原地改 config，引用不用换）
+  activeConfig = config
 
   if (config.memesDir === '') config.memesDir = join(DATA_DIR, 'memes')
   ensureDir(config.memesDir)

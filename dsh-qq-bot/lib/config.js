@@ -282,6 +282,13 @@ export const DEFAULTS = Object.freeze({
    * 隔了几分钟他自己再讲一遍那是故意的，得让她听见。
    */
   dedupeSeconds: 8,
+
+  /**
+   * 日志轮转上限（MB）。超过就把 qq-bot.log 改名成 qq-bot.log.1，重新写。
+   * 0 = 不轮转（不推荐：这文件只长不缩，跑久了反而更难查）。
+   * 只保留一份旧的 .1，不做 .1 .2 .3 那种堆叠 —— 那只会让人不知道该看哪个。
+   */
+  logRotateMB: 10,
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -456,6 +463,7 @@ export function parseConfig(raw) {
     dedupeSeconds: Math.round(
       num(input.dedupeSeconds, DEFAULTS.dedupeSeconds, { min: 0, max: 120 }),
     ),
+    logRotateMB: num(input.logRotateMB, DEFAULTS.logRotateMB, { min: 0, max: 512 }),
 
     imageEnabled: input.imageEnabled !== false,
     imageDir: typeof input.imageDir === 'string' ? input.imageDir.trim() : '',
