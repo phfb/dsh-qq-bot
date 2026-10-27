@@ -42,6 +42,7 @@ import { ALLOWED_ACTIONS, checkAction, clampTarget } from './api-allowlist.mjs'
 import { checkBudget, emptyBudget, rollDay, takeBudget } from './interact-budget.mjs'
 import { isFarewell, shouldStopHere } from './goodnight.mjs'
 import { judgeTurnSilence } from './silence.mjs'
+import { judgeWatchdog } from './watchdog.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -1881,6 +1882,174 @@ export function apply(ctx, rawConfig) {
     void verifyBotAccount()
   }, 4000)
 
+  /* ── 看门狗：卡住就中断 + 关思考 + 催一句（2026-10-27）──────────────
+     零正文判定抓不到「请求发出去了、一直不回包」这种 —— 那一轮压根还没结束。
+     所以再加一层只看时间的：这一轮还在跑、却已经 N 秒没有任何事件，就该动手。
+
+     动手顺序（一次比一次硬）：
+       第一次 → 打断 + 临时关思考 + 催一句
+       第二次 → 打断 + 催（不再折腾档位）
+       到上限 → 开新对话
+
+     思考只对她这一个会话、且只对下一次请求生效，说完就恢复 —— 不永久关。 */
+
+  /** @type {Map<string, {inTurn: boolean, lastAt: number, strikes: number, switchedOff: boolean, prev: any}>} */
+  const watchdogState = new Map()
+  let watchdogTimer = null
+
+  function watchdogOf(uin) {
+    let state = watchdogState.get(uin)
+    if (state === undefined) {
+      state = { inTurn: false, lastAt: 0, strikes: 0, switchedOff: false, prev: null }
+      watchdogState.set(uin, state)
+    }
+    return state
+  }
+
+  /** 任何事件都算「她还活着」；顺便记下这一轮的起止。 */
+  function watchdogTouch(uin, event) {
+    const state = watchdogOf(uin)
+    state.lastAt = Date.now()
+    if (event?.type === 'turn/start') {
+      state.inTurn = true
+      return
+    }
+    if (event?.type === 'turn/end') state.inTurn = false
+  }
+
+  /** 把临时关掉的思考档位还回去。 */
+  async function restoreThinkingEffort(uin) {
+    const state = watchdogOf(uin)
+    if (!state.switchedOff) return
+    state.switchedOff = false
+    const prev = state.prev
+    state.prev = null
+    if (!prev || typeof prev.provider !== 'string' || typeof prev.model !== 'string') return
+    const service = ctx.get('sessionController')
+    const sessionId = sessions.get(uin)?.sessionId
+    if (!service || typeof service.selectModel !== 'function' || typeof sessionId !== 'string') return
+    try {
+      /** @type {Record<string, unknown>} */
+      const request = { sessionId, provider: prev.provider, model: prev.model }
+      if (typeof prev.reasoningEffort === 'string' && prev.reasoningEffort !== '') {
+        request.reasoningEffort = prev.reasoningEffort
+      }
+      await service.selectModel(request)
+      writeLog('INFO', `看门狗：思考档位已恢复（${prev.provider}/${prev.model}${prev.reasoningEffort ? ` ${prev.reasoningEffort}` : ''}）`)
+    } catch (err) {
+      writeLog(
+        'WARN',
+        `看门狗：恢复思考档位失败，她还停在 off 档：${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+
+  /** 临时把她这个会话的思考关掉（只对下一次请求生效）。 */
+  async function switchThinkingOff(uin, record) {
+    const state = watchdogOf(uin)
+    if (state.switchedOff) return true
+    const service = ctx.get('sessionController')
+    const sessionId = record?.sessionId
+    const selection = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {}
+    if (!service || typeof service.selectModel !== 'function' || typeof sessionId !== 'string') return false
+    if (typeof selection.provider !== 'string' || typeof selection.model !== 'string') return false
+    state.prev = {
+      provider: selection.provider,
+      model: selection.model,
+      reasoningEffort: selection.reasoningEffort,
+    }
+    try {
+      await service.selectModel({
+        sessionId,
+        provider: selection.provider,
+        model: selection.model,
+        reasoningEffort: 'off',
+      })
+      state.switchedOff = true
+      writeLog('INFO', `看门狗：这一轮先把思考关掉再试（${selection.provider}/${selection.model}）`)
+      return true
+    } catch (err) {
+      writeLog('WARN', `看门狗：关思考没成功，那就只重试：${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+  }
+
+  /** 到点了：动手。 */
+  async function watchdogRescue(uin, record, action) {
+    const state = watchdogOf(uin)
+    state.strikes += 1
+    state.lastAt = Date.now()
+
+    const agent = record?.agent
+    // ① 打断正在跑的那一轮，但别把排队的消息一起扔掉
+    if (agent && typeof agent.cancel === 'function') {
+      try {
+        agent.cancel({ kind: 'user' }, { keepInbox: true })
+        writeLog(
+          'WARN',
+          `看门狗：这一轮 ${config.watchdogSeconds} 秒没有动静，打断重来（第 ${state.strikes} 次）`,
+        )
+      } catch (err) {
+        writeLog('WARN', `看门狗：打断失败 ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
+    if (action === 'rollover') {
+      state.strikes = 0
+      await rolloverForSilence(uin, record, `看门狗救了 ${config.watchdogMaxStrikes} 次仍然没有输出`)
+      return
+    }
+
+    // ② 第一次救：临时关思考（第二次就不再动档位，免得来回切）
+    if (config.watchdogSwitchThinkingOff && state.strikes === 1) {
+      await switchThinkingOff(uin, record)
+    }
+
+    // ③ 催她接着说
+    if (agent && typeof agent.followup === 'function') {
+      await deliverTask(agent, config.watchdogNudgeText, 'watchdog-nudge').catch((err) => {
+        writeLog('WARN', `看门狗催话失败：${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
+  }
+
+  function startWatchdog() {
+    if (watchdogTimer !== null) return
+    // 定时器一律起来，阈值每次跳都从 config 现读 ——
+    // 这样设置页把 300 改成 600（配置热载）立刻生效，把 0 改成 300 也能自己活过来。
+    watchdogTimer = setInterval(() => {
+      const now = Date.now()
+      const thresholdMs = Math.round(Number(config.watchdogSeconds) || 0) * 1000
+      for (const [uin, state] of watchdogState) {
+        const action = judgeWatchdog({
+          inTurn: state.inTurn,
+          idleMs: now - state.lastAt,
+          thresholdMs,
+          strikes: state.strikes,
+          maxStrikes: config.watchdogMaxStrikes,
+        })
+        if (action !== 'rescue' && action !== 'rollover') continue
+        const record = sessions.get(uin)
+        if (!record) continue
+        void watchdogRescue(uin, record, action).catch((err) => {
+          writeLog('WARN', `看门狗动作失败：${err instanceof Error ? err.message : String(err)}`)
+        })
+      }
+    }, 5000)
+    if (typeof watchdogTimer.unref === 'function') watchdogTimer.unref()
+    writeLog(
+      'INFO',
+      `看门狗：已启动（一轮 ${config.watchdogSeconds} 秒没动静就救；最多救 ${config.watchdogMaxStrikes} 次，` +
+        `救的时候${config.watchdogSwitchThinkingOff ? '' : '不'}关思考）`,
+    )
+  }
+
+  function stopWatchdog() {
+    if (watchdogTimer === null) return
+    clearInterval(watchdogTimer)
+    watchdogTimer = null
+  }
+
   /* ── 出站：只认映射到 QQ 的那些会话 ── */
 
   /** session id → 他那个 QQ 号。认不出来返回 null。 */
@@ -1931,11 +2100,14 @@ export function apply(ctx, rawConfig) {
     try {
       const sessionId = session?.id
       if (typeof sessionId !== 'string') return
+      // 不是 QQ 会话就一个字都不发，也不进看门狗
+      const uin = uinForSession(sessionId)
+      if (uin === null) return
+      // 任何事件都算「她还活着」，顺便记下这一轮的起止
+      watchdogTouch(uin, event)
 
       /* ── 一轮结束：她这一轮到底说过话没有 ── */
       if (event?.type === 'turn/end') {
-        const uin = uinForSession(sessionId)
-        if (uin === null) return
         const turnNo = Number(event?.data?.turn)
         const state = turnSpeech.get(uin)
         // 这一轮压根没见到她的 assistant 事件（纯工具轮 / 我们自己派的活）→ 不判她的嘴
@@ -1949,12 +2121,16 @@ export function apply(ctx, rawConfig) {
           state.silentRun = 0
           turnSpeech.set(uin, state)
           writeLog('INFO', `她第 ${turnNo} 轮只动了手没说话（工具 ${state.toolCalls} 次），按故意处理，不催`)
+          void restoreThinkingEffort(uin)
           return
         }
 
         if (verdict === 'spoken') {
           state.silentRun = 0
           turnSpeech.set(uin, state)
+          // 这一轮正常说出话了：看门狗的计数归零，临时关掉的思考还回去
+          watchdogOf(uin).strikes = 0
+          void restoreThinkingEffort(uin)
           return
         }
         state.silentRun += 1
@@ -1994,9 +2170,6 @@ export function apply(ctx, rawConfig) {
       }
 
       if (event?.type !== 'assistant/message') return
-
-      const uin = uinForSession(sessionId)
-      if (uin === null) return // 不是 QQ 会话，一个字都不发
 
       const text = assistantText(event)
       // 这条日志是压测换新局时踩出来的：需要能一眼看出「事件到了但文本是 0 字」，
@@ -2878,6 +3051,7 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
 
   startDiaryTimer()
   startPollTimer()
+  startWatchdog()
 
   /* ── 清理：插件卸载 / 重载时全部拆掉 ── */
   ctx.effect(() => () => {
@@ -2885,6 +3059,7 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
       clearInterval(heartbeat)
       stopDiaryTimer()
       stopPollTimer()
+      stopWatchdog()
       offSession?.()
       offLocalCommands?.()
       offSessionTicks?.()

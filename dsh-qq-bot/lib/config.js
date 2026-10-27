@@ -236,6 +236,34 @@ export const DEFAULTS = Object.freeze({
 
   /** 推她那句话说什么。太长会干扰她，一句话就够。 */
   zeroTextNudgeText: '（刚才那轮你把话写在思考里了，正文一个字都没发出去 —— 她那边什么都没收到。把话直接说出来。）',
+
+  /* ── 看门狗（2026-10-27 加）──────────────────────────────────── */
+
+  /**
+   * 这一轮跑多久没有任何输出就算卡住（秒）。0 = 关掉看门狗。
+   *
+   * 300 秒是保守值：今晚实测有一轮「看起来死了」其实只是慢（等你把话说完 + 模型 110 秒），
+   * 门槛定低了会把正常的长回答误杀。
+   */
+  watchdogSeconds: 300,
+
+  /**
+   * 卡住时先推她一句，说什么。
+   * 注意这句是在**打断**她之后发的，所以要告诉她「刚才被打断了，接着说」。
+   */
+  watchdogNudgeText: '（刚才那一轮卡了太久，我把你打断了。别管刚才想到哪，直接把话说出来。）',
+
+  /**
+   * 卡住自救时临时把思考关掉（只对她这一个会话、只对下一次请求生效，说完就恢复）。
+   *
+   * 为什么要关：卡住的根因是思考把输出吃光了 / 思考完不吐正文。
+   * **需要 provider 目录里 off 档真的能关**（现在是 `null` = 不发送参数，等于没关），
+   * 别人的 provider 不支持 off 档时把这条设成 false 即可 —— 那就只中断重试，不碰档位。
+   */
+  watchdogSwitchThinkingOff: true,
+
+  /** 这一轮最多救几次，到了就开新对话。0 = 不救、直接换局。 */
+  watchdogMaxStrikes: 2,
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -395,6 +423,16 @@ export function parseConfig(raw) {
       ? input.zeroTextNudgeText.trim()
       : DEFAULTS.zeroTextNudgeText,
 
+    /* ── 看门狗 ── */
+    watchdogSeconds: parseWatchdogSeconds(input.watchdogSeconds, problems),
+    watchdogNudgeText: typeof input.watchdogNudgeText === 'string' && input.watchdogNudgeText.trim() !== ''
+      ? input.watchdogNudgeText.trim()
+      : DEFAULTS.watchdogNudgeText,
+    watchdogSwitchThinkingOff: input.watchdogSwitchThinkingOff !== false,
+    watchdogMaxStrikes: Math.round(
+      num(input.watchdogMaxStrikes, DEFAULTS.watchdogMaxStrikes, { min: 0, max: 5 }),
+    ),
+
     imageEnabled: input.imageEnabled !== false,
     imageDir: typeof input.imageDir === 'string' ? input.imageDir.trim() : '',
     // 上限夹在 512 MB ~ 6 GB：这是他在 2026-10-25 明确给的范围
@@ -447,6 +485,38 @@ function parseClock(value, fallback, problems) {
     return fallback
   }
   return `${String(m[1]).padStart(2, '0')}:${m[2]}`
+}
+
+/** 看门狗的时间范围（秒）。设置页的输入框也是这个范围。 */
+export const WATCHDOG_MIN_SECONDS = 180
+export const WATCHDOG_MAX_SECONDS = 900
+
+/**
+ * 校验看门狗阈值。
+ *
+ * 范围卡在 180~900 秒：低于 180 会把「她真的在慢慢想」当成卡死（2026-10-27 实测有一轮
+ * 只是因为他在连发消息 + 模型慢，整整 110 秒才回），高于 900 等于不管。
+ * 显式写 0 = 关掉看门狗（配置文件能写，设置页不给你这个选项）。
+ *
+ * @param {unknown} value
+ * @param {string[]} problems
+ * @returns {number}
+ */
+function parseWatchdogSeconds(value, problems) {
+  const fallback = DEFAULTS.watchdogSeconds
+  if (value === undefined || value === null) return fallback
+  const n = Number(value)
+  if (!Number.isFinite(n)) {
+    problems.push(`watchdogSeconds 不是数字，已退回 ${fallback}`)
+    return fallback
+  }
+  if (n === 0) return 0
+  if (n < WATCHDOG_MIN_SECONDS || n > WATCHDOG_MAX_SECONDS) {
+    const clamped = Math.min(WATCHDOG_MAX_SECONDS, Math.max(WATCHDOG_MIN_SECONDS, Math.round(n)))
+    problems.push(`watchdogSeconds 超出 ${WATCHDOG_MIN_SECONDS}~${WATCHDOG_MAX_SECONDS} 秒，已压到 ${clamped}`)
+    return clamped
+  }
+  return Math.round(n)
 }
 
 /**

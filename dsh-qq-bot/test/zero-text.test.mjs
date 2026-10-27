@@ -37,9 +37,9 @@ test('零正文先「推一句」，默认开，文案可换', () => {
   assert.equal(parseConfig({ zeroTextNudgeText: '   ' }).config.zeroTextNudgeText, DEFAULTS.zeroTextNudgeText)
 })
 
-test('换局阈值可以调到 35（本机现在就是 35，别让它回到 60）', () => {
-  // 代码默认仍是 80（老值，给别人装的时候别一上来就换局），
-  // 但这台机器的 config.json 已经改成 35 —— 上下文到 35 万 token 就开始换新局。
+test('换局阈值可配（代码默认 80，本机 config.json 现在是 60）', () => {
+  // 2026-10-27 中途试过 35，用户看过实际占用后改回 60 —— 别再拿错误的估算去改它。
   assert.equal(DEFAULTS.contextLimitPercent, 80)
   assert.equal(parseConfig({ contextLimitPercent: 35 }).config.contextLimitPercent, 35)
+  assert.equal(parseConfig({ contextLimitPercent: 60 }).config.contextLimitPercent, 60)
 })

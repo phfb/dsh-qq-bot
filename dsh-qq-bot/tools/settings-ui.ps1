@@ -303,6 +303,15 @@ Add-Number $g.Box ([ref]$inner) 'pollDays' '只看最近几天' 'qzonePollLookba
 $g.Box.Height = $inner + 8
 $y += $g.Box.Height + 10
 
+# --- 她卡住时（看门狗）------------------------------------------------------
+$g = New-Group '她卡住时（看门狗）' '她那一轮跑太久、一个字都没输出的时候，插件会先打断她、临时把思考关掉、再催一句「接着说」；还不行就开新局。太短会把「她在慢慢想」误杀（实测有一轮只是慢，整整 110 秒才回）。' $y
+$inner = $g.Inner
+Add-Number $g.Box ([ref]$inner) 'wdSecs' '多久没动静就算卡住（秒）' 'watchdogSeconds' 180 900 30 0
+Add-Number $g.Box ([ref]$inner) 'wdStrikes' '一轮最多救几次（到了就开新局）' 'watchdogMaxStrikes' 0 5 1 0
+Add-Bool $g.Box ([ref]$inner) 'wdNoThink' '救的时候临时关掉思考（说完自动恢复）' 'watchdogSwitchThinkingOff'
+$g.Box.Height = $inner + 8
+$y += $g.Box.Height + 10
+
 # --- 收图 -----------------------------------------------------------------
 $g = New-Group '收图（他发来的图片）' '收到图片先下载到本地，再把绝对路径贴进消息让她自己 read_image 看。同目录的 INDEX.md 记着每张图什么时候来的、他说了什么、她怎么回的。' $y
 $inner = $g.Inner
