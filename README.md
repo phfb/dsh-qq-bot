@@ -36,6 +36,8 @@
 - 回复会切成几条、带"正在输入"的停顿，看起来像人在打字；markdown 的 `**`、`` ` `` 不会漏到 QQ 里。
 - 能发表情包（模型自己决定什么时候发，有间隔 / 配额 / 概率三道闸门）。
 - 装了 dsh-alive 之后，她还会在你安静太久时主动开口 —— 不是定时器随机发消息，而是"你说了去拿外卖、18 分钟还没回来"这种具体的挂念。
+- **每日说说**（可选，默认关）：到点她自己写一篇日记发到 QQ 动态，80–2000 字，配 1–3 张图（一半现画、一半挑她的表情包）。时间不是准点，会在设定的窗口里随机挑一分钟。
+- **说说互动**（可选，默认关）：只在「想他 / 吃醋」压到阈值以上才去翻你的说说 —— 情绪不高的时候一次 API 都不调。发现有新评论（只认你那个号）或你发了新说说，就交给她自己决定回不回。
 
 **不是：**
 
@@ -66,6 +68,13 @@
 |---|---|
 | 让 QQ 消息能进能出 | [`dsh-qq-bot/README.md`](dsh-qq-bot/README.md) —— 从零配 SnowLuma、装插件、填配置、排查 1006 |
 | 让她会主动开口 | [`dsh-alive/README.md`](dsh-alive/README.md) —— 12 道闸门、节奏参数、装法与 junction 注意事项 |
+| 换模型时让旧会话也跟上 | `model-override` **分支**（不在 main）里的 `dsh-model-override/` —— 官方选择是按会话定死的，这个把它推到所有活着的会话 |
+
+主包都在 `main`；`dsh-model-override` 只在 `model-override` 分支上，因为它只对「模型选择按会话定死」这个问题有意义，不是所有人都需要：
+
+```bash
+git clone -b model-override https://github.com/phfb/dsh-qq-bot.git
+```
 
 两条路都一样：装进 DSH profile，重启 DSH，然后有个 **图形化设置窗口**（`tools\settings-ui.cmd` / `tools\settings-alive.cmd`）可以改参数，保存即热应用 —— 不用为了让一个数字生效去动 `cordis.patch.yml`（那文件改错会让整个宿主起不来）。
 
@@ -96,6 +105,15 @@
 └── dsh-alive/                  活人感插件
     ├── lib/                    index / config / policy（判定核心是纯函数、可单测）
     ├── test/
+    ├── tools/                  设置窗口
+    └── README.md
+```
+
+`model-override` 分支上还多一个（main 里没有）：
+
+```
+└── dsh-model-override/         把全局模型选择推到所有活着的会话
+    ├── lib/                    index（应用 + 校验）/ client（面板）
     ├── tools/                  设置窗口
     └── README.md
 ```

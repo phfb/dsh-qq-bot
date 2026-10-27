@@ -24,14 +24,15 @@
 
 ## 1. 它由什么组成
 
-四个插件 + 一个协议端：
+五个插件 + 一个协议端：
 
 | 组件 | 干什么 | 必需 |
 |---|---|---|
-| **dsh-qq-bot** | QQ 接入本身：收消息、发消息、图片、表情包 | ✅ 必需 |
+| **dsh-qq-bot** | QQ 接入本身：收消息、发消息、图片、表情包、每日说说、说说互动 | ✅ 必需 |
 | **ebbinghaus-memory** | 记忆：短期 / 长期 / 永久三分区，按遗忘曲线升级 | ✅ 强烈建议 |
 | **dsh-agent-md** | 人格：用 Markdown 写「她是谁」，每轮注入 | ✅ 强烈建议 |
 | **dsh-alive** | 活人感：情绪 + 主动开口 + 时段问候 | ⭕ 可选，但没它就是个哑巴 |
+| **dsh-model-override** | 把全局模型选择推到所有活着的会话（官方选择是按会话定死的） | ⭕ 可选，换模型的人才需要 |
 | **SnowLuma** | QQ 协议端：把 QQ 的私有协议翻成 OneBot 11 | ✅ 必需 |
 
 依赖关系：
@@ -42,6 +43,7 @@ QQ  ←→  SnowLuma  ←→  dsh-qq-bot  ←→  DSH agent
                           ebbinghaus-memory（记忆）
                           dsh-agent-md（人格）
                           dsh-alive（主动，依赖 qq-bot 的表情包 service）
+                          dsh-model-override（改模型，依赖 llm + sessionController）
 ```
 
 装错顺序会报错：**先装 qq-bot，再装其它**。alive 尤其要在 qq-bot 之后，它靠 `ctx.get('qqMeme')` 找表情包。
@@ -221,6 +223,38 @@ dsh plugin --profile desktop add "link:D:\dsh-plugins\dsh-qq-bot\dsh-alive"
 
 ## 7. 可选插件
 
+### 7.0 dsh-model-override（换模型时让旧会话也跟上）
+
+**什么时候需要它**：DSH 官方的模型选择是**按会话**的 —— 每个会话在创建那一刻就把模型
+钉死了，设置里换模型只影响**新**会话。QQ bot 建的那一局从建出来那天起就改不动：你在设置页
+换了 provider，它还在用旧的，请求全打到已经不存在的路由上。
+
+装上之后：选一次模型 → 立刻推到**所有活着的会话**（QQ 那局也在里面），并写进全局默认
+让新会话直接跟上。带一个设置窗口 `tools\settings-model.cmd`。
+
+**它不在 main 分支上**，放在这个仓库的 `model-override` 分支：
+
+```bash
+# 单独 clone 那一支
+git clone -b model-override https://github.com/phfb/dsh-qq-bot.git
+
+# 或者已经 clone 过 main
+git fetch origin model-override
+git checkout model-override
+```
+
+装法同第 3.1 步，只是目录指向 `dsh-model-override`；再在 `cordis.patch.yml` 里加一条
+insert（跟装其它插件一样），重启 DSH。
+
+| 配置 | 说明 |
+|---|---|
+| `provider` / `model` | 要推到所有会话的模型。**换 provider 时这里必须一起改** —— 指向一个已删除的 provider，QQ 那一局会变成死链 |
+| `reasoningEffort` | 留空 = 用模型默认 |
+
+2026-10-27 起，它在应用**之前**会先校验 provider 还在不在 `llm` 的注册表里：
+不在就一行都不套，面板上标红说明原因；`llm` 还没就绪时算「暂时判不了」，等下一轮重试，
+不会把「还没加载完」当成「坏了」。
+
 ### 7.1 dsh-whale-widget（余额挂件）
 
 DSH 界面右下角一只小鲸鱼，显示 API 余额、今日用量、峰谷定价。
@@ -273,6 +307,8 @@ DSH 界面右下角一只小鲸鱼，显示 API 余额、今日用量、峰谷�
 - [ ] 你说「我去洗澡」，十几分钟后她跟进一句（悬着的念头）
 - [ ] 你半天不理她，她会自己找话说（自发开口）
 - [ ] 你跟她说「晚安」、她也说「晚安」，之后她不再追着聊（道别闭环）
+- [ ] 换了 provider / 模型之后，**QQ 那一局也跟着变了**（装了 dsh-model-override 才有这条）
+- [ ] 打开「每日说说」开关并重启后，到点她会自己发一条说说到 QQ 动态（要另外在设置里打开）
 
 哪条不过，就看对应插件的日志：
 
@@ -280,7 +316,8 @@ DSH 界面右下角一只小鲸鱼，显示 API 余额、今日用量、峰谷�
 |---|---|
 | dsh-qq-bot | `<dataDir>\logs\qq-bot.log` |
 | dsh-alive | `<dataDir>\logs\alive.log` |
-| ebbinghaus-memory | 插件设置页 / 侧栏面板 |
+| dsh-model-override | `<dataDir>\model-override.log` |
+| ebbinghaus-memory | 插件设置页 / 侧栏面板的「固化日志」和「分区体检」 |
 
 ---
 
