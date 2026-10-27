@@ -280,6 +280,29 @@ Add-Number $g.Box ([ref]$inner) 'memeProb' '通过率（0~1）' 'memeProbability
 $g.Box.Height = $inner + 8
 $y += $g.Box.Height + 10
 
+# --- 每日说说（日记）-------------------------------------------------------
+$g = New-Group '每日说说（日记）' '到点让她自己写一篇日记发到 QQ 动态。默认关 —— 说说所有人可见，不该默认替你在社交圈发言。时间不做准点：会在「时间 + 窗口」里随机挑一分钟，免得一眼看出是机器人。' $y
+$inner = $g.Inner
+Add-Bool $g.Box ([ref]$inner) 'diaryOn' '每天写一篇日记发说说' 'qzoneDiaryEnabled'
+Add-Text $g.Box ([ref]$inner) 'diaryTime' '大概几点（HH:MM）' 'qzoneDiaryTime' '18:00'
+Add-Number $g.Box ([ref]$inner) 'diaryWin' '时间窗口（分钟，在这段里随机）' 'qzoneDiaryWindowMinutes' 1 720 10 0
+Add-Number $g.Box ([ref]$inner) 'diaryMinChars' '最少多少字' 'qzoneDiaryMinChars' 10 2000 10 0
+Add-Number $g.Box ([ref]$inner) 'diaryMaxChars' '最多多少字' 'qzoneDiaryMaxChars' 100 5000 100 0
+Add-Number $g.Box ([ref]$inner) 'diaryImgs' '配几张图（0~3）' 'qzoneDiaryImageCount' 0 3 1 0
+Add-Number $g.Box ([ref]$inner) 'diaryImgW' '配图里「现画」的比例（%，剩下挑表情包）' 'qzoneImageGenWeight' 0 100 10 0
+$g.Box.Height = $inner + 8
+$y += $g.Box.Height + 10
+
+# --- 说说互动（情绪驱动）----------------------------------------------------
+$g = New-Group '说说互动（只在想他/吃醋时）' '情绪没到阈值的时候一次都不会去翻他空间 —— 那不是她，那是监控。到了阈值才按间隔看看自己说说下的新评论（只认他那个号）、以及他有没有发新说说。' $y
+$inner = $g.Inner
+Add-Bool $g.Box ([ref]$inner) 'pollOn' '开启说说互动轮询' 'qzonePollEnabled'
+Add-Number $g.Box ([ref]$inner) 'pollTrig' '想他/吃醋到多少 % 才开始' 'qzonePollTriggerPercent' 1 100 5 0
+Add-Number $g.Box ([ref]$inner) 'pollGap' '轮询间隔（分钟）' 'qzonePollIntervalMinutes' 5 720 5 0
+Add-Number $g.Box ([ref]$inner) 'pollDays' '只看最近几天' 'qzonePollLookbackDays' 1 30 1 0
+$g.Box.Height = $inner + 8
+$y += $g.Box.Height + 10
+
 # --- 收图 -----------------------------------------------------------------
 $g = New-Group '收图（他发来的图片）' '收到图片先下载到本地，再把绝对路径贴进消息让她自己 read_image 看。同目录的 INDEX.md 记着每张图什么时候来的、他说了什么、她怎么回的。' $y
 $inner = $g.Inner
