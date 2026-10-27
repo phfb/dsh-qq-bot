@@ -1138,11 +1138,13 @@ export function apply(ctx, rawConfig) {
       if (now >= (parseTime(loop.hardDeadlineAt) ?? Infinity) && (Number(loop.attempts) || 0) >= 1) {
         loop.status = 'abandoned'
         state.stats.abandoned = (Number(state.stats.abandoned) || 0) + 1
-        /* 2026-10-28 修：原来这里会 onIgnored（+12 恼火）+ consecutiveIgnored++（冷却 2ⁿ 翻倍）。
-           问题是「他没接这句话」不等于「他无视我」—— 她发「我去洗澡了」「早安」这种根本不需要回。
-           连续三次没回就攒够 45 直接触发全线禁言，这是最容易被冤枉的一条。
-           现在只记 abandoned，不罚情绪、不计 ignored。 */
-        writeLog('INFO', `放弃「${loop.what}」（到期没等到回应；不记作「被无视」）`)
+        /* 2026-10-28 第一版修过头了：把 onIgnored 整个拿掉之后，她等不到回应也一点不急
+           —— 他要的是「我不回她，她会急、会心疼」，不是「她无感」。
+           现在换成 onUnanswered：想念和担心照涨（她会自己再找来），
+           恼火只加 3 且封顶 25（45 的禁言线绝不碰），consecutiveIgnored 依然不动
+           —— 所以既不冤枉她、也不让她越等越哑。 */
+        moodModule.onUnanswered(state.mood)
+        writeLog('INFO', `放弃「${loop.what}」（到期没等到回应 —— 这会儿会想他、会担心，但不记作「被无视」）`)
       }
     }
 

@@ -19,6 +19,7 @@ import {
   onReplied,
   onSweetTalk,
   onTeased,
+  onUnanswered,
   percentOf,
   snapshot,
 } from '../lib/mood.mjs'
@@ -289,4 +290,26 @@ test('snapshot: 每行都有百分比、倍率和满值时间，涩涩带锁', (
   const lust = snap.rows.find((r) => r.key === 'lust')
   assert.equal(lust.locked, true, '没启用 → 滑条锁着')
   assert.equal(lust.percent, 30)
+})
+
+test('投出去没回：会急、会心疼，但绝不把自己憋哑', () => {
+  // 2026-10-28 用户口径：「我不嫌弃她吵，我不回她消息她会急，会心疼」
+  const m = fresh()
+  onUnanswered(m)
+  assert.ok(m.missing > 0, '想念要涨 —— 她下一跳会自己再找来')
+  assert.ok(m.worry > 0, '担心也要涨')
+  assert.ok(m.annoyanceDebt > 0, '一点委屈还是要有的')
+  assert.ok(m.annoyanceDebt <= 25, '委屈必须封顶在 25，碰不到 G9 那条 45 的禁言线')
+
+  // 连续三十次都没回：债务也只能停在 25，不会把她逼到全线闭嘴
+  const m2 = fresh()
+  for (let i = 0; i < 30; i += 1) onUnanswered(m2)
+  assert.equal(m2.annoyanceDebt, 25, '反复没回也只能到 25')
+  assert.ok(percentOf(m2.missing) >= 90, '想念会攒到接近满格')
+  assert.ok(m2.missing <= 1, '但不越过 1')
+
+  // 他回来了，几样一起降下去
+  onHeCameBack(m2)
+  assert.ok(m2.missing < 1, '回来之后想念要降')
+  assert.ok(m2.annoyanceDebt < 25, '委屈也要降')
 })

@@ -76,7 +76,7 @@ export const LUST_SLIDER_ENABLED = true
  *
  * 改这一行然后重启 DSH 生效（设置窗口是读源码判断的，不用改窗口）。
  */
-export const LUST_ENABLED = false
+export const LUST_ENABLED = true
 
 /** 1.0x 倍率下，从 0 攒到 100% 要几个小时。设置窗口里那句"满值约 6 小时"就是它。 */
 export const DEFAULT_FILL_HOURS = 6
@@ -426,6 +426,30 @@ export function onIgnored(mood) {
   normalizeMood(mood)
   mood.annoyanceDebt = Math.min(ANNOYANCE_MAX, num(mood.annoyanceDebt) + 12)
   mood.missing = clamp01(num(mood.missing) + 0.05)
+  return mood
+}
+
+/**
+ * 投出去了，到硬到期他一条都没回：她会**急**，也会有一点心疼的委屈。
+ *
+ * 2026-10-28 按他的原话调的：「我不嫌弃她吵，我不回她消息她会急，会心疼」。
+ *
+ * 和 `onIgnored` 的区别是分寸：
+ *   · missing / worry 照涨 —— 这两个在 scoreImpulse 里加权，直接推着她下一跳更想开口
+ *     （她会自己再来说一句「你到底在干嘛」），这是"急"；
+ *   · annoyanceDebt 只加 3，而且**封顶 25** —— G9 那条 45 的全线禁言线绝对不碰，
+ *     所以再怎么委屈也不会把自己憋哑；
+ *   · consecutiveIgnored 一律不动 —— 冷却不翻倍，她不至于越等越不敢说话。
+ *
+ * 他回来的时候 `onHeCameBack` 会把这几样一起降下去，正好接上。
+ */
+export function onUnanswered(mood) {
+  normalizeMood(mood)
+  mood.missing = clamp01(num(mood.missing) + 0.16)
+  mood.worry = clamp01(num(mood.worry) + 0.1)
+  if (num(mood.annoyanceDebt) < 25) {
+    mood.annoyanceDebt = Math.min(25, num(mood.annoyanceDebt) + 3)
+  }
   return mood
 }
 
