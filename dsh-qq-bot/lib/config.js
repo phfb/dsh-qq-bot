@@ -210,6 +210,17 @@ export const DEFAULTS = Object.freeze({
    * 0 = 不盯。
    */
   taskDeliveryWatchSeconds: 90,
+
+  /**
+   * 连续几轮「一个字都没说出来」就主动换新局。
+   *
+   * 2026-10-27 踩的：上下文压到 58 万 token 时，flash 模型开始只 thinking 不给正文，
+   * 于是她在 QQ 里安静了十几分钟，日志里只有几行「本段 0 字」，没人知道出事了。
+   * 换局是唯一的止血办法，但换局原本只在「她真说出话」之后才判定 —— 越不说话越换不了。
+   *
+   * 0 = 不自动换（只报警）。
+   */
+  zeroTextRolloverTurns: 2,
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -359,6 +370,9 @@ export function parseConfig(raw) {
     taskSourceKind: parseSourceKind(input.taskSourceKind, problems),
     taskDeliveryWatchSeconds: Math.round(
       num(input.taskDeliveryWatchSeconds, DEFAULTS.taskDeliveryWatchSeconds, { min: 0, max: 3600 }),
+    ),
+    zeroTextRolloverTurns: Math.round(
+      num(input.zeroTextRolloverTurns, DEFAULTS.zeroTextRolloverTurns, { min: 0, max: 10 }),
     ),
 
     imageEnabled: input.imageEnabled !== false,

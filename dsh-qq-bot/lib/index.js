@@ -1854,21 +1854,87 @@ export function apply(ctx, rawConfig) {
   }, 4000)
 
   /* ── 出站：只认映射到 QQ 的那些会话 ── */
+
+  /** session id → 他那个 QQ 号。认不出来返回 null。 */
+  function uinForSession(sessionId) {
+    if (typeof sessionId !== 'string') return null
+    for (const [candidateUin, record] of sessions) {
+      if (record.sessionId === sessionId) return candidateUin
+    }
+    // 刚换过局：旧会话这一轮的尾巴也要能发出去
+    return legacyIds.get(sessionId)?.uin ?? null
+  }
+
+  /**
+   * 每个 QQ 会话「这一轮说过话没有 / 连续几轮没说」。
+   *
+   * 零正文是**静默故障**：模型只 thinking 不给正文的时候，QQ 那边就是一句不回，
+   * 日志里只有几行「本段 0 字」——没人会盯着那几行看。2026-10-27 她就这么安静了十几分钟。
+   *
+   * @type {Map<string, {turn: number, spoke: boolean, silentRun: number}>}
+   */
+  const turnSpeech = new Map()
+
+  /**
+   * 连续零正文到阈值就主动换局。
+   *
+   * 为什么不只靠 maybeRollover：它判的是「上下文百分比」——
+   * 模型坏掉、或者上下文根本量不出来（没挂 tokenMeter）的时候它永远不触发，
+   * 而那正是她完全不出声的时候。越不说话，越等不到救援。
+   */
+  async function rolloverForSilence(uin, record, reason) {
+    if (rollingOver.has(uin)) return
+    rollingOver.add(uin)
+    try {
+      const usage = contextUsage(record) ?? { used: 0, limit: resolveContextWindow(), percent: 0 }
+      writeLog('WARN', `连续零正文，主动换新局（${reason}）`)
+      const switched = await rolloverSession(uin, record, usage)
+      if (switched) rolloverAt.set(uin, Date.now())
+      else writeLog('ERROR', `换局失败（${reason}）—— 这个会话可能要人工介入了`)
+    } finally {
+      rollingOver.delete(uin)
+    }
+  }
+
   const offSession = ctx.on('session/event', (session, event) => {
     try {
-      if (event?.type !== 'assistant/message') return
       const sessionId = session?.id
       if (typeof sessionId !== 'string') return
 
-      let uin = null
-      for (const [candidateUin, record] of sessions) {
-        if (record.sessionId === sessionId) {
-          uin = candidateUin
-          break
+      /* ── 一轮结束：她这一轮到底说过话没有 ── */
+      if (event?.type === 'turn/end') {
+        const uin = uinForSession(sessionId)
+        if (uin === null) return
+        const turnNo = Number(event?.data?.turn)
+        const state = turnSpeech.get(uin)
+        // 这一轮压根没见到她的 assistant 事件（纯工具轮 / 我们自己派的活）→ 不判她的嘴
+        if (!state || state.turn !== turnNo) return
+        if (state.spoke) {
+          state.silentRun = 0
+          turnSpeech.set(uin, state)
+          return
         }
+        state.silentRun += 1
+        state.spoke = false
+        turnSpeech.set(uin, state)
+        writeLog(
+          'WARN',
+          `她第 ${turnNo} 轮一个字都没说出来（连续 ${state.silentRun} 轮）—— 模型只 thinking 不给正文，先查上下文大小和模型`,
+        )
+        const limit = Math.round(Number(config.zeroTextRolloverTurns) || 0)
+        if (limit > 0 && state.silentRun >= limit) {
+          state.silentRun = 0
+          turnSpeech.set(uin, state)
+          void rolloverForSilence(uin, sessions.get(uin), `连续 ${limit} 轮零正文`).catch((err) => {
+            writeLog('WARN', `零正文换局失败：${err instanceof Error ? err.message : String(err)}`)
+          })
+        }
+        return
       }
-      // 刚换过局：旧会话这一轮的尾巴也要能发出去
-      if (uin === null) uin = legacyIds.get(sessionId)?.uin ?? null
+
+      if (event?.type !== 'assistant/message') return
+
+      const uin = uinForSession(sessionId)
       if (uin === null) return // 不是 QQ 会话，一个字都不发
 
       const text = assistantText(event)
@@ -1876,6 +1942,18 @@ export function apply(ctx, rawConfig) {
       // 否则只会看到"她没回话"，分不清是模型没说话还是出站把他吞了。
       writeLog('INFO', `出站：${sessionId.slice(0, 13)}… 匹配 QQ ${uin}，本段 ${text.length} 字`)
       if (text !== '') enqueueReply(uin, text)
+
+      // 记一笔：这一轮她说出话了没有？零正文的判定全靠 turnSpeech
+      const turnNo = Number(event?.data?.turn)
+      if (Number.isFinite(turnNo)) {
+        const state = turnSpeech.get(uin) ?? { turn: -1, spoke: false, silentRun: 0 }
+        if (state.turn !== turnNo) {
+          state.turn = turnNo
+          state.spoke = false
+        }
+        if (text !== '') state.spoke = true
+        turnSpeech.set(uin, state)
+      }
 
       // 把"这一轮我怎么回的"回填进图片索引 —— 索引里那列空着，过一个月就没人记得那张图是干嘛的
       if (text !== '' && imageStore !== null) {
@@ -1889,16 +1967,12 @@ export function apply(ctx, rawConfig) {
       // 一轮结束，顺手量一下上下文；快满了就换新局（异步，不挡这轮回复）。
       // 只在"这一轮真说出了话"时才考虑换局 —— 多步 agent 的中间 step 也会发
       // assistant/message（常常是空文本），在那儿换局会把本轮回复直接判死。
+      // 零正文的情况归上面 turn/end 那段管（rolloverForSilence），不在这儿判。
       if (text !== '') {
         void maybeRollover(uin, sessions.get(uin)).catch((err) => {
           writeLog('WARN', `上下文检查失败：${err instanceof Error ? err.message : String(err)}`)
         })
       }
-
-      // 一轮结束，顺手量一下上下文；快满了就换新局（异步，不挡这轮回复）
-      void maybeRollover(uin, sessions.get(uin)).catch((err) => {
-        writeLog('WARN', `上下文检查失败：${err instanceof Error ? err.message : String(err)}`)
-      })
     } catch (err) {
       writeLog('ERROR', `出站失败：${err instanceof Error ? err.message : String(err)}`)
     }
