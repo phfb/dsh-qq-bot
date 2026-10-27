@@ -41,6 +41,7 @@ import { socialEventToText } from './notice.mjs'
 import { ALLOWED_ACTIONS, checkAction, clampTarget } from './api-allowlist.mjs'
 import { checkBudget, emptyBudget, rollDay, takeBudget } from './interact-budget.mjs'
 import { isFarewell, shouldStopHere } from './goodnight.mjs'
+import { judgeTurnSilence } from './silence.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -333,6 +334,33 @@ function assistantText(event) {
     .map((b) => b.text)
     .join('')
     .trim()
+}
+
+/**
+ * assistant 这一步的「思考」有多少字。
+ *
+ * 用来分辨两种零正文：思考里躺着整段回复 = 答案写错通道了（该催），
+ * 思考里也是空的 = 她本来就没打算说话（别催）。
+ */
+function assistantReasoningLen(event) {
+  const content = event?.data?.message?.content
+  if (!Array.isArray(content)) return 0
+  let len = 0
+  for (const block of content) {
+    if (block && block.type === 'reasoning' && typeof block.text === 'string') len += block.text.length
+  }
+  return len
+}
+
+/** assistant 这一步调了几次工具（两家宿主字段名不一样，都认）。 */
+function assistantToolCallCount(event) {
+  const message = event?.data?.message
+  const direct = Array.isArray(message?.toolCalls) ? message.toolCalls.length : 0
+  const content = message?.content
+  const inContent = Array.isArray(content)
+    ? content.filter((b) => b && (b.type === 'tool-call' || b.type === 'toolCall')).length
+    : 0
+  return Math.max(direct, inContent)
 }
 
 /**
@@ -1912,7 +1940,19 @@ export function apply(ctx, rawConfig) {
         const state = turnSpeech.get(uin)
         // 这一轮压根没见到她的 assistant 事件（纯工具轮 / 我们自己派的活）→ 不判她的嘴
         if (!state || state.turn !== turnNo) return
-        if (state.spoke) {
+
+        const verdict = judgeTurnSilence(state)
+
+        if (verdict === 'quiet') {
+          // 她动了手（戳一戳、点赞、发表情包）但没说话 —— 那是她的表达方式，不是故障。
+          // 2026-10-27 补的：不区分这个，她每次故意不吭声都会被"催话"，等于嫌她多做了动作。
+          state.silentRun = 0
+          turnSpeech.set(uin, state)
+          writeLog('INFO', `她第 ${turnNo} 轮只动了手没说话（工具 ${state.toolCalls} 次），按故意处理，不催`)
+          return
+        }
+
+        if (verdict === 'spoken') {
           state.silentRun = 0
           turnSpeech.set(uin, state)
           return
@@ -1920,12 +1960,12 @@ export function apply(ctx, rawConfig) {
         state.silentRun += 1
         state.spoke = false
         turnSpeech.set(uin, state)
-        // 2026-10-27 查出来的真相：模型常常把**整段回复**写进思考通道，正文留空就 stop
-        // （reasoning 里能看到"分条。看到了 / 两条 8G 的 DDR4-3200…"这种已经起草好的话）。
-        // 平时下一步会把话补出来，落在最后一步就彻底静音 —— 他那边一个字都收不到。
+        // 走到这儿就是 judgeTurnSilence 判的 stuck：要么思考里躺着整段回复（答案写错通道），
+        // 要么这一轮连手都没动、一个字也没有。两种都得有人喊一嗓子。
         writeLog(
           'WARN',
-          `她第 ${turnNo} 轮一个字都没说出来（连续 ${state.silentRun} 轮）—— 答案写在思考里了，正文是空的`,
+          `她第 ${turnNo} 轮一个字都没说出来（连续 ${state.silentRun} 轮）—— ` +
+            `思考 ${state.lastReasoningLen} 字 / 工具 ${state.toolCalls} 次，答案很可能写在思考里了`,
         )
 
         // 先推她一句把话补出来。只推第一轮，且 20 秒内不重复推 ——
@@ -1967,12 +2007,29 @@ export function apply(ctx, rawConfig) {
       // 记一笔：这一轮她说出话了没有？零正文的判定全靠 turnSpeech
       const turnNo = Number(event?.data?.turn)
       if (Number.isFinite(turnNo)) {
-        const state = turnSpeech.get(uin) ?? { turn: -1, spoke: false, silentRun: 0 }
+        const state = turnSpeech.get(uin) ?? {
+          turn: -1,
+          spoke: false,
+          silentRun: 0,
+          hadToolCall: false,
+          toolCalls: 0,
+          lastReasoningLen: 0,
+        }
         if (state.turn !== turnNo) {
           state.turn = turnNo
           state.spoke = false
+          state.hadToolCall = false
+          state.toolCalls = 0
+          state.lastReasoningLen = 0
         }
         if (text !== '') state.spoke = true
+        // 最后一步的思考字数 + 这一轮动过几次手 —— 判定「故障」还是「故意的」全靠这两个
+        state.lastReasoningLen = assistantReasoningLen(event)
+        const calls = assistantToolCallCount(event)
+        if (calls > 0) {
+          state.hadToolCall = true
+          state.toolCalls += calls
+        }
         turnSpeech.set(uin, state)
       }
 
