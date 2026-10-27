@@ -2,7 +2,7 @@
  * dsh-alive 的判定核心。全是纯函数：不碰 IO、不碰 ctx、不碰网络。
  *
  * 想改她的"分寸"，改这个文件就够了；改完跑
- *   node --test "test/*.test.mjs"     （在 dsh-alive 目录下跑）
+ *   D:\Astrbot\Snowluma\node.exe --test "D:\DSHBot\plugin\dsh-alive\test\*.test.mjs"
  */
 
 import { LUST_ENABLED } from './mood.mjs'
@@ -164,6 +164,9 @@ export function checkGate(state, config, loop, env) {
    */
   const exempt = env?.exempt ?? {}
 
+  // 2026-10-28：设置页那个「启用活人感」写的是 config.enabled，而这里原来只认 state.control.enabled
+  // —— 于是那个勾选框根本不生效。现在两个都要开（config = 装不装，state = 运行期临时闭嘴）。
+  if (config?.enabled === false && exempt.master !== true) failed.push('G1:disabled-by-config')
   if (state.control?.enabled !== true && exempt.master !== true) failed.push('G1:disabled')
   if (state.control?.hardOff === true && exempt.master !== true) failed.push('G2:hardOff')
 

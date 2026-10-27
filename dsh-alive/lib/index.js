@@ -298,15 +298,23 @@ export function apply(ctx, rawConfig) {
      首次启动落一份基线，这样设置窗口一打开读到的就是当前真实生效值。 */
   const cfgPath = join(parsedBase.config.dataDir, 'alive-config.json')
   let savedCfg = null
+  /** 读失败的原因（null = 没失败）。失败时**绝不能**拿出厂值把它覆盖掉。 */
+  let cfgReadError = null
   try {
     if (existsSync(cfgPath)) savedCfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
   } catch (err) {
     savedCfg = null
+    cfgReadError = err instanceof Error ? err.message : String(err)
   }
   const { config, problems } = savedCfg !== null && typeof savedCfg === 'object'
     ? parseConfig({ ...(rawConfig ?? {}), ...savedCfg })
     : parsedBase
-  if (savedCfg === null) {
+  /* 2026-10-28 修：原来读失败就静默 savedCfg=null，然后**用出厂值把用户配置覆盖掉** ——
+     dryRun 被重置回 true（她彻底不开口），而且一句日志都没有，谁也查不出来。
+     现在：读失败只报错、不覆盖（旧文件留着，人还能手工救）。 */
+  if (cfgReadError !== null) {
+    writeLog('ERROR', `配置读不出来（${cfgReadError}）—— 这次用出厂值跑，但**不会覆盖** ${cfgPath}，请手工检查那一份`)
+  } else if (savedCfg === null) {
     try {
       mkdirSync(config.dataDir, { recursive: true })
       writeFileSync(cfgPath, `${JSON.stringify(pickConfigForFile(config), null, 2)}\n`, 'utf8')
@@ -906,10 +914,19 @@ export function apply(ctx, rawConfig) {
       ]
       if (top.key === 'lust') lines.push(LUST_EXTRA)
       return lines.join('\n')
-    } catch {
+    } catch (err) {
+      // 2026-10-28：原来这里静默 return ''，情绪段渲染失败没有任何痕迹 ——
+      // 表现就是「她突然没情绪了」，查无可查。每分钟最多报一次，别刷屏。
+      if (Date.now() - moodRenderWarnAt > 60_000) {
+        moodRenderWarnAt = Date.now()
+        writeLog('WARN', `情绪段渲染失败（这一轮不注入情绪）：${err instanceof Error ? err.message : String(err)}`)
+      }
       return ''
     }
   }
+
+  /** 上次报「情绪段渲染失败」的时间：一分钟最多一条，别刷屏。 */
+  let moodRenderWarnAt = 0
 
   /** 给这个 agent 注册情绪段（幂等；agent 重建会自动重新注册）。 */
   function ensureMoodSection(agent) {
@@ -1037,6 +1054,19 @@ export function apply(ctx, rawConfig) {
     const agents = ctx.get('agents')
     if (!agents) return
 
+    /* 2026-10-28 修：情绪段的注册原来挂在链路**末尾**（要等所有闸门都过了才走到），
+       于是只要上面任何一条 return（说完晚安、拿不到目标会话…），情绪就永远注入不进去，
+       而且失败也没痕迹。现在一进门先挂上：这一跳能拿到 agent 就注册，和投递成败无关。 */
+    try {
+      const earlyId = resolveTargetSession()
+      if (earlyId !== '') {
+        const earlyAgent = agents.get?.(earlyId)
+        if (earlyAgent) ensureMoodSection(earlyAgent)
+      }
+    } catch (err) {
+      writeLog('WARN', `情绪段提前注册失败（不影响投递）：${err instanceof Error ? err.message : String(err)}`)
+    }
+
     /* 说完晚安就别再找了（2026-10-27 加的）。
        她最后一句是道别、之后他没再说话 —— 那就是闭环了。
        qq-bot 那边会把他的「晚安」吞掉（不再回），于是这里看到的就是
@@ -1099,9 +1129,11 @@ export function apply(ctx, rawConfig) {
       if (now >= (parseTime(loop.hardDeadlineAt) ?? Infinity) && (Number(loop.attempts) || 0) >= 1) {
         loop.status = 'abandoned'
         state.stats.abandoned = (Number(state.stats.abandoned) || 0) + 1
-        state.quota.consecutiveIgnored = (Number(state.quota.consecutiveIgnored) || 0) + 1
-        moodModule.onIgnored(state.mood)
-        writeLog('INFO', `放弃「${loop.what}」（他一直没有回来）`)
+        /* 2026-10-28 修：原来这里会 onIgnored（+12 恼火）+ consecutiveIgnored++（冷却 2ⁿ 翻倍）。
+           问题是「他没接这句话」不等于「他无视我」—— 她发「我去洗澡了」「早安」这种根本不需要回。
+           连续三次没回就攒够 45 直接触发全线禁言，这是最容易被冤枉的一条。
+           现在只记 abandoned，不罚情绪、不计 ignored。 */
+        writeLog('INFO', `放弃「${loop.what}」（到期没等到回应；不记作「被无视」）`)
       }
     }
 
@@ -1384,7 +1416,11 @@ export function apply(ctx, rawConfig) {
 
     // 现在为什么不会发 —— 把能判断的都跑一遍，面板直接摊开给他看
     const blocked = []
-    if (!state.control.enabled) blocked.push('总开关关着')
+    /* 2026-10-28 修：原来只认 state.control.enabled（运行期开关），
+       而设置页那个「启用活人感」写的是 config.enabled —— 于是那个勾选框是死的。
+       现在两个都要开：config 那个是「装不装这个功能」，state 那个是「运行期临时闭嘴」。 */
+    if (!config.enabled) blocked.push('总开关关着（设置页「启用活人感」没勾）')
+    if (!state.control.enabled) blocked.push('运行期开关关着（说过「别吵」之类）')
     if (config.dryRun) blocked.push('dryRun 开着：只算不投')
     if (openLoops.length === 0) {
       if (config.freeTalkEnabled !== true) {
