@@ -161,6 +161,19 @@ export const DEFAULTS = Object.freeze({
    */
   qzoneImageGenWeight: 50,
 
+  /* ── 说说互动轮询（2026-10-27）─────────────────────────────────
+     只在「想他 / 吃醋」压到阈值以上才干活 —— 情绪不高的时候跑去翻他空间，
+     那不是她，那是监控。所以她心情不够就什么都不做，一次 API 都不调。 */
+
+  /** 总开关。默认关（跟日记一样，开源装的人自己去开）。 */
+  qzonePollEnabled: false,
+  /** 想他 / 吃醋（0-100）任意一个到这个数，才开始轮询。 */
+  qzonePollTriggerPercent: 80,
+  /** 轮询间隔（分钟）。 */
+  qzonePollIntervalMinutes: 20,
+  /** 只看最近几天的内容。 */
+  qzonePollLookbackDays: 3,
+
   /**
    * 道别闭环的有效期（分钟）。
    *
@@ -298,6 +311,18 @@ export function parseConfig(raw) {
     ),
     qzoneImageGenWeight: Math.round(
       num(input.qzoneImageGenWeight, DEFAULTS.qzoneImageGenWeight, { min: 0, max: 100 }),
+    ),
+
+    /* ── 说说互动轮询 ── */
+    qzonePollEnabled: input.qzonePollEnabled === true,
+    qzonePollTriggerPercent: Math.round(
+      num(input.qzonePollTriggerPercent, DEFAULTS.qzonePollTriggerPercent, { min: 1, max: 100 }),
+    ),
+    qzonePollIntervalMinutes: Math.round(
+      num(input.qzonePollIntervalMinutes, DEFAULTS.qzonePollIntervalMinutes, { min: 5, max: 720 }),
+    ),
+    qzonePollLookbackDays: Math.round(
+      num(input.qzonePollLookbackDays, DEFAULTS.qzonePollLookbackDays, { min: 1, max: 30 }),
     ),
     farewellGapMin: num(input.farewellGapMin, DEFAULTS.farewellGapMin, { min: 10, max: 1440 }),
 

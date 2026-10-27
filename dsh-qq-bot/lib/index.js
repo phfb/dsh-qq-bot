@@ -766,6 +766,8 @@ export function apply(ctx, rawConfig) {
 
   // 每日说说（日记）调度：内部自己判断 enabled / qzoneDiaryEnabled
   startDiaryTimer()
+  // 说说互动轮询：只在「想他/吃醋」到阈值时才干活，平时一次 API 都不调
+  startPollTimer()
 
   if (!config.enabled) {
     writeLog('INFO', 'enabled=false，本次不连接、不转发。改配置后插件会重载。')
@@ -1061,6 +1063,221 @@ export function apply(ctx, rawConfig) {
     if (diaryTimer === null) return
     clearInterval(diaryTimer)
     diaryTimer = null
+  }
+
+  /* ── 说说互动轮询 2026-10-27 ────────────────────────────────────
+     只在「想他 / 吃醋」压到阈值以上才干活。情绪不高的时候跑去翻他空间，
+     那不是她，那是监控 —— 所以不满足条件时**一次 API 都不调**。
+     轮到的这一趟做两件事：看自己最近几天说说下面的新评论（只认他那个号）、
+     看他最近有没有发新说说；有新东西就拼一条 task 丢给她，让她自己决定回不回。 */
+
+  const POLL_STATE_FILE = 'qzone-poll-state.json'
+  /** @type {{lastPollAt: number, handled: string[]}} */
+  let pollState = { lastPollAt: 0, handled: [] }
+  let pollTimer = null
+  let pollBusy = false
+
+  function loadPollState() {
+    try {
+      const raw = JSON.parse(readFileSync(join(dataRoot(), POLL_STATE_FILE), 'utf8'))
+      pollState = {
+        lastPollAt: Number(raw?.lastPollAt) || 0,
+        handled: Array.isArray(raw?.handled) ? raw.handled.filter((x) => typeof x === 'string').slice(-500) : [],
+      }
+    } catch {
+      // 第一次跑没有这个文件
+    }
+  }
+
+  function savePollState() {
+    try {
+      mkdirSync(dataRoot(), { recursive: true })
+      writeFileSync(
+        join(dataRoot(), POLL_STATE_FILE),
+        `${JSON.stringify({ version: 1, ...pollState }, null, 2)}\n`,
+        'utf8',
+      )
+    } catch (err) {
+      writeLog('WARN', `轮询状态落盘失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /** 读她的心情（alive 那份 alive-mood.json）。读不到返回 null。 */
+  function readMoodNow() {
+    try {
+      const raw = JSON.parse(readFileSync(join(dataRoot(), 'alive-mood.json'), 'utf8'))
+      const m = raw?.mood ?? {}
+      return { missing: Number(m.missing) || 0, jealousy: Number(m.jealousy) || 0 }
+    } catch {
+      return null
+    }
+  }
+
+  /** 想他 / 吃醋 任意一个到阈值了没。读不到心情就当没到（不乱动）。 */
+  function moodTriggered() {
+    const m = readMoodNow()
+    if (!m) return false
+    const th = Math.max(1, Math.min(100, Number(config.qzonePollTriggerPercent) || 80)) / 100
+    return m.missing >= th || m.jealousy >= th
+  }
+
+  /** 把 OneBot 返回的列表尽量拆成条目数组（各家字段名不一样，粘一个算一个）。 */
+  function asList(r) {
+    if (!r || r.ok !== true) return []
+    const d = r.data
+    if (Array.isArray(d)) return d
+    for (const key of ['msglist', 'messages', 'list', 'feeds', 'data']) {
+      if (Array.isArray(d?.[key])) return d[key]
+    }
+    return []
+  }
+
+  /** 从一条说说里抠 tid / 正文 / 时间。 */
+  function readPost(item) {
+    const tid = String(item?.tid ?? item?.feedskey ?? item?.id ?? '').trim()
+    const content = String(item?.content ?? item?.summary ?? item?.text ?? '').trim()
+    const rawTime = Number(item?.createTime ?? item?.create_time ?? item?.time ?? 0)
+    const createdAt = rawTime > 1e12 ? rawTime : rawTime > 1e9 ? rawTime * 1000 : 0
+    return { tid, content, createdAt }
+  }
+
+  /** 从 detail 返回里抠评论列表。 */
+  function readComments(r) {
+    if (!r || r.ok !== true) return []
+    const d = r.data
+    const pools = [
+      d?.comments,
+      d?.commentlist,
+      d?.data?.comments,
+      d?.data?.commentlist,
+      Array.isArray(d) ? d : null,
+    ]
+    for (const pool of pools) {
+      if (Array.isArray(pool)) return pool
+    }
+    return []
+  }
+
+  function commentKey(tid, c) {
+    const id = String(c?.commentid ?? c?.commentId ?? c?.id ?? '').trim()
+    const from = String(c?.uin ?? c?.userid ?? c?.user?.uin ?? '').trim()
+    const text = String(c?.content ?? c?.text ?? '').trim().slice(0, 40)
+    return `${tid}|${id !== '' ? id : `${from}|${text}`}`
+  }
+
+  async function pollQzoneOnce() {
+    if (pollBusy) return
+    pollBusy = true
+    try {
+      const owner = String(config.allowUsers?.[0] ?? '')
+      if (owner === '') return
+      const record = await ensureSession(owner)
+      const agent = record?.agent
+      if (!agent || typeof agent.followup !== 'function') return
+
+      const lookbackMs = Math.max(1, Number(config.qzonePollLookbackDays) || 3) * 86_400_000
+      const since = Date.now() - lookbackMs
+      const handled = new Set(pollState.handled)
+      /** @type {string[]} */
+      const findings = []
+      /** @type {string[]} */
+      const newlyHandled = []
+
+      /* ① 自己最近几天的说说 → 看下面有没有他的新评论 */
+      const mine = asList(await callOneBot('get_qzone_msg_list', { page_num: 1, count: 20 }))
+      for (const raw of mine.slice(0, 10)) {
+        const post = readPost(raw)
+        if (post.tid === '' || (post.createdAt > 0 && post.createdAt < since)) continue
+        const detail = await callOneBot('get_qzone_msg_detail', { tid: post.tid })
+        for (const c of readComments(detail)) {
+          const from = String(c?.uin ?? c?.userid ?? c?.user?.uin ?? '').trim()
+          // 只认他那个号 —— 别人评论当没看见
+          if (from !== '' && from !== owner) continue
+          if (from === '') continue
+          const key = commentKey(post.tid, c)
+          if (handled.has(key)) continue
+          const text = String(c?.content ?? c?.text ?? '').trim()
+          findings.push(`- 你的说说「${post.content.slice(0, 30)}」下面他评论了：「${text.slice(0, 60)}」（tid=${post.tid}）`)
+          newlyHandled.push(key)
+        }
+      }
+
+      /* ② 他最近有没有发新说说 */
+      const his = asList(
+        await callOneBot('get_qzone_msg_list', { target_uin: Number(owner), page_num: 1, count: 10 }),
+      )
+      for (const raw of his.slice(0, 5)) {
+        const post = readPost(raw)
+        if (post.tid === '' || (post.createdAt > 0 && post.createdAt < since)) continue
+        const key = `post|${post.tid}`
+        if (handled.has(key)) continue
+        findings.push(`- 他刚发了新说说：「${post.content.slice(0, 60)}」（tid=${post.tid}）`)
+        newlyHandled.push(key)
+      }
+
+      if (findings.length === 0) {
+        writeLog('INFO', `轮询：最近 ${config.qzonePollLookbackDays} 天没有新东西`)
+        return
+      }
+
+      const text = [
+        '【说说那边有新动静】你心里想他 / 吃醋压得有点高了，去看看。',
+        ...findings,
+        '',
+        '怎么处理你自己定：想回就回、想点赞就点，都要用 qq_qzone 工具（comment / like）。',
+        '不想理也行 —— 但别装看不见，也别每条都回一长串。',
+      ].join('\n')
+
+      agent.followup(
+        Object.freeze({
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: Object.freeze({ kind: 'plugin', reason: 'qzone-poll' }),
+        }),
+      )
+      writeLog('INFO', `轮询：${findings.length} 条新动静，已交给她`)
+
+      // 交给她的同时就记成「已处理」：宁可漏回一次，也别同一个评论回两遍
+      pollState.handled = [...pollState.handled, ...newlyHandled].slice(-500)
+      savePollState()
+    } catch (err) {
+      writeLog('WARN', `轮询出错：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      pollBusy = false
+    }
+  }
+
+  /** 每分钟看一眼：情绪到了、且到间隔了，才真去轮询。 */
+  async function tickQzonePoll() {
+    if (!config.enabled || !config.qzonePollEnabled) return
+    if (!moodTriggered()) return
+    const gap = Math.max(5, Number(config.qzonePollIntervalMinutes) || 20) * 60_000
+    if (pollState.lastPollAt > 0 && Date.now() - pollState.lastPollAt < gap) return
+    pollState.lastPollAt = Date.now()
+    savePollState()
+    await pollQzoneOnce()
+  }
+
+  function startPollTimer() {
+    if (pollTimer !== null) return
+    if (!config.qzonePollEnabled) return
+    loadPollState()
+    pollTimer = setInterval(() => {
+      void tickQzonePoll().catch((err) => {
+        writeLog('WARN', `轮询调度出错：${err instanceof Error ? err.message : String(err)}`)
+      })
+    }, 60_000)
+    writeLog(
+      'INFO',
+      `轮询：已启动（想他/吃醋 >= ${config.qzonePollTriggerPercent}% 才干活，间隔 ${config.qzonePollIntervalMinutes} 分钟，只看最近 ${config.qzonePollLookbackDays} 天）`,
+    )
+  }
+
+  function stopPollTimer() {
+    if (pollTimer === null) return
+    clearInterval(pollTimer)
+    pollTimer = null
   }
 
   async function ensureSession(uin) {
@@ -2355,6 +2572,7 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
     try {
       clearInterval(heartbeat)
       stopDiaryTimer()
+      stopPollTimer()
       offSession?.()
       offLocalCommands?.()
       if (typeof offRoute === 'function') {
