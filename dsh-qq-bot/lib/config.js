@@ -135,6 +135,32 @@ export const DEFAULTS = Object.freeze({
   /** 主动发的说说默认给谁看：1=所有人 4=好友 64=仅自己。 */
   interactQzoneUgcRight: 1,
 
+  /* ── 每日说说（日记）2026-10-27 ─────────────────────────────── */
+
+  /**
+   * 到点让她写一篇日记发到说说。
+   *
+   * **默认关**：说说所有人可见，等于替用户在自己的社交圈发言。开源给别人装的时候
+   * 默认就自动发动态太冒犯 —— 要用的自己去设置里打开。
+   */
+  qzoneDiaryEnabled: false,
+  /** 每天大概几点写（HH:MM）。实际会在下面的窗口里随机挑一分钟，别太机械。 */
+  qzoneDiaryTime: '18:00',
+  /** 时间窗口（分钟）：在上面那个时间点之后的这段时间里随机触发一次。 */
+  qzoneDiaryWindowMinutes: 60,
+  /** 日记字数下限。太短不发（那是糊弄），记一条日志就跳过。 */
+  qzoneDiaryMinChars: 80,
+  /** 日记字数上限。超了让插件截断 —— 说说太长没人看。 */
+  qzoneDiaryMaxChars: 2000,
+  /** 配几张图（0-3）。0 = 纯文字。 */
+  qzoneDiaryImageCount: 2,
+  /**
+   * 0-100：配图里「现画」的比例，剩下走她自己的表情包。
+   *
+   * 50 = 一半一半。写 0 就是全用表情包（不花钱、最快），写 100 就全现画。
+   */
+  qzoneImageGenWeight: 50,
+
   /**
    * 道别闭环的有效期（分钟）。
    *
@@ -254,6 +280,25 @@ export function parseConfig(raw) {
     interactQzoneMaxPerDay: Math.floor(num(input.interactQzoneMaxPerDay, DEFAULTS.interactQzoneMaxPerDay, { min: 0, max: 20 })),
     interactLinkMaxPerDay: Math.floor(num(input.interactLinkMaxPerDay, DEFAULTS.interactLinkMaxPerDay, { min: 0, max: 20 })),
     interactQzoneUgcRight: Math.floor(num(input.interactQzoneUgcRight, DEFAULTS.interactQzoneUgcRight, { min: 1, max: 128 })),
+
+    /* ── 每日说说（日记）── */
+    qzoneDiaryEnabled: input.qzoneDiaryEnabled === true,
+    qzoneDiaryTime: parseClock(input.qzoneDiaryTime, DEFAULTS.qzoneDiaryTime, problems),
+    qzoneDiaryWindowMinutes: Math.round(
+      num(input.qzoneDiaryWindowMinutes, DEFAULTS.qzoneDiaryWindowMinutes, { min: 1, max: 720 }),
+    ),
+    qzoneDiaryMinChars: Math.round(
+      num(input.qzoneDiaryMinChars, DEFAULTS.qzoneDiaryMinChars, { min: 10, max: 2000 }),
+    ),
+    qzoneDiaryMaxChars: Math.round(
+      num(input.qzoneDiaryMaxChars, DEFAULTS.qzoneDiaryMaxChars, { min: 100, max: 5000 }),
+    ),
+    qzoneDiaryImageCount: Math.round(
+      num(input.qzoneDiaryImageCount, DEFAULTS.qzoneDiaryImageCount, { min: 0, max: 3 }),
+    ),
+    qzoneImageGenWeight: Math.round(
+      num(input.qzoneImageGenWeight, DEFAULTS.qzoneImageGenWeight, { min: 0, max: 100 }),
+    ),
     farewellGapMin: num(input.farewellGapMin, DEFAULTS.farewellGapMin, { min: 10, max: 1440 }),
 
     imageEnabled: input.imageEnabled !== false,
@@ -289,4 +334,23 @@ export function buildSocketUrl(config) {
   if (!config.accessToken) return raw
   const sep = raw.includes('?') ? '&' : '?'
   return `${raw}${sep}access_token=${encodeURIComponent(config.accessToken)}`
+}
+
+/**
+ * 校验 `HH:MM` 形式的时间。坏值退回默认并记一条 problem ——
+ * 配置错了只 warn，绝不让插件起不来（这个文件顶上的总原则）。
+ *
+ * @param {unknown} value
+ * @param {string} fallback 形如 '18:00'
+ * @param {string[]} problems 收集问题用
+ * @returns {string}
+ */
+function parseClock(value, fallback, problems) {
+  const s = typeof value === 'string' ? value.trim() : ''
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(s)
+  if (m === null) {
+    if (s !== '') problems.push(`时间格式不是 HH:MM，已退回 ${fallback}（原值：${s}）`)
+    return fallback
+  }
+  return `${String(m[1]).padStart(2, '0')}:${m[2]}`
 }

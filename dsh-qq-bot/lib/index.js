@@ -764,6 +764,9 @@ export function apply(ctx, rawConfig) {
     }
   }, 5000)
 
+  // 每日说说（日记）调度：内部自己判断 enabled / qzoneDiaryEnabled
+  startDiaryTimer()
+
   if (!config.enabled) {
     writeLog('INFO', 'enabled=false，本次不连接、不转发。改配置后插件会重载。')
     return
@@ -774,6 +777,292 @@ export function apply(ctx, rawConfig) {
   }
 
   /** 取某个 uin 的 DSH 会话；没有就创建。 */
+  /* ── 说说配图（2026-10-27）─────────────────────────────────────
+     为什么图由插件备、而不是让她自己找：
+       · `generate_image` 生成的图**确实落地成本地文件**，但那个工具把结果返回成
+         纯文本，模型拿不到路径；而 `send_qzone_msg` 要的正是本地路径。
+       · 所以「让她自己搞图」是死路：她能画，但传不过去。
+     这里按权重二选一：现画一张（调 Agnes），或者从她自己的表情包里挑一张。 */
+
+  /** 数据目录兜底：config.dataDir 默认是空串，join('') 会写到进程 cwd。 */
+  function dataRoot() {
+    return config.dataDir || join(homedir(), '.dsh-qq-bot')
+  }
+
+  /** 0-100 的权重抽签。 */
+  function rollPercent(weight) {
+    return Math.random() * 100 < weight
+  }
+
+  /** 从表情包目录里随机挑一张本地图片。挑不到返回 ''。 */
+  function pickMemeFile() {
+    try {
+      const root = config.memesDir || join(dataRoot(), 'memes')
+      const packs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory())
+      if (packs.length === 0) return ''
+      const files = []
+      for (const pack of packs) {
+        const base = join(root, pack.name, 'memes')
+        let cats = []
+        try {
+          cats = readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory())
+        } catch {
+          continue
+        }
+        for (const cat of cats) {
+          let imgs = []
+          try {
+            imgs = readdirSync(join(base, cat.name)).filter((n) => /\.(png|jpe?g|gif|webp)$/i.test(n))
+          } catch {
+            continue
+          }
+          for (const n of imgs) files.push(join(base, cat.name, n))
+        }
+      }
+      if (files.length === 0) return ''
+      return files[Math.floor(Math.random() * files.length)]
+    } catch (err) {
+      writeLog('WARN', `挑表情包失败：${err instanceof Error ? err.message : String(err)}`)
+      return ''
+    }
+  }
+
+  /** 调 Agnes 现画一张，存到 dataDir/qzone-images/，返回本地路径。失败返回 ''。 */
+  async function generateDiaryImage(prompt, idx) {
+    try {
+      const cfgPath = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'ag-multimodal.json')
+      /** @type {any} */
+      const pool = JSON.parse(readFileSync(cfgPath, 'utf8'))
+      const accounts = Array.isArray(pool?.accounts) ? pool.accounts : []
+      if (accounts.length === 0) return ''
+      const account = accounts[Math.floor(Math.random() * accounts.length)]
+      const endpoint = String(account?.endpoint ?? '').replace(/\/+$/, '')
+      const key = String(account?.key ?? '')
+      if (endpoint === '' || key === '') return ''
+
+      const r = await fetch(`${endpoint}/images/generations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'agnes-image-2.1-flash',
+          prompt,
+          size: '1024x1024',
+          extra_body: { response_format: 'url' },
+        }),
+        signal: AbortSignal.timeout(180000),
+      })
+      if (!r.ok) {
+        writeLog('WARN', `配图生成失败 HTTP ${r.status}`)
+        return ''
+      }
+      /** @type {any} */
+      const body = await r.json()
+      const item = Array.isArray(body?.data) ? body.data[0] : undefined
+      if (!item) return ''
+      const dir = join(dataRoot(), 'qzone-images')
+      mkdirSync(dir, { recursive: true })
+      const file = join(dir, `diary-${Date.now()}-${idx}.png`)
+      if (item.url) {
+        const dl = await fetch(item.url)
+        if (!dl.ok) return ''
+        writeFileSync(file, Buffer.from(await dl.arrayBuffer()))
+      } else if (item.b64_json) {
+        writeFileSync(file, Buffer.from(item.b64_json, 'base64'))
+      } else {
+        return ''
+      }
+      return file
+    } catch (err) {
+      writeLog('WARN', `配图生成异常：${err instanceof Error ? err.message : String(err)}`)
+      return ''
+    }
+  }
+
+  /** 按权重备 n 张图，返回本地路径数组（失败的就不带，宁可少一张也不要空路径）。 */
+  async function prepareQzoneImages(n, imagePrompt) {
+    const out = []
+    const weight = Math.max(0, Math.min(100, Number(config.qzoneImageGenWeight) || 0))
+    for (let i = 0; i < n; i += 1) {
+      if (rollPercent(weight)) {
+        const p = String(imagePrompt ?? '').trim()
+        const prompt = p === '' ? '一张柔和的生活感插画，暖色调，像随手拍的照片' : `${p}，自然光，生活感，柔和色调`
+        const file = await generateDiaryImage(prompt, i)
+        if (file !== '') {
+          out.push(file)
+          continue
+        }
+      }
+      const meme = pickMemeFile()
+      if (meme !== '') out.push(meme)
+    }
+    return out
+  }
+
+  /* ── 每日说说（日记）调度 2026-10-27 ──────────────────────────
+     每天在 `qzoneDiaryTime` 起、`qzoneDiaryWindowMinutes` 分钟内的**随机一分钟**
+     触发一次，不是准点 —— 准点发动态一眼就是机器人。
+     触发方式是往她的会话里塞一条 task（source.kind = plugin）：
+     她自己写、自己决定画面、自己调 qq_qzone 发出去。
+     注意 source.kind 故意不是 'qq'：这条不是「他说的话」，
+     用 qq 会被记忆插件当成真人发言收进记忆库，污染得很。 */
+
+  const DIARY_STATE_FILE = 'qzone-diary-state.json'
+  /** @type {{dayKey: string, firedAt: number, minute: number}} */
+  let diaryState = { dayKey: '', firedAt: 0, minute: -1 }
+  let diaryTimer = null
+  let diaryBusy = false
+
+  function loadDiaryState() {
+    try {
+      const raw = JSON.parse(readFileSync(join(dataRoot(), DIARY_STATE_FILE), 'utf8'))
+      diaryState = {
+        dayKey: typeof raw?.dayKey === 'string' ? raw.dayKey : '',
+        firedAt: Number(raw?.firedAt) || 0,
+        minute: Number.isFinite(Number(raw?.minute)) ? Number(raw.minute) : -1,
+      }
+    } catch {
+      // 第一次跑没有这个文件
+    }
+  }
+
+  function saveDiaryState() {
+    try {
+      mkdirSync(dataRoot(), { recursive: true })
+      writeFileSync(
+        join(dataRoot(), DIARY_STATE_FILE),
+        `${JSON.stringify({ version: 1, ...diaryState }, null, 2)}\n`,
+        'utf8',
+      )
+    } catch (err) {
+      writeLog('WARN', `日记状态落盘失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  function dayKeyOf(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  }
+
+  /** 今天定在第几分钟触发：[起点, 起点 + 窗口) 里随机。 */
+  function plannedMinuteOfDay() {
+    const parts = String(config.qzoneDiaryTime || '18:00').split(':')
+    const base = (Number(parts[0]) || 0) * 60 + (Number(parts[1]) || 0)
+    const win = Math.max(1, Math.round(Number(config.qzoneDiaryWindowMinutes) || 60))
+    return base + Math.floor(Math.random() * win)
+  }
+
+  /** 拼给她看的日记任务，塞进会话。 */
+  async function runDiaryNow() {
+    if (diaryBusy) return
+    diaryBusy = true
+    try {
+      const owner = String(config.allowUsers?.[0] ?? '')
+      if (owner === '') {
+        writeLog('WARN', '日记：allowUsers 是空的，不知道这日记写给他看还是给谁看，跳过')
+        return
+      }
+      const record = await ensureSession(owner)
+      const agent = record?.agent
+      if (!agent || typeof agent.followup !== 'function') {
+        writeLog('WARN', '日记：拿不到 agent，这次跳过')
+        return
+      }
+
+      // 「最近的事」从记忆插件读短期区 —— 读不到就让这一段空着，绝不让她编
+      let recent = ''
+      try {
+        const mem = ctx.get('ebbinghausMemory')
+        const snap = mem && typeof mem.snapshot === 'function' ? mem.snapshot() : null
+        const short = Array.isArray(snap?.short) ? snap.short.slice(-8) : []
+        recent = short
+          .map((e) => String(e?.title ?? '').trim())
+          .filter((s) => s !== '')
+          .map((s) => `- ${s}`)
+          .join('\n')
+      } catch {
+        // 没装记忆插件 / 拿不到快照：跳过素材，不写空条目
+      }
+
+      const now = new Date()
+      const hh = String(now.getHours()).padStart(2, '0')
+      const mm = String(now.getMinutes()).padStart(2, '0')
+      const lines = [
+        '【今天的日记】到点了，写一篇今天的小记，写完发到 QQ 动态（说说）。',
+        `现在是 ${hh}:${mm}。`,
+        '',
+        '要求：',
+        `- 长度 ${config.qzoneDiaryMinChars}~${config.qzoneDiaryMaxChars} 字，第一人称，像日记。不是总结报告，别写成条目清单`,
+        '- 写今天的事、碎碎念、现在的心情；没发生过的事不要编',
+        '- 写完之后**必须**调用 qq_qzone 工具发出去：action=post，content 放日记正文，',
+        `  autoImages=${Math.max(0, Number(config.qzoneDiaryImageCount) || 0)}（图由插件负责，你拿不到路径也不用管），`,
+        '  imagePrompt 用一两句写清楚你想要的画面',
+        '- 发完就结束，不用再补一句「我发了」之类的话',
+      ]
+      if (recent !== '') {
+        lines.push('', '最近记下的事（可以当素材，别照抄成流水账）：', recent)
+      }
+
+      const text = lines.join('\n')
+      agent.followup(
+        Object.freeze({
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text }],
+          // 故意不是 'qq'：这条是插件派的活，不是他说的话，
+          // 用 qq 会被记忆插件当真人发言收进记忆库
+          source: Object.freeze({ kind: 'plugin', reason: 'qzone-diary' }),
+        }),
+      )
+      writeLog('INFO', `日记：任务已交给她（提示 ${text.length} 字，配图 ${config.qzoneDiaryImageCount} 张）`)
+    } catch (err) {
+      writeLog('WARN', `日记触发失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      diaryBusy = false
+    }
+  }
+
+  /** 每分钟看一眼：今天该不该写了。跨天时重新抽一次时间。 */
+  async function tickDiary() {
+    if (!config.enabled || !config.qzoneDiaryEnabled) return
+    const now = new Date()
+    const today = dayKeyOf(now)
+    if (diaryState.dayKey !== today) {
+      diaryState = { dayKey: today, firedAt: 0, minute: plannedMinuteOfDay() }
+      saveDiaryState()
+      const hh = String(Math.floor(diaryState.minute / 60)).padStart(2, '0')
+      const mm = String(diaryState.minute % 60).padStart(2, '0')
+      writeLog('INFO', `日记：今天的写日记时间定在 ${hh}:${mm}（窗口内随机）`)
+    }
+    if (diaryState.firedAt > 0) return
+    const nowMin = now.getHours() * 60 + now.getMinutes()
+    if (nowMin < diaryState.minute) return
+    diaryState.firedAt = Date.now()
+    saveDiaryState()
+    await runDiaryNow()
+  }
+
+  function startDiaryTimer() {
+    if (diaryTimer !== null) return
+    if (!config.qzoneDiaryEnabled) return
+    loadDiaryState()
+    diaryTimer = setInterval(() => {
+      void tickDiary().catch((err) => {
+        writeLog('WARN', `日记调度出错：${err instanceof Error ? err.message : String(err)}`)
+      })
+    }, 60_000)
+    // 启动时先看一眼：可能重启前就已经过了那个点
+    void tickDiary().catch(() => {})
+    writeLog(
+      'INFO',
+      `日记：已启动（${config.qzoneDiaryTime} 起 ${config.qzoneDiaryWindowMinutes} 分钟内随机一次，配图 ${config.qzoneDiaryImageCount} 张，现画权重 ${config.qzoneImageGenWeight}%）`,
+    )
+  }
+
+  function stopDiaryTimer() {
+    if (diaryTimer === null) return
+    clearInterval(diaryTimer)
+    diaryTimer = null
+  }
+
   async function ensureSession(uin) {
     const cached = sessions.get(uin)
     const agents = ctx.get('agents')
@@ -1723,6 +2012,15 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
             tid: { type: 'string', description: '说说 id（detail/like/comment 用）。' },
             content: { type: 'string', description: '发说说或评论的正文（post/comment 用）。' },
             images: { type: 'array', items: { type: 'string' }, description: '配图，本地路径或 URL（post 用，可省略）。' },
+            autoImages: {
+              type: 'number',
+              description:
+                '让插件自己备 1-3 张图（post 用）。你不用给路径——按权重一半现画、一半挑她的表情包。',
+            },
+            imagePrompt: {
+              type: 'string',
+              description: 'autoImages 时想要的画面描述，一两句就够（post 用）。',
+            },
             num: { type: 'number', description: '取几条，默认 10。' },
             ugc_right: { type: 'number', description: '可见范围：1=所有人 4=好友 64=仅自己。默认 1。' },
           },
@@ -1762,11 +2060,28 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
             const gate = takeInteract('qzone', config.interactQzoneMaxPerDay)
             if (!gate.ok) return { ok: false, note: gate.note, json: '' }
             const params = { content, ugc_right: Number(args?.ugc_right) || config.interactQzoneUgcRight }
-            if (Array.isArray(args?.images) && args.images.length > 0) {
-              params.images = args.images.map((s) => String(s))
+            const images = Array.isArray(args?.images)
+              ? args.images.map((s) => String(s)).filter((s) => s !== '')
+              : []
+            // autoImages：让插件自己按权重备图（现画 / 表情包），她只管说「配几张」。
+            // 她自己拿不到生成图的本地路径（工具只回纯文本），所以这一步必须在这儿做。
+            const autoN = Math.max(0, Math.min(3, Math.round(Number(args?.autoImages) || 0)))
+            if (autoN > 0) {
+              try {
+                images.push(...(await prepareQzoneImages(autoN, args?.imagePrompt)))
+              } catch (err) {
+                writeLog('WARN', `备图失败，先只发文字：${err instanceof Error ? err.message : String(err)}`)
+              }
             }
+            if (images.length > 0) params.images = images
             const r = await callOneBot('send_qzone_msg', params)
-            return r.ok ? { ok: true, note: '', json: '说说发出去了' } : { ok: false, note: r.note, json: '' }
+            return r.ok
+              ? {
+                  ok: true,
+                  note: '',
+                  json: `说说发出去了${images.length > 0 ? `（带 ${images.length} 张图）` : '（纯文字）'}`,
+                }
+              : { ok: false, note: r.note, json: '' }
           }
 
           if (act === 'like') {
@@ -2039,6 +2354,7 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
   ctx.effect(() => () => {
     try {
       clearInterval(heartbeat)
+      stopDiaryTimer()
       offSession?.()
       offLocalCommands?.()
       if (typeof offRoute === 'function') {
