@@ -45,8 +45,26 @@ import { isFarewell, shouldStopHere } from './goodnight.mjs'
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
 
-/** 本插件注册的消息来源标记。 */
+/** 本插件注册的消息来源标记（真人发言走这个）。 */
 export const SOURCE_KIND = 'qq'
+
+/**
+ * 插件派活（每日说说 / 说说轮询）用的 source.kind。
+ *
+ * ⚠️ 2026-10-27 的血：这里原本写的是 `'plugin'`。
+ * DSH v4 会话格式**显式拒绝** `kind === 'plugin'`
+ * （dsh-session-format-v3-to-v4/lib/index.js:126 → "format v4 message requires a producer-owned source kind"），
+ * 于是这条消息一进队列，整个会话的写盘就抛 SessionFormatError，
+ * 之后所有消息只进不出 —— 表面上就是「她不回我了」。
+ * v3 那边同样不认：v3 的正规写法是 `{kind:'plugin', plugin:'xxx'}`，缺 plugin 字段照样抛。
+ *
+ * 现在改成自有 kind，和官方范本一致（dsh-schedule 投递用的是 `{kind:'schedule'}`）：
+ * 非空、且不是 'plugin'，v3/v4 两道校验都过。
+ *
+ * 也不能图省事用 'qq' —— 那个在记忆插件的白名单里（默认 `user,qq`），
+ * 插件派的活会被当成他亲手打的字记进记忆库。
+ */
+export const TASK_SOURCE_KIND = 'dsh-qq-bot'
 
 /**
  * 数据目录与日志目录。
@@ -215,6 +233,24 @@ function createQqUserMessage({ text, images = [], uin, messageId, at }) {
       qqMessageId: messageId ?? null,
       at: at ?? new Date().toISOString(),
     }),
+  })
+}
+
+/**
+ * 造一条「插件派的活」的 user 消息 —— 日记、说说轮询走这条。
+ *
+ * 和 createQqUserMessage 的区别就是没有 uin：这条不是他发的。
+ * source 里只留 kind + reason，别加额外字段 —— 会话格式对 source 的校验
+ * 现在只看 kind，但多写的键以后被当成来源元数据解释就麻烦了。
+ *
+ * @param {{text: string, reason: string, kind: string}} args
+ */
+function createTaskMessage({ text, reason, kind }) {
+  return Object.freeze({
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: Object.freeze({ kind, reason }),
   })
 }
 
@@ -734,6 +770,10 @@ export function apply(ctx, rawConfig) {
   for (const p of problems) writeLog('WARN', `配置：${p}`)
   writeLog('INFO', `启动 name=${name} enabled=${config.enabled} allowUsers=${JSON.stringify(config.allowUsers)} dryRun=${config.dryRun}`)
   writeLog('INFO', `数据目录：${DATA_DIR}`)
+  // 派活用的 source.kind 必须打出来：这个值写错不是"日志难看"，
+  // 是整个 QQ 会话的写盘报废、她一条都不回（2026-10-27 就这么栽的）。
+  // 出问题时第一眼要能在日志里确认它到底是什么。
+  writeLog('INFO', `派活来源 kind=${taskSourceKind()}（配置项 taskSourceKind；'plugin' 会被 DSH v4 拒绝，'qq'/'user' 会被记忆插件当成他说的话）`)
 
   // 首次安装的引导：没填 QQ 号就等于没启用，必须说清楚，别让人干等
   if (config.allowUsers.length === 0) {
@@ -895,10 +935,134 @@ export function apply(ctx, rawConfig) {
     return out
   }
 
+  /* ── 派活投递（2026-10-27）─────────────────────────────────────
+     日记和说说轮询都是「插件派的活」，统一走这一条口子。
+
+     以前是直接 `agent.followup({...})` 一行了事，两个坑都真踩了：
+       1. followup 只是塞进队列，真正的写盘在后面的 flush 里 ——
+          source.kind 一旦不被会话格式接受（`'plugin'` 就是），
+          错误全静默，日志里只有一行 agent.failed，用户那边只看到「她不回我」。
+       2. 会话写不进去的时候没有任何兜底提示，于是这种事能藏一整晚。
+
+     现在四步都在这儿：造消息 → followup → 立刻冲盘确认 → 后台盯动静。 */
+
+  /** 每个会话累计来了多少条事件：派活后靠它判断「她到底动没动」。 */
+  const sessionTicks = new Map()
+
+  /**
+   * 当前生效的派活 source.kind。
+   *
+   * 配置项 `taskSourceKind` 优先；坏值退回代码默认。
+   * parseConfig 已经挡过一次，这里再挡是因为**这里才是真正写进消息的地方** ——
+   * 这个值写错不是"日志不好看"，是整个会话写盘报废。
+   */
+  function taskSourceKind() {
+    const configured = config.taskSourceKind
+    if (typeof configured !== 'string') return TASK_SOURCE_KIND
+    const trimmed = configured.trim()
+    if (trimmed === '' || trimmed === 'plugin' || trimmed === 'qq' || trimmed === 'user') {
+      return TASK_SOURCE_KIND
+    }
+    return trimmed
+  }
+
+  /**
+   * 冲一次盘，确认这条消息真的落到会话文件里了。
+   *
+   * 官方范本（dsh-schedule）是 flush 不认就抛；这里只记日志不抛 ——
+   * 派活失败不该把定时器整条炸掉，日志里那条 ERROR 才是给人看的。
+   *
+   * @param {any} session agent.session
+   * @param {string} reason 日志用的来由
+   * @returns {Promise<boolean>} 宿主是否确认落盘
+   */
+  async function confirmDelivery(session, reason) {
+    if (!session || typeof session !== 'object') {
+      writeLog('WARN', `派活（${reason}）：拿不到会话对象，落盘没法确认 —— 她收没收到只能看后面有没有动静`)
+      return false
+    }
+    const service = ctx.get('sessions')
+    if (!service || typeof service.flush !== 'function') {
+      writeLog('WARN', `派活（${reason}）：宿主没挂 sessions 服务，落盘没法确认（消息可能还在内存里）`)
+      return false
+    }
+    try {
+      const acknowledged = await service.flush(session)
+      if (acknowledged === true) return true
+      writeLog('WARN', `派活（${reason}）：sessions.flush 没确认（返回 ${String(acknowledged)}），这条可能丢了`)
+      return false
+    } catch (err) {
+      // 这里最可能出现的就是 SessionFormatError：
+      // "format v4 message requires a producer-owned source kind"
+      writeLog('ERROR', `派活（${reason}）落盘失败：${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+  }
+
+  /**
+   * 投递之后盯 N 秒：这个会话一条事件都没有，就把话喊进日志。
+   *
+   * 为什么 flush 之外还要这一层：flush 只证明「消息写进去了」，
+   * 证明不了「她跑起来了」。模型调用失败、turn 起不来、会话卡死，
+   * 全都表现为「写进去了但没人回」—— 以前这一步完全没有，失败是静默的。
+   */
+  function watchDelivery(session, reason) {
+    const seconds = Number(config.taskDeliveryWatchSeconds)
+    if (!(seconds > 0)) return
+    const id = session?.id
+    if (typeof id !== 'string') return
+    const baseline = sessionTicks.get(id) ?? 0
+    const timer = setTimeout(() => {
+      if ((sessionTicks.get(id) ?? 0) > baseline) return
+      writeLog('WARN', `派活（${reason}）：${seconds} 秒过去会话 ${id.slice(0, 13)}… 一点动静都没有 —— 查它的会话写盘和模型调用`)
+    }, seconds * 1000)
+    // 别让这个观察定时器把进程吊住不退
+    if (typeof timer.unref === 'function') timer.unref()
+  }
+
+  /**
+   * 派活给她：造消息 → followup → 冲盘确认 → 后台盯动静。
+   *
+   * @param {any} agent 目标会话的 agent（必须有 followup）
+   * @param {string} text 交给她的话
+   * @param {string} reason 来由，进日志：qzone-diary / qzone-poll
+   * @returns {Promise<boolean>} 落盘是否被确认
+   */
+  async function deliverTask(agent, text, reason) {
+    if (!agent || typeof agent.followup !== 'function') {
+      writeLog('ERROR', `派活（${reason}）：会话没有 followup 方法，这条发不出去`)
+      return false
+    }
+    const message = createTaskMessage({ text, reason, kind: taskSourceKind() })
+    const session = agent.session ?? null
+    agent.followup(message)
+    const confirmed = await confirmDelivery(session, reason)
+    watchDelivery(session, reason)
+    return confirmed
+  }
+
+  /**
+   * 只做一件事：数每个会话来了多少条事件。
+   *
+   * 独立成一个监听器、不做任何业务过滤 —— 它统计的是「会话活没活」，
+   * 混进出站那套判断里，哪天出站逻辑改了就会把这个计数带坏。
+   */
+  const offSessionTicks = ctx.on('session/event', (session) => {
+    const id = session?.id
+    if (typeof id !== 'string') return
+    sessionTicks.set(id, (sessionTicks.get(id) ?? 0) + 1)
+    // QQ 会话就一两个，别让这个 Map 无限长：超过 64 个就把不认识的清掉
+    if (sessionTicks.size > 64) {
+      const keep = new Set()
+      for (const record of sessions.values()) keep.add(record.sessionId)
+      for (const key of sessionTicks.keys()) if (!keep.has(key)) sessionTicks.delete(key)
+    }
+  })
+
   /* ── 每日说说（日记）调度 2026-10-27 ──────────────────────────
      每天在 `qzoneDiaryTime` 起、`qzoneDiaryWindowMinutes` 分钟内的**随机一分钟**
      触发一次，不是准点 —— 准点发动态一眼就是机器人。
-     触发方式是往她的会话里塞一条 task（source.kind = plugin）：
+     触发方式是往她的会话里塞一条 task（source.kind = taskSourceKind()，默认 dsh-qq-bot）：
      她自己写、自己决定画面、自己调 qq_qzone 发出去。
      注意 source.kind 故意不是 'qq'：这条不是「他说的话」，
      用 qq 会被记忆插件当成真人发言收进记忆库，污染得很。 */
@@ -999,17 +1163,8 @@ export function apply(ctx, rawConfig) {
       }
 
       const text = lines.join('\n')
-      agent.followup(
-        Object.freeze({
-          id: randomUUID(),
-          role: 'user',
-          content: [{ type: 'text', text }],
-          // 故意不是 'qq'：这条是插件派的活，不是他说的话，
-          // 用 qq 会被记忆插件当真人发言收进记忆库
-          source: Object.freeze({ kind: 'plugin', reason: 'qzone-diary' }),
-        }),
-      )
-      writeLog('INFO', `日记：任务已交给她（提示 ${text.length} 字，配图 ${config.qzoneDiaryImageCount} 张）`)
+      const confirmed = await deliverTask(agent, text, 'qzone-diary')
+      writeLog('INFO', `日记：任务已交给她（提示 ${text.length} 字，配图 ${config.qzoneDiaryImageCount} 张${confirmed ? '' : '，落盘未确认'}）`)
     } catch (err) {
       writeLog('WARN', `日记触发失败：${err instanceof Error ? err.message : String(err)}`)
     } finally {
@@ -1232,15 +1387,8 @@ export function apply(ctx, rawConfig) {
         '不想理也行 —— 但别装看不见，也别每条都回一长串。',
       ].join('\n')
 
-      agent.followup(
-        Object.freeze({
-          id: randomUUID(),
-          role: 'user',
-          content: [{ type: 'text', text }],
-          source: Object.freeze({ kind: 'plugin', reason: 'qzone-poll' }),
-        }),
-      )
-      writeLog('INFO', `轮询：${findings.length} 条新动静，已交给她`)
+      const confirmed = await deliverTask(agent, text, 'qzone-poll')
+      writeLog('INFO', `轮询：${findings.length} 条新动静，已交给她${confirmed ? '' : '（落盘未确认）'}`)
 
       // 交给她的同时就记成「已处理」：宁可漏回一次，也别同一个评论回两遍
       pollState.handled = [...pollState.handled, ...newlyHandled].slice(-500)
@@ -2587,6 +2735,7 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
       stopPollTimer()
       offSession?.()
       offLocalCommands?.()
+      offSessionTicks?.()
       if (typeof offRoute === 'function') {
         try { offRoute() } catch { /* 宿主可能已经自己清掉了 */ }
         offRoute = null

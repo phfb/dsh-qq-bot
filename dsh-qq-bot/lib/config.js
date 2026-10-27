@@ -181,6 +181,35 @@ export const DEFAULTS = Object.freeze({
    * 超过这么久就算新的一轮，不再拦（免得一句午睡把一整个下午都封掉）。
    */
   farewellGapMin: 180,
+
+  /* ── 派活投递（2026-10-27 加）──────────────────────────────────── */
+
+  /**
+   * 插件派活（每日说说 / 说说轮询）投递时用的 `source.kind`。
+   *
+   * 为什么这个值必须可配：DSH 的会话格式会**校验**它，
+   * 而校验规则跟着 DSH 版本变。2026-10-27 那次写死 `'plugin'`，
+   * v4 直接拒绝（`format v4 message requires a producer-owned source kind`），
+   * 消息进队列后整个会话写盘都抛错 —— 表现就是「她一条都不回」，
+   * 而且错在 flush 里、日志里只有一行 agent.failed，很难定位。
+   *
+   * 所以：换 DSH 版本、规则再变，改配置就行，不用改代码。
+   *
+   * 三条红线（parseConfig 会挡）：
+   *   - 不能是 `'plugin'` —— v4 明确拒绝
+   *   - 不能是 `'qq'` / `'user'` —— 记忆插件按 source.kind 收他的原话，
+   *     这俩会让插件派的活被记成「他自己说的」
+   *   - 不能是空串
+   */
+  taskSourceKind: 'dsh-qq-bot',
+
+  /**
+   * 派活之后盯多久（秒）：这么久这个会话一条事件都没有，就往日志里 WARN。
+   *
+   * 以前 followup 完就撒手，投递失败完全静默，用户只看到「她不回我」。
+   * 0 = 不盯。
+   */
+  taskDeliveryWatchSeconds: 90,
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -326,6 +355,12 @@ export function parseConfig(raw) {
     ),
     farewellGapMin: num(input.farewellGapMin, DEFAULTS.farewellGapMin, { min: 10, max: 1440 }),
 
+    /* ── 派活投递 ── */
+    taskSourceKind: parseSourceKind(input.taskSourceKind, problems),
+    taskDeliveryWatchSeconds: Math.round(
+      num(input.taskDeliveryWatchSeconds, DEFAULTS.taskDeliveryWatchSeconds, { min: 0, max: 3600 }),
+    ),
+
     imageEnabled: input.imageEnabled !== false,
     imageDir: typeof input.imageDir === 'string' ? input.imageDir.trim() : '',
     // 上限夹在 512 MB ~ 6 GB：这是他在 2026-10-25 明确给的范围
@@ -378,4 +413,40 @@ function parseClock(value, fallback, problems) {
     return fallback
   }
   return `${String(m[1]).padStart(2, '0')}:${m[2]}`
+}
+
+/**
+ * 校验派活用的 `source.kind`。
+ *
+ * 三个必须挡的坏值，每一个都在 2026-10-27 那摊子事里出现过：
+ *   - `'plugin'`：DSH v4 会话格式显式拒绝（v3 那边还得配 `plugin` 字段才算正规），
+ *     用了它 → 消息进队列 → 整个会话写盘抛 SessionFormatError → 她一条都不回
+ *   - `'qq'` / `'user'`：这俩是「他说的话」的来源，插件派的活混进去会被记进记忆库
+ *   - 空串：会话格式也拒（要求非空 kind）
+ *
+ * 挡掉的办法一律是**退回默认 + 记一条 problem**，不让插件起不来 ——
+ * 这个文件顶上的总原则：配置错了只 warn。
+ *
+ * @param {unknown} value 用户填的值
+ * @param {string[]} problems 收集问题用
+ * @returns {string} 可用的 source kind
+ */
+function parseSourceKind(value, problems) {
+  const fallback = DEFAULTS.taskSourceKind
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'string') {
+    problems.push(`taskSourceKind 不是字符串，已退回 ${fallback}（原值：${String(value)}）`)
+    return fallback
+  }
+  const s = value.trim()
+  if (s === '') return fallback
+  if (s === 'plugin') {
+    problems.push(`taskSourceKind 不能是 'plugin' —— DSH v4 会话格式会拒绝它，会话写盘整个失败，已退回 ${fallback}`)
+    return fallback
+  }
+  if (s === 'qq' || s === 'user') {
+    problems.push(`taskSourceKind 用 '${s}' 会把插件派的活记成他说的话（记忆插件按 source.kind 收），已退回 ${fallback}`)
+    return fallback
+  }
+  return s
 }
