@@ -1,0 +1,29 @@
+{
+  "name": "dsh-model-override",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 全局模型覆盖：选一次 provider/model，立刻应用到所有会话（包括 QQ bot 建的那一局），新会话也自动跟上。",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "tools", "locale", "README.md", "LICENSE"],
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "keywords": ["dsh", "dsh-plugin", "model", "provider", "override"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*"
+  }
+}

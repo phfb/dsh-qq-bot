@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Global Model Override",
+    "description": "Pick one provider/model and apply it to every live session (including the QQ bot one); new sessions follow automatically."
+  }
+}

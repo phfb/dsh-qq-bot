@@ -1,0 +1,12 @@
+# dsh-model-override 的装载配置。
+#
+# 这个插件自己不连网、不画界面，只做一件事：
+# 把「全局模型选择」真正应用到**所有**活着的会话上（含 QQ bot 那局）。
+#
+# 数据目录跟 dsh-alive / dsh-qq-bot 放在一起，设置窗口好找。
+
+- insert:
+    - id: dsh-model-override
+      name: dsh-model-override
+      config:
+        dataDir: 'D:/DSHBot/data'

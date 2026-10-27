@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "全局模型覆盖",
+    "description": "选一次 provider / model，应用到所有活着的会话（含 QQ bot 建的那一局），新会话也自动跟上。"
+  }
+}
