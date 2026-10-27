@@ -1893,14 +1893,22 @@ export function apply(ctx, rawConfig) {
 
      思考只对她这一个会话、且只对下一次请求生效，说完就恢复 —— 不永久关。 */
 
-  /** @type {Map<string, {inTurn: boolean, lastAt: number, strikes: number, switchedOff: boolean, prev: any}>} */
+  /** @type {Map<string, {inTurn: boolean, lastAt: number, strikes: number, switchedOff: boolean, prev: any, expectNoThinking: boolean, warnedNoThinking: boolean}>} */
   const watchdogState = new Map()
   let watchdogTimer = null
 
   function watchdogOf(uin) {
     let state = watchdogState.get(uin)
     if (state === undefined) {
-      state = { inTurn: false, lastAt: 0, strikes: 0, switchedOff: false, prev: null }
+      state = {
+        inTurn: false,
+        lastAt: 0,
+        strikes: 0,
+        switchedOff: false,
+        prev: null,
+        expectNoThinking: false,
+        warnedNoThinking: false,
+      }
       watchdogState.set(uin, state)
     }
     return state
@@ -1966,6 +1974,9 @@ export function apply(ctx, rawConfig) {
         reasoningEffort: 'off',
       })
       state.switchedOff = true
+      // 切完之后要亲眼确认一次「思考真没了」—— 不同 host/provider 对 off 档的实现不一样，
+      // 有的只是「不发参数」，而这不发给会思考的模型等于没关（2026-10-27 就是这么被骗的）。
+      state.expectNoThinking = true
       writeLog('INFO', `看门狗：这一轮先把思考关掉再试（${selection.provider}/${selection.model}）`)
       return true
     } catch (err) {
@@ -2198,6 +2209,25 @@ export function apply(ctx, rawConfig) {
         if (text !== '') state.spoke = true
         // 最后一步的思考字数 + 这一轮动过几次手 —— 判定「故障」还是「故意的」全靠这两个
         state.lastReasoningLen = assistantReasoningLen(event)
+        // 刚把思考切成 off 之后，这里应该是 0。不是 0 就说明「关思考」这条路是假的，
+        // 喊一嗓子让人去改 provider 配置 —— 否则这种骗子会一直骗下去。
+        const wd = watchdogOf(uin)
+        if (wd.expectNoThinking) {
+          if (state.lastReasoningLen > 0) {
+            if (!wd.warnedNoThinking) {
+              wd.warnedNoThinking = true
+              writeLog(
+                'WARN',
+                `看门狗：明明切到 off 档，思考还是有 ${state.lastReasoningLen} 字 —— ` +
+                  '这个 provider 的 off 档可能是「不发参数」，而它对会思考的模型等于没关。' +
+                  '去 provider 目录把 reasoningEfforts.off 从 null 改成一个真值（这个渠道是 none）',
+              )
+            }
+          } else {
+            wd.expectNoThinking = false
+            writeLog('INFO', '看门狗：确认这次思考真的关掉了（0 字）')
+          }
+        }
         const calls = assistantToolCallCount(event)
         if (calls > 0) {
           state.hadToolCall = true
