@@ -832,7 +832,16 @@ export function apply(ctx, rawConfig) {
       return
     }
     const hours = Math.min(6, (now - last) / 3_600_000) // 一次最多补 6 小时，防休眠唤醒后暴涨
-    if (hours <= 0) return
+    if (hours <= 0) {
+      /* 2026-10-28 修：系统时间往回跳（自动对时 / 手改钟）时，lastTickAt 落在"未来"，
+         原来直接 return 不更新基准 —— 于是往后每一跳都算出负的时间差，情绪一直冻着，
+         窗口推进也跟着乱。现在把基准拉回当前时间，只跳过这一次补算。 */
+      if (now < last) {
+        writeLog('WARN', `检测到时钟回拨（心跳基准在未来 ${new Date(last).toISOString()}），已拉回当前时间`)
+        state.focus.lastTickAt = new Date(now).toISOString()
+      }
+      return
+    }
     const lastQq = parseTime(state.focus.lastQqAt) ?? parseTime(state.focus.lastHumanAt)
     moodModule.evolve(state.mood, hours, {
       hourOfDay: new Date(now).getHours(),
@@ -1216,13 +1225,10 @@ export function apply(ctx, rawConfig) {
 
     if (config.dryRun) {
       writeLog('INFO', `[dryRun] 分数 ${score} ${JSON.stringify(parts)} 本来会投：${shortForLog(loop.what, 30)}（念头 ${[...text].length} 字）`)
-      // dryRun 下也记账，但不真正 followup，避免它影响会话
-      loop.status = 'due'
-      loop.lastAttemptAt = new Date(now).toISOString()
+      /* 2026-10-28 修：dryRun 原来照样 attempts+1、标 delivered —— 明明是「只算不投」，
+         却把这件念头的次数和"已投递"都吃掉；切回真投时它已经被判死，永远发不出去。
+         现在只留一条痕迹（dryRunAt），不动 attempts / status。 */
       loop.dryRunAt = new Date(now).toISOString()
-      loop.status = 'open'
-      loop.attempts = (Number(loop.attempts) || 0) + 1
-      loop.status = 'delivered'
       save()
       return
     }
@@ -1275,14 +1281,33 @@ export function apply(ctx, rawConfig) {
     }
 
     try {
-      agent.followup({
-        id: randomUUID(),
-        role: 'user',
-        content: [{ type: 'text', text }],
-        source: Object.freeze({ kind: 'proactive', loopId: loop.id, at: new Date(now).toISOString() }),
-      })
+      /* 2026-10-28 修：原来没 await —— followup 返回 rejected promise 时就是一个
+         unhandledRejection（宿主里可能直接变红字），而下面照常按"已投递"记账，
+         面板说投了、她其实一个字都没出去。现在等它真的落下再记账，失败就不记。
+         加 30 秒上限：万一它一直不返回（等整轮回复 / 卡在队列里），
+         有 delivering 标志挡着，下一跳就再也不投了 —— 那等于她彻底哑掉。
+         超时就按"已投递"记账（消息多半已经交出去了），宁可重复也不能卡死。 */
+      let followupTimedOut = false
+      await Promise.race([
+        agent.followup({
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: Object.freeze({ kind: 'proactive', loopId: loop.id, at: new Date(now).toISOString() }),
+        }),
+        new Promise((resolve) => {
+          const t = setTimeout(() => {
+            followupTimedOut = true
+            resolve()
+          }, 30_000)
+          if (typeof t.unref === 'function') t.unref()
+        }),
+      ])
+      if (followupTimedOut) {
+        writeLog('WARN', 'followup 30 秒没返回（消息大概率已经发出去了），按已投递记账')
+      }
     } catch (err) {
-      writeLog('ERROR', `投递失败：${err instanceof Error ? err.message : String(err)}`)
+      writeLog('ERROR', `投递失败（这次不记账）：${err instanceof Error ? err.message : String(err)}`)
       return
     }
 
@@ -1333,12 +1358,15 @@ export function apply(ctx, rawConfig) {
   /** 每小时 / 每天的窗口滚动。 */
   function rollWindows(now) {
     const hourStart = parseTime(state.quota.hourWindowStart)
-    if (hourStart === null || now - hourStart >= 3_600_000) {
+    /* 2026-10-28 修：加了 `now < hourStart` / `now < dayStart` —— 时钟往回跳之后，
+       "窗口起点在未来"，差值永远是负的，也就永远等不到 1 小时 / 24 小时，
+       额度条会被卡死（她说不了话、面板还显示额度满）。回拨时直接把窗口重开。 */
+    if (hourStart === null || now - hourStart >= 3_600_000 || now < hourStart) {
       state.quota.hourWindowStart = new Date(now).toISOString()
       state.quota.hourCount = 0
     }
     const dayStart = parseTime(state.quota.dayWindowStart)
-    if (dayStart === null || now - dayStart >= 86_400_000) {
+    if (dayStart === null || now - dayStart >= 86_400_000 || now < dayStart) {
       state.quota.dayWindowStart = new Date(now).toISOString()
       state.quota.dayCount = 0
     }
@@ -1434,6 +1462,23 @@ export function apply(ctx, rawConfig) {
     if (stopToday) blocked.push(`今天说过「别发了」，封顶到 24:00`)
     if (dayLeft <= 0) blocked.push(`今日额度用完（${dayCount}/${config.maxPerDay}）`)
     if (hourLeft <= 0) blocked.push(`本小时额度用完（${hourCount}/${config.maxPerHour}）`)
+    /* 2026-10-28 补：闸门里有、面板上却没有的四条。她"莫名其妙不说话"的时候，
+       面板显示「无事可拦」，人只能干瞪眼 —— 这几条以前全在暗处。 */
+    const annoyance = Number(state.mood?.annoyanceDebt) || 0
+    if (annoyance >= 45) blocked.push(`恼火攒到 ${Math.round(annoyance)} 了（G9：够 45 就全线闭嘴，哄一句就降）`)
+    if (state.control.lastWasStop === true) {
+      blocked.push('你说过「别吵」（G12）—— 这条不会自己到期，要等你说「好了」才解开')
+    }
+    if (inQuietHours(now, config.quietHours)) blocked.push('现在是静默时段（quietHours）')
+    else if (inQuietHours(now, config.deepNightHours)) blocked.push('现在是深夜静默时段（deepNightHours）')
+    try {
+      // G4：目标会话的 agent 不在（冷会话）—— 这一跳就算所有条件都满足也投不出去
+      const agents = ctx.get('agents')
+      const g4Sid = resolveTargetSession()
+      if (g4Sid !== '' && agents && typeof agents.get === 'function' && !agents.get(g4Sid)) {
+        blocked.push('目标会话的 agent 不在（冷会话，G4）—— 要等它被叫醒这一跳才投得出去')
+      }
+    } catch { /* 拿不到 agents 服务就不写这一条，不能因为它把整个面板弄挂 */ }
     const lastHuman = parseTime(state.focus.lastQqAt)
     if (lastHuman !== null && now - lastHuman < config.minSilenceMin * 60_000) {
       blocked.push(`你刚在 QQ 说过话，${Math.max(1, Math.ceil((config.minSilenceMin * 60_000 - (now - lastHuman)) / 60_000))} 分钟后再看`)
@@ -1524,12 +1569,16 @@ export function apply(ctx, rawConfig) {
       const start = size - want
       const buf = Buffer.allocUnsafe(want)
       const fd = openSync(LOG_FILE, 'r')
+      let got = 0
       try {
-        readSync(fd, buf, 0, want, start)
+        /* 2026-10-28 修：原来忽略 readSync 的返回值，直接把 allocUnsafe 的整块转成字符串 ——
+           少读的那截是未初始化内存，会以乱码 / 替换字符混进面板的日志尾巴。现在按实读截断。 */
+        got = readSync(fd, buf, 0, want, start)
       } finally {
         closeSync(fd)
       }
-      let text = buf.toString('utf8')
+      if (got <= 0) return ''
+      let text = buf.toString('utf8', 0, got)
       // 从中间切进去的时候第一行可能是半个字，扔掉
       if (start > 0) {
         const nl = text.indexOf('\n')
@@ -1685,7 +1734,15 @@ export function apply(ctx, rawConfig) {
     }, 'dsh-alive: control watch')
   } catch { /* 挂不上就只能在设置窗口里改配置 */ }
 
-  const timer = setInterval(() => {
+  /* 2026-10-28 修：原来是 setInterval(..., config.tickMs) —— 定时器在启动那一刻就钉死了，
+     设置页改「心跳间隔」虽然写了文件、日志也说「已热应用」，实际一点用都没有。
+     改成自己递归 setTimeout：每一跳重新读一次 config.tickMs，改了下一跳就按新值走。 */
+  let tickTimer = null
+  /** 插件卸载之后就不要再自己续命了（递归 setTimeout 不像 clearInterval 那样一刀切干净）。 */
+  let disposed = false
+  /** 上一跳的投递还没跑完？—— 防止两跳叠在一起把同一件事投两遍。 */
+  let delivering = false
+  function heartbeat() {
     try {
       if (state.control.hardOff === true) return
       const now = Date.now()
@@ -1696,19 +1753,45 @@ export function apply(ctx, rawConfig) {
       // 每跳都把演化后的情绪落盘：这样不管 DSH 是正常关、还是被强杀，
       // 下次启动读到的都是"关掉前最后一跳"的数值，而不是最早的快照。
       save()
-      void tryDeliver(now).catch((err) => {
-        writeLog('ERROR', `心跳失败：${err instanceof Error ? err.message : String(err)}`)
-      })
+      /* 2026-10-28 修：加一道重入保护。投递里有 await（表情、followup），
+         一慢就可能和下一跳叠在一起 —— 同一件事被投两遍，然后两遍都记账。
+         现在上一跳没结束，这一跳就不开新的投递。 */
+      if (delivering) {
+        writeLog('INFO', '上一跳的投递还没结束，这一跳跳过（防重复投）')
+        return
+      }
+      delivering = true
+      void tryDeliver(now)
+        .catch((err) => {
+          writeLog('ERROR', `心跳失败：${err instanceof Error ? err.message : String(err)}`)
+        })
+        .finally(() => {
+          delivering = false
+        })
     } catch (err) {
       writeLog('ERROR', `心跳异常：${err instanceof Error ? err.message : String(err)}`)
     }
-  }, config.tickMs)
+  }
+  function scheduleTick() {
+    const every = Math.max(15_000, Number(config.tickMs) || 60_000)
+    tickTimer = setTimeout(() => {
+      tickTimer = null
+      heartbeat()
+      // 宿主卸载插件之后别再自己续命
+      if (!disposed) scheduleTick()
+    }, every)
+  }
+  scheduleTick()
 
   /* ───────────── 清理 ───────────── */
 
   ctx.effect(() => () => {
     try {
-      clearInterval(timer)
+      disposed = true
+      if (tickTimer !== null) {
+        clearTimeout(tickTimer)
+        tickTimer = null
+      }
       if (saveTimer !== null) clearTimeout(saveTimer)
       offSession?.()
       if (typeof offRoute === 'function') {
