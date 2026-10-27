@@ -945,12 +945,27 @@ export function apply(ctx, rawConfig) {
     if (typeof agent.ctx?.inject !== 'function') return
     try {
       const fiber = agent.ctx.inject(['systemPrompt'], (scope) => {
-        scope.systemPrompt.section({
-          name: 'alive-mood',
-          order: 4950,
-          text: () => renderMoodSection(),
-          interpolate: false,
-        })
+        try {
+          scope.systemPrompt.section({
+            name: 'alive-mood',
+            order: 4950,
+            text: () => renderMoodSection(),
+            interpolate: false,
+          })
+        } catch (err) {
+          /* 2026-10-28：插件重载之后，旧 agent 的 fiber 可能还没释放，
+             同一个 scope 里已经有一份 alive-mood —— 再注册就直接抛
+             `prompt section "alive-mood" is already registered in this scope`，
+             而且这条是在 inject 的回调里抛的，外层 catch 拦不住，宿主那边就是一条红字。
+             好消息是：旧那份的 text 回调指向的仍是当前模块的 renderMoodSection，
+             读的还是最新状态，所以功能没坏，只是日志难看。这里把它降成 INFO。 */
+          const msg = err instanceof Error ? err.message : String(err)
+          if (/already registered/i.test(msg)) {
+            writeLog('INFO', '情绪段已存在（重载后旧注册还挂着），沿用旧的那份')
+          } else {
+            throw err
+          }
+        }
       })
       moodFibers.set(agent, fiber)
       writeLog('INFO', '已注册情绪段（她的心情会写进系统提示词）')
@@ -1775,7 +1790,10 @@ export function apply(ctx, rawConfig) {
     }
   }
   function scheduleTick() {
-    const every = Math.max(15_000, Number(config.tickMs) || 60_000)
+    /* 下限只防「设成 0 / 负数」这种误操作 —— 别把用户自己填的 10000 也一起抬掉。
+       2026-10-28：第一版写的是 15000，结果他配置里的 10 秒被静默改成 15 秒，
+       跟「tickMs 改了不生效」是同一类毛病。 */
+    const every = Math.max(1_000, Number(config.tickMs) || 60_000)
     tickTimer = setTimeout(() => {
       tickTimer = null
       heartbeat()
