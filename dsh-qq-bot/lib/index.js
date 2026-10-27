@@ -500,18 +500,50 @@ export function apply(ctx, rawConfig) {
 
   /* ── 上下文占用 ── */
 
-  /** 拿模型的上下文窗口大小；拿不到就用配置里的兜底值。 */
-  function resolveContextWindow() {
+  /** 缓存住的模型上下文窗口。0 = 还没查到过。 */
+  let cachedContextWindow = 0
+
+  /**
+   * 去宿主问一次模型的上下文窗口，成功就更新缓存。
+   *
+   * ⚠️ `llm.resolveModelInfo()` 是 **async** 的。2026-10-27 之前这里是**不 await**
+   * 直接取 `.context` 的：拿到的是个 Promise，属性全是 undefined，所以永远走兜底值；
+   * 更糟的是 provider 不存在时它返回的 rejected Promise **没人接**，升级成
+   * unhandledRejection，DSH 判成「致命加载失败」，整个桌面端 `exited with 1`。
+   * 那天的事故就是：provider 从 unlimit 换成 bit，配置里还留着 unlimit。
+   *
+   * 所以这里三条纪律：必须 await、必须 catch、错了就当没查到（永不抛）。
+   *
+   * @returns {Promise<number>} 有效的窗口大小；拿不到返回 0
+   */
+  async function refreshContextWindow() {
+    /** @type {any} */
+    let sel = {}
     try {
       const llm = ctx.get('llm')
-      const sel = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {}
-      const info = llm?.resolveModelInfo?.(sel?.provider, sel?.model) ?? llm?.resolveModelInfo?.(sel) ?? llm?.resolveModelInfo?.()
-      const size = Number(info?.context ?? info?.contextWindow ?? info?.contextSize)
-      if (Number.isFinite(size) && size > 8000) return size
-    } catch {
-      // 拿不到就兜底，不抛
+      sel = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {}
+      if (typeof llm?.resolveModelInfo !== 'function') return 0
+      const info = await llm.resolveModelInfo(sel?.provider, sel?.model)
+      const size = Number(
+        info?.context?.contextWindow ?? info?.context ?? info?.contextWindow ?? info?.contextSize,
+      )
+      if (Number.isFinite(size) && size > 8000) {
+        cachedContextWindow = size
+        return size
+      }
+      return 0
+    } catch (err) {
+      writeLog(
+        'WARN',
+        `读不到模型上下文窗口（${sel?.provider ?? '?'}/${sel?.model ?? '?'}）：${err instanceof Error ? err.message : String(err)} —— 先用配置里的兜底值`,
+      )
+      return 0
     }
-    return config.contextWindow
+  }
+
+  /** 拿模型的上下文窗口大小。**同步、永不抛**：查过就用真值，没查到用配置兜底。 */
+  function resolveContextWindow() {
+    return cachedContextWindow > 8000 ? cachedContextWindow : config.contextWindow
   }
 
   /**
@@ -711,15 +743,19 @@ export function apply(ctx, rawConfig) {
 
   // 自检：等宿主把那几个服务挂完再看一眼，把「上下文能不能量」一次说清楚。
   // 以前只会在 /qq status 里看到一句「读不到」，分不清是没挂 tokenMeter 还是没会话。
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
       const meter = ctx.get('tokenMeter')
       const ok = meter !== null && meter !== undefined && typeof meter.measure === 'function'
       if (ok) {
         // 把分母和实际触发线一起打出来：换局提前/滞后时，一眼能看出是基数错了还是百分比错了。
-        const win = resolveContextWindow()
+        const live = await refreshContextWindow()
+        const win = live > 0 ? live : config.contextWindow
         const trigger = Math.round((win * config.contextLimitPercent) / 100)
-        writeLog('INFO', `自检：tokenMeter 就绪 —— 上下文窗口 ${win}，到 ${config.contextLimitPercent}%（${trigger} token）会自动换新局`)
+        writeLog(
+          'INFO',
+          `自检：tokenMeter 就绪 —— 上下文窗口 ${win}${live > 0 ? '' : '（模型信息读不到，用配置兜底值）'}，到 ${config.contextLimitPercent}%（${trigger} token）会自动换新局`,
+        );
       } else {
         writeLog('WARN', '自检：拿不到 tokenMeter —— 「上下文到 X% 自动换新对话」不会触发（其余功能不受影响）')
       }
