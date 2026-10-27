@@ -52,6 +52,18 @@ export const name = 'dsh-qq-bot'
 export const SOURCE_KIND = 'qq'
 
 /**
+ * 给 QQ 这一局设的思考等级（写死）。
+ *
+ * 为什么不让 dsh-model-override 统一管：它是对**所有活会话**生效的，
+ * 一改思考等级就把用户自己正在用的 DSH 对话也一起顶掉（2026-10-28 现场抓到的）。
+ * 所以这里只用 sessionController.selectModel 打她这一个 sessionId，
+ * 别人的会话一个字都不动。
+ *
+ * 想要更省可以改成 'low'；老宿主 / 别的 provider 不认这个档位时只记一条 WARN，不影响聊天。
+ */
+export const TASK_REASONING_EFFORT = 'high'
+
+/**
  * 插件派活（每日说说 / 说说轮询）用的 source.kind。
  *
  * ⚠️ 2026-10-27 的血：这里原本写的是 `'plugin'`。
@@ -483,6 +495,46 @@ export function apply(ctx, rawConfig) {
    * @type {Map<string, {text: string, at: number}>}
    */
   const lastInbound = new Map()
+
+  /** 已经设过思考等级的会话（每个会话只设一次，别每轮都往会话里写一条 selection）。 */
+  const effortApplied = new Set()
+
+  /**
+   * 只给她这一局设思考等级，别人的会话一个都不动。
+   *
+   * 走 sessionController.selectModel（按 sessionId 定位），不用 dsh-model-override 的
+   * applySelection —— 那个是对所有活会话生效的，会把用户自己的 DSH 对话一起顶掉。
+   *
+   * 失败不影响聊天：老宿主没这个接口、或者 provider 不认这个档位，记一条日志就跳过。
+   *
+   * @param {string} sessionId
+   * @param {string} why 日志里说明是哪个时机设的（复用活会话 / 新建 / 换局后）
+   */
+  async function applyTaskEffort(sessionId, why) {
+    if (TASK_REASONING_EFFORT === '') return
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    if (effortApplied.has(sessionId)) return
+    const service = ctx.get('sessionController')
+    const selection = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {}
+    if (!service || typeof service.selectModel !== 'function') return
+    if (typeof selection.provider !== 'string' || typeof selection.model !== 'string') return
+    // 先记上再设：失败了也别每轮重试，一轮一条 WARN 会淹掉日志
+    effortApplied.add(sessionId)
+    try {
+      await service.selectModel({
+        sessionId,
+        provider: selection.provider,
+        model: selection.model,
+        reasoningEffort: TASK_REASONING_EFFORT,
+      })
+      writeLog('INFO', `给她这一局设了 ${TASK_REASONING_EFFORT} 思考（${why}，只影响这一局）`)
+    } catch (err) {
+      writeLog(
+        'WARN',
+        `思考等级没设上（不影响聊天）：${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
   /** 限流器按 uin 分 */
   const limiters = new Map()
   /** 正在处理的发送链，保证同一会话的消息按顺序发 */
@@ -700,6 +752,7 @@ export function apply(ctx, rawConfig) {
     sessions.set(uin, { sessionId: realId, agent, handle, createdAt: new Date().toISOString(), generation: gen })
     saveMap()
     writeLog('INFO', `已切到新对话 ${realId}（第 ${gen} 局）`)
+    void applyTaskEffort(realId, '换局后')
     return true
   }
 
@@ -1082,6 +1135,7 @@ export function apply(ctx, rawConfig) {
     }
     const message = createTaskMessage({ text, reason, kind: taskSourceKind() })
     const session = agent.session ?? null
+    void applyTaskEffort(session?.id, '派活')
     agent.followup(message)
     const confirmed = await confirmDelivery(session, reason)
     watchDelivery(session, reason)
@@ -1799,6 +1853,7 @@ export function apply(ctx, rawConfig) {
     queueDepth.set(userId, depth + 1)
     try {
       const record = await ensureSession(userId)
+      void applyTaskEffort(record.sessionId, '入站')
       const agent = record.agent
       if (!agent || typeof agent.followup !== 'function') {
         writeLog('ERROR', `会话 ${record.sessionId} 没有 followup 方法，消息丢弃`)
