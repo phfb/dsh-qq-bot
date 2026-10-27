@@ -2,7 +2,7 @@
  * dsh-alive 的判定核心。全是纯函数：不碰 IO、不碰 ctx、不碰网络。
  *
  * 想改她的"分寸"，改这个文件就够了；改完跑
- *   D:\Astrbot\Snowluma\node.exe --test "D:\DSHBot\plugin\dsh-alive\test\*.test.mjs"
+ *   node --test "test/*.test.mjs"
  */
 
 import { LUST_ENABLED } from './mood.mjs'
