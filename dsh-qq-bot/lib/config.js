@@ -221,6 +221,21 @@ export const DEFAULTS = Object.freeze({
    * 0 = 不自动换（只报警）。
    */
   zeroTextRolloverTurns: 2,
+
+  /**
+   * 零正文的时候，先推她一句把话补上（默认开）。
+   *
+   * 2026-10-27 查出来的真相：她不是不会说，是把答案**写进了思考通道**。
+   * 那个模型的 reasoning 里常常整段都是已经起草好的回复（"分条。看到了 / 两条 8G…"），
+   * 然后正文留空就 stop 了。这种「边想边起草」平时没事（下一步会把话真说出来），
+   * 但只要发生在最后一步，这一轮就彻底静音 —— 他那边一个字都收不到。
+   *
+   * 所以：零正文的轮次先推一句让她把话补出来；推了还没用，才走换局那条路。
+   */
+  zeroTextNudge: true,
+
+  /** 推她那句话说什么。太长会干扰她，一句话就够。 */
+  zeroTextNudgeText: '（刚才那轮你把话写在思考里了，正文一个字都没发出去 —— 她那边什么都没收到。把话直接说出来。）',
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -374,6 +389,11 @@ export function parseConfig(raw) {
     zeroTextRolloverTurns: Math.round(
       num(input.zeroTextRolloverTurns, DEFAULTS.zeroTextRolloverTurns, { min: 0, max: 10 }),
     ),
+    // 布尔项用 !== false：老配置文件里没有这个键时也要默认开着
+    zeroTextNudge: input.zeroTextNudge !== false,
+    zeroTextNudgeText: typeof input.zeroTextNudgeText === 'string' && input.zeroTextNudgeText.trim() !== ''
+      ? input.zeroTextNudgeText.trim()
+      : DEFAULTS.zeroTextNudgeText,
 
     imageEnabled: input.imageEnabled !== false,
     imageDir: typeof input.imageDir === 'string' ? input.imageDir.trim() : '',

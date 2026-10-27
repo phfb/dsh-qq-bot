@@ -27,6 +27,16 @@ test('zeroTextRolloverTurns: 坏值被夹回合法区间', () => {
   assert.equal(parseConfig({ zeroTextRolloverTurns: 'abc' }).config.zeroTextRolloverTurns, 2)
 })
 
+test('零正文先「推一句」，默认开，文案可换', () => {
+  // 真相：模型把整段回复写进了思考通道，正文留空。先催一句比直接换局便宜得多。
+  assert.equal(DEFAULTS.zeroTextNudge, true)
+  assert.equal(parseConfig({}).config.zeroTextNudge, true)
+  assert.equal(parseConfig({ zeroTextNudge: false }).config.zeroTextNudge, false)
+  assert.ok(parseConfig({}).config.zeroTextNudgeText.includes('思考'))
+  assert.equal(parseConfig({ zeroTextNudgeText: '  快说句话  ' }).config.zeroTextNudgeText, '快说句话')
+  assert.equal(parseConfig({ zeroTextNudgeText: '   ' }).config.zeroTextNudgeText, DEFAULTS.zeroTextNudgeText)
+})
+
 test('换局阈值可以调到 35（本机现在就是 35，别让它回到 60）', () => {
   // 代码默认仍是 80（老值，给别人装的时候别一上来就换局），
   // 但这台机器的 config.json 已经改成 35 —— 上下文到 35 万 token 就开始换新局。

@@ -1875,6 +1875,9 @@ export function apply(ctx, rawConfig) {
    */
   const turnSpeech = new Map()
 
+  /** 上次「推她补一句」的时间：防止一轮里反复推。 */
+  const silentNudgeAt = new Map()
+
   /**
    * 连续零正文到阈值就主动换局。
    *
@@ -1917,10 +1920,28 @@ export function apply(ctx, rawConfig) {
         state.silentRun += 1
         state.spoke = false
         turnSpeech.set(uin, state)
+        // 2026-10-27 查出来的真相：模型常常把**整段回复**写进思考通道，正文留空就 stop
+        // （reasoning 里能看到"分条。看到了 / 两条 8G 的 DDR4-3200…"这种已经起草好的话）。
+        // 平时下一步会把话补出来，落在最后一步就彻底静音 —— 他那边一个字都收不到。
         writeLog(
           'WARN',
-          `她第 ${turnNo} 轮一个字都没说出来（连续 ${state.silentRun} 轮）—— 模型只 thinking 不给正文，先查上下文大小和模型`,
+          `她第 ${turnNo} 轮一个字都没说出来（连续 ${state.silentRun} 轮）—— 答案写在思考里了，正文是空的`,
         )
+
+        // 先推她一句把话补出来。只推第一轮，且 20 秒内不重复推 ——
+        // 推了还有用，推了没用就交给下面的换局，别在这儿死循环。
+        const lastNudge = silentNudgeAt.get(uin) ?? 0
+        if (config.zeroTextNudge && state.silentRun === 1 && Date.now() - lastNudge > 20_000) {
+          const record = sessions.get(uin)
+          if (record?.agent && typeof record.agent.followup === 'function') {
+            silentNudgeAt.set(uin, Date.now())
+            writeLog('INFO', `零正文：推她一句，把刚才没说的补上（第 ${turnNo} 轮）`)
+            void deliverTask(record.agent, config.zeroTextNudgeText, 'zero-text-nudge').catch((err) => {
+              writeLog('WARN', `零正文催话失败：${err instanceof Error ? err.message : String(err)}`)
+            })
+          }
+        }
+
         const limit = Math.round(Number(config.zeroTextRolloverTurns) || 0)
         if (limit > 0 && state.silentRun >= limit) {
           state.silentRun = 0
