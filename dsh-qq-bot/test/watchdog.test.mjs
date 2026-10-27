@@ -19,7 +19,10 @@ test('默认 300 秒，落在设置页给的范围里', () => {
 })
 
 test('设置页范围 180~900：超出会被压回去并记一条 problem', () => {
-  const low = parseConfig({ watchdogSeconds: 60 })
+  // ⚠️ 临时：WATCHDOG_MIN_SECONDS 现在是 1（压测看门狗用），恢复 180 时这个测试自动跟着对。
+  // 断言写成「相对常量」，所以恢复常量不用改测试。
+  const tooLow = WATCHDOG_MIN_SECONDS - 100
+  const low = parseConfig({ watchdogSeconds: tooLow })
   assert.equal(low.config.watchdogSeconds, WATCHDOG_MIN_SECONDS)
   assert.ok(low.problems.some((p) => p.includes('watchdogSeconds')))
 
@@ -56,4 +59,15 @@ test('判定：到点了就救，救满上限才换局', () => {
 test('时间戳异常（负数/NaN）宁可不动手', () => {
   assert.equal(judgeWatchdog({ inTurn: true, idleMs: -5, thresholdMs: 300000, strikes: 0, maxStrikes: 2 }), 'wait')
   assert.equal(judgeWatchdog({ inTurn: true, idleMs: NaN, thresholdMs: 300000, strikes: 0, maxStrikes: 2 }), 'wait')
+})
+
+test('两种换局说辞是分开的：上下文满 ≠ 她卡住', () => {
+  // 2026-10-27 实测：她卡住换局时只有 12.2% 上下文，却在说「上下文快满了哦」—— 纯误导。
+  assert.notEqual(DEFAULTS.rolloverNotice, DEFAULTS.stuckRolloverNotice)
+  assert.ok(DEFAULTS.rolloverNotice.includes('上下文'))
+  assert.ok(DEFAULTS.stuckRolloverNotice.includes('宕机'))
+  assert.equal(parseConfig({}).config.stuckRolloverNotice, DEFAULTS.stuckRolloverNotice)
+  // 可以换说法，但空串退回默认
+  assert.equal(parseConfig({ stuckRolloverNotice: '卡了，重来' }).config.stuckRolloverNotice, '卡了，重来')
+  assert.equal(parseConfig({ stuckRolloverNotice: '  ' }).config.stuckRolloverNotice, DEFAULTS.stuckRolloverNotice)
 })

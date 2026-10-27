@@ -86,6 +86,14 @@ export const DEFAULTS = Object.freeze({
   contextWindow: 1_000_000,
   /** 换新对话时在 QQ 里说的那句。 */
   rolloverNotice: '上下文快满了哦，我先换个新脑子。\n这是新的一局，接着陪你。',
+
+  /**
+   * 她卡住、被看门狗救不回来时换局说的话。
+   *
+   * 跟上面那条分开，因为原因不一样：这条不是因为上下文满了，
+   * 说「上下文快满了哦」只会误导人（2026-10-27 实测过一次：明明只有 12%，却在喊快满了）。
+   */
+  stuckRolloverNotice: '脑子宕机了，重启一下...\n咱继续。',
   /**
    * 数据目录：会话映射、控制开关、表情闸门状态、日志全放这里。
    * 空串 = 默认落到 `<用户主目录>/.dsh-qq-bot`（插件首次启动时创建）。
@@ -365,6 +373,9 @@ export function parseConfig(raw) {
     contextLimitPercent: num(input.contextLimitPercent, DEFAULTS.contextLimitPercent, { min: 0, max: 100 }),
     contextWindow: num(input.contextWindow, DEFAULTS.contextWindow, { min: 8000, max: 2_000_000 }),
     rolloverNotice: typeof input.rolloverNotice === 'string' ? input.rolloverNotice : DEFAULTS.rolloverNotice,
+    stuckRolloverNotice: typeof input.stuckRolloverNotice === 'string' && input.stuckRolloverNotice.trim() !== ''
+      ? input.stuckRolloverNotice
+      : DEFAULTS.stuckRolloverNotice,
     dataDir: typeof input.dataDir === 'string' ? input.dataDir.trim() : '',
     memesDir: typeof input.memesDir === 'string' && input.memesDir.trim() !== '' ? input.memesDir.trim() : '',
     commandPrefix: typeof input.commandPrefix === 'string' && input.commandPrefix.trim() !== '' ? input.commandPrefix.trim() : DEFAULTS.commandPrefix,
@@ -488,7 +499,8 @@ function parseClock(value, fallback, problems) {
 }
 
 /** 看门狗的时间范围（秒）。设置页的输入框也是这个范围。 */
-export const WATCHDOG_MIN_SECONDS = 180
+// ⚠️ 临时改成 1，只为了压测看门狗（用户要求）。测完必须恢复 180。
+export const WATCHDOG_MIN_SECONDS = 1
 export const WATCHDOG_MAX_SECONDS = 900
 
 /**

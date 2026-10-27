@@ -637,19 +637,30 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * 上下文快满了：在 QQ 里说一声，然后换一个全新的会话接着聊。
+   * 换一个全新的会话接着聊。
    * 旧会话不删（GUI 里还能翻），只是后续消息走新的。
+   *
+   * @param {string} uin
+   * @param {any} record
+   * @param {{used:number, limit:number, percent:number}} usage
+   * @param {{notify?: string, why?: string}} [options]
+   *   notify — 换局时对他说的话，省略用默认那句「上下文快满了」
+   *   why    — 日志里的来由（沉默换局时写清楚是卡住，不是上下文满）
    */
-  async function rolloverSession(uin, record, usage) {
+  async function rolloverSession(uin, record, usage, options = {}) {
     const agents = ctx.get('agents')
     if (!agents) return false
 
     const gen = (Number(record.generation) || 1) + 1
     const newId = mintSessionId()
-    writeLog('INFO', `上下文 ${usage.percent}%（${usage.used}/${usage.limit}），准备换新对话（第 ${gen} 局）→ ${newId}`)
+    writeLog(
+      'INFO',
+      `${options.why ?? `上下文 ${usage.percent}%（${usage.used}/${usage.limit}）`}，` +
+        `准备换新对话（第 ${gen} 局）→ ${newId}`,
+    )
 
     // 走同一条发送队列，保证"这一轮的回复"先出去，提醒排在它后面
-    enqueueReply(uin, config.rolloverNotice)
+    enqueueReply(uin, options.notify ?? config.rolloverNotice)
 
     const selection = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {}
     /** @type {Record<string, unknown>} */
@@ -2087,11 +2098,14 @@ export function apply(ctx, rawConfig) {
   const silentNudgeAt = new Map()
 
   /**
-   * 连续零正文到阈值就主动换局。
+   * 她卡住、被救不回来 → 换局。
    *
    * 为什么不只靠 maybeRollover：它判的是「上下文百分比」——
    * 模型坏掉、或者上下文根本量不出来（没挂 tokenMeter）的时候它永远不触发，
    * 而那正是她完全不出声的时候。越不说话，越等不到救援。
+   *
+   * 注意说辞：这条**不是**上下文满了，所以不能说「上下文快满了哦」——
+   * 2026-10-27 实测过一次：只有 12.2%，却在喊快满了，纯误导。
    */
   async function rolloverForSilence(uin, record, reason) {
     if (rollingOver.has(uin)) return
@@ -2099,7 +2113,10 @@ export function apply(ctx, rawConfig) {
     try {
       const usage = contextUsage(record) ?? { used: 0, limit: resolveContextWindow(), percent: 0 }
       writeLog('WARN', `连续零正文，主动换新局（${reason}）`)
-      const switched = await rolloverSession(uin, record, usage)
+      const switched = await rolloverSession(uin, record, usage, {
+        notify: config.stuckRolloverNotice,
+        why: `她卡住了（${reason}），不是上下文满 —— 当前 ${usage.percent}%`,
+      })
       if (switched) rolloverAt.set(uin, Date.now())
       else writeLog('ERROR', `换局失败（${reason}）—— 这个会话可能要人工介入了`)
     } finally {
