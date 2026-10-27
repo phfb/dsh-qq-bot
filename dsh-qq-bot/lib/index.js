@@ -43,6 +43,7 @@ import { checkBudget, emptyBudget, rollDay, takeBudget } from './interact-budget
 import { isFarewell, shouldStopHere } from './goodnight.mjs'
 import { judgeTurnSilence } from './silence.mjs'
 import { judgeWatchdog } from './watchdog.mjs'
+import { isDuplicateMessage } from './dedupe.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -476,6 +477,12 @@ export function apply(ctx, rawConfig) {
   const creating = new Map()
   /** 每个会话的排队计数 */
   const queueDepth = new Map()
+  /**
+   * 每人最后一条入站正文和时间 —— 用来判「重复消息」。
+   * 只存一行文本和时间戳，不存整个事件。
+   * @type {Map<string, {text: string, at: number}>}
+   */
+  const lastInbound = new Map()
   /** 限流器按 uin 分 */
   const limiters = new Map()
   /** 正在处理的发送链，保证同一会话的消息按顺序发 */
@@ -1682,6 +1689,32 @@ export function apply(ctx, rawConfig) {
     if (config.selfId && userId === config.selfId) return
 
     const text = extractText(event.message)
+
+    /* 重复消息合并（2026-10-27 加的）：
+       同一条话连发两遍（手滑 / 网络重投 / 复制粘贴）会被当成两轮，她就回两遍。
+       只在「纯文本、内容完全一样、还在窗口内」时丢 —— 带图带文件的每份都是独立的，不能吞。 */
+    const plainOnly = !event.message || !Array.isArray(event.message)
+      ? true
+      : !event.message.some((seg) => seg && ['image', 'file', 'video', 'record', 'mface'].includes(seg.type))
+    if (plainOnly && text !== '' && (Number(config.dedupeSeconds) || 0) > 0) {
+      const last = lastInbound.get(userId)
+      const inFlight = (queueDepth.get(userId) ?? 0) > 0
+      if (
+        isDuplicateMessage({
+          lastText: last?.text ?? null,
+          lastAt: last?.at ?? 0,
+          now: Date.now(),
+          windowMs: Math.round(Number(config.dedupeSeconds) || 0) * 1000,
+          lastInFlight: inFlight,
+        }) &&
+        last !== undefined &&
+        last.text === text
+      ) {
+        writeLog('INFO', `重复消息，丢掉这一条：${text.slice(0, 40)}`)
+        return
+      }
+    }
+    lastInbound.set(userId, { text, at: Date.now() })
 
     /* 道别闭环（2026-10-27 加的）：她说了晚安、他也说了晚安 —— 这条就不回了。
        以前这种情况会被当成一轮新对话，于是她再回一句「晚安呀」，他没完没了。

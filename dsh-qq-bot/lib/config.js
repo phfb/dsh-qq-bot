@@ -272,6 +272,16 @@ export const DEFAULTS = Object.freeze({
 
   /** 这一轮最多救几次，到了就开新对话。0 = 不救、直接换局。 */
   watchdogMaxStrikes: 2,
+
+  /* ── 重复消息（2026-10-27 加）────────────────────────────────── */
+
+  /**
+   * 同一个人连发一模一样的话，多久内算重复（秒）。0 = 不合并。
+   *
+   * 默认 8 秒：手滑重发、网络重投都在这个区间里；
+   * 隔了几分钟他自己再讲一遍那是故意的，得让她听见。
+   */
+  dedupeSeconds: 8,
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -443,6 +453,9 @@ export function parseConfig(raw) {
     watchdogMaxStrikes: Math.round(
       num(input.watchdogMaxStrikes, DEFAULTS.watchdogMaxStrikes, { min: 0, max: 5 }),
     ),
+    dedupeSeconds: Math.round(
+      num(input.dedupeSeconds, DEFAULTS.dedupeSeconds, { min: 0, max: 120 }),
+    ),
 
     imageEnabled: input.imageEnabled !== false,
     imageDir: typeof input.imageDir === 'string' ? input.imageDir.trim() : '',
@@ -499,8 +512,7 @@ function parseClock(value, fallback, problems) {
 }
 
 /** 看门狗的时间范围（秒）。设置页的输入框也是这个范围。 */
-// ⚠️ 临时改成 1，只为了压测看门狗（用户要求）。测完必须恢复 180。
-export const WATCHDOG_MIN_SECONDS = 1
+export const WATCHDOG_MIN_SECONDS = 180
 export const WATCHDOG_MAX_SECONDS = 900
 
 /**
