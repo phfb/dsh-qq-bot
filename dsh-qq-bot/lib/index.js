@@ -2071,25 +2071,38 @@ export function apply(ctx, rawConfig) {
   async function restoreThinkingEffort(uin) {
     const state = watchdogOf(uin)
     if (!state.switchedOff) return
-    state.switchedOff = false
     const prev = state.prev
-    state.prev = null
-    if (!prev || typeof prev.provider !== 'string' || typeof prev.model !== 'string') return
+    /* 2026-10-28 修：原来一进门就把 switchedOff 清成 false，然后才去检查条件 ——
+       于是只要这一次没恢复成（会话还没建好 / selectModel 抛错），状态就丢了，
+       之后再也不会重试，她会一直停在 off 档，直到下次换局或重启才偶然恢复。
+       现在只有**真的恢复成功**（或者确认根本没东西可恢复）才清状态。 */
+    if (!prev || typeof prev.provider !== 'string' || typeof prev.model !== 'string') {
+      state.switchedOff = false
+      state.prev = null
+      return
+    }
     const service = ctx.get('sessionController')
     const sessionId = sessions.get(uin)?.sessionId
+    // 会话暂时不在（换局中 / 刚重启）就留着状态，turn/end 时还会再调一次
     if (!service || typeof service.selectModel !== 'function' || typeof sessionId !== 'string') return
     try {
       /** @type {Record<string, unknown>} */
       const request = { sessionId, provider: prev.provider, model: prev.model }
-      if (typeof prev.reasoningEffort === 'string' && prev.reasoningEffort !== '') {
-        request.reasoningEffort = prev.reasoningEffort
-      }
+      /* 档位兜底：这一局本来就是我们按 TASK_REASONING_EFFORT 设的。
+         万一 prev 里没带上档位（selection 当时没给），也不能就这么留在 off —— 那等于永久关思考。 */
+      const back =
+        typeof prev.reasoningEffort === 'string' && prev.reasoningEffort !== ''
+          ? prev.reasoningEffort
+          : TASK_REASONING_EFFORT
+      if (back !== '') request.reasoningEffort = back
       await service.selectModel(request)
-      writeLog('INFO', `看门狗：思考档位已恢复（${prev.provider}/${prev.model}${prev.reasoningEffort ? ` ${prev.reasoningEffort}` : ''}）`)
+      state.switchedOff = false
+      state.prev = null
+      writeLog('INFO', `看门狗：思考档位已恢复（${prev.provider}/${prev.model}${back ? ` ${back}` : ''}）`)
     } catch (err) {
       writeLog(
         'WARN',
-        `看门狗：恢复思考档位失败，她还停在 off 档：${err instanceof Error ? err.message : String(err)}`,
+        `看门狗：恢复思考档位失败（下次 turn/end 再试），她还停在 off 档：${err instanceof Error ? err.message : String(err)}`,
       )
     }
   }
