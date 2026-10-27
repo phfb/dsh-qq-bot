@@ -764,11 +764,6 @@ export function apply(ctx, rawConfig) {
     }
   }, 5000)
 
-  // 每日说说（日记）调度：内部自己判断 enabled / qzoneDiaryEnabled
-  startDiaryTimer()
-  // 说说互动轮询：只在「想他/吃醋」到阈值时才干活，平时一次 API 都不调
-  startPollTimer()
-
   if (!config.enabled) {
     writeLog('INFO', 'enabled=false，本次不连接、不转发。改配置后插件会重载。')
     return
@@ -1037,6 +1032,15 @@ export function apply(ctx, rawConfig) {
     if (diaryState.firedAt > 0) return
     const nowMin = now.getHours() * 60 + now.getMinutes()
     if (nowMin < diaryState.minute) return
+    // 过期太久就跳过今天：否则半夜重启会「补写」一篇，那不像日记像补作业。
+    // 宽限 = 窗口长度再 + 120 分钟，够应付一次临时重启。
+    const grace = Math.max(1, Math.round(Number(config.qzoneDiaryWindowMinutes) || 60)) + 120
+    if (nowMin > diaryState.minute + grace) {
+      diaryState.firedAt = Date.now()
+      saveDiaryState()
+      writeLog('INFO', '日记：今天那个时间点已经过太久了，这次不补写')
+      return
+    }
     diaryState.firedAt = Date.now()
     saveDiaryState()
     await runDiaryNow()
@@ -2566,6 +2570,14 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
   } else {
     writeLog('INFO', '宿主没有 webServer 服务：设置页 API 未注册，配置请改 cordis.patch.yml')
   }
+
+  /* ── 定时任务：放到这里启动 ──────────────────────────────────
+     必须在这之后 —— diaryTimer / pollTimer 是 let，声明在下面那些
+     函数附近。放前面会撞 TDZ（临时性死区），2026-10-27 就是这么炸的：
+     ReferenceError: Cannot access 'diaryTimer' before initialization。 */
+
+  startDiaryTimer()
+  startPollTimer()
 
   /* ── 清理：插件卸载 / 重载时全部拆掉 ── */
   ctx.effect(() => () => {
