@@ -11,8 +11,13 @@ import assert from 'node:assert/strict'
 import {
   RateLimiter,
   cleanMarkdown,
+  expandQuote,
+  extractQuoteId,
   extractText,
+  formatQuote,
+  hasImageSegments,
   isAllowedUser,
+  limitImageSegments,
   looksRejected,
   randomIn,
   segmentText,
@@ -82,6 +87,160 @@ test('extractText: CQ 码字符串', () => {
     extractText('[CQ:reply,id=1]hi[CQ:image,file=x.jpg]'),
     'hi[图片]',
   )
+})
+
+/* ── 引用段的 message_id（expandQuote 靠它去 get_msg 取原文）── */
+
+test('extractQuoteId: array 格式取 reply 段的 id', () => {
+  assert.equal(
+    extractQuoteId([
+      { type: 'reply', data: { id: '7485621634122345678' } },
+      { type: 'text', data: { text: ' 这句是啥意思' } },
+    ]),
+    '7485621634122345678',
+  )
+})
+
+test('extractQuoteId: 没有 reply 段返回 null', () => {
+  assert.equal(extractQuoteId([{ type: 'text', data: { text: '在吗' } }]), null)
+  assert.equal(extractQuoteId('在吗'), null)
+  assert.equal(extractQuoteId(null), null)
+})
+
+test('extractQuoteId: reply 段缺 id / 空 id 都算没有', () => {
+  assert.equal(extractQuoteId([{ type: 'reply', data: {} }]), null)
+  assert.equal(extractQuoteId([{ type: 'reply', data: { id: '  ' } }]), null)
+})
+
+test('extractQuoteId: CQ 码字符串里取 id（id 不在最后一个参数也要取到）', () => {
+  assert.equal(extractQuoteId('[CQ:reply,id=123,text=abc]你好'), '123')
+  assert.equal(extractQuoteId('[CQ:face,id=1]你好'), null)
+})
+
+test('extractQuoteId: 数字 id 也认', () => {
+  assert.equal(extractQuoteId([{ type: 'reply', data: { id: 456 } }]), '456')
+})
+
+/* ── 引用里的图：张数封顶 ── */
+
+test('limitImageSegments: 只留前 N 张图，文字段全留', () => {
+  const msg = [
+    { type: 'text', data: { text: 'a' } },
+    { type: 'image', data: { file: '1.jpg' } },
+    { type: 'image', data: { file: '2.jpg' } },
+    { type: 'mface', data: { url: 'x' } },
+    { type: 'text', data: { text: 'b' } },
+  ]
+  const out = limitImageSegments(msg, 2)
+  assert.equal(out.length, 4)
+  assert.equal(out.filter((s) => s.type === 'image').length, 2)
+  assert.deepEqual(out.filter((s) => s.type === 'text').map((s) => s.data.text), ['a', 'b'])
+})
+
+test('limitImageSegments: 上限定 0 就一张都不留；不是 array 原样返回', () => {
+  const msg = [{ type: 'image', data: { file: '1.jpg' } }, { type: 'text', data: { text: 'x' } }]
+  assert.deepEqual(limitImageSegments(msg, 0), [{ type: 'text', data: { text: 'x' } }])
+  assert.equal(limitImageSegments('[CQ:image,file=1.jpg]x', 4), '[CQ:image,file=1.jpg]x')
+})
+
+test('hasImageSegments: 认得出图 / 表情 / 纯文字', () => {
+  assert.equal(hasImageSegments([{ type: 'image', data: {} }]), true)
+  assert.equal(hasImageSegments([{ type: 'mface', data: {} }]), true)
+  assert.equal(hasImageSegments([{ type: 'text', data: { text: 'x' } }]), false)
+  assert.equal(hasImageSegments(null), false)
+})
+
+/* ── 引用展开（expandQuote / formatQuote）──
+   她以前只看得见「[引用]」三个字，看不见引的是哪句。这几个用例盯的就是那三个字
+   到底有没有被填成原话，以及取不到时有没有乖乖退回占位。 */
+
+const quoteMsg = (id, text = '') => [
+  { type: 'reply', data: { id } },
+  ...(text === '' ? [] : [{ type: 'text', data: { text } }]),
+]
+
+test('formatQuote: 带昵称和正文', () => {
+  const data = { message: [{ type: 'text', data: { text: '那不是复制文件，那是搬家' } }], sender: { nickname: 'Never' } }
+  assert.equal(formatQuote(data), '[引用 Never]: 那不是复制文件，那是搬家')
+})
+
+test('formatQuote: 没有昵称就只留「[引用]」', () => {
+  const data = { message: [{ type: 'text', data: { text: '在吗' } }] }
+  assert.equal(formatQuote(data), '[引用]: 在吗')
+})
+
+test('formatQuote: 空正文 / 只有表情的引用返回 null', () => {
+  assert.equal(formatQuote({ message: [{ type: 'text', data: { text: '   ' } }] }), null)
+  assert.equal(formatQuote({ message: [] }), null)
+  assert.equal(formatQuote(null), null)
+})
+
+test('formatQuote: 太长截断（不把一整段聊天记录塞进正文）', () => {
+  const data = { message: [{ type: 'text', data: { text: '啊'.repeat(50) } }], sender: { nickname: 'Never' } }
+  const out = formatQuote(data, { maxChars: 10 })
+  assert.equal(out, `[引用 Never]: ${'啊'.repeat(10)}…`)
+})
+
+test('expandQuote: 把引用原话取回来', async () => {
+  const fake = {
+    1001: { message: [{ type: 'text', data: { text: '外卖比我还重要？' } }], sender: { nickname: 'Never' } },
+  }
+  const out = await expandQuote(quoteMsg('1001', ' 你这话什么意思'), {
+    fetchMsg: async (id) => fake[id] ?? null,
+  })
+  assert.equal(out, '[引用 Never]: 外卖比我还重要？')
+})
+
+test('expandQuote: 没有引用段就不取（也不该白打一次 get_msg）', async () => {
+  let called = 0
+  const out = await expandQuote([{ type: 'text', data: { text: '在吗' } }], {
+    fetchMsg: async () => { called++; return null },
+  })
+  assert.equal(out, null)
+  assert.equal(called, 0)
+})
+
+test('expandQuote: 引用里的引用一并展开', async () => {
+  const fake = {
+    A: { message: [{ type: 'reply', data: { id: 'B' } }, { type: 'text', data: { text: ' 这句' } }], sender: { nickname: 'Never' } },
+    B: { message: [{ type: 'text', data: { text: '更早那句' } }], sender: { nickname: 'Never' } },
+  }
+  const out = await expandQuote(quoteMsg('A'), { fetchMsg: async (id) => fake[id] ?? null })
+  assert.equal(out, '[引用 Never]: [引用 Never]: 更早那句 这句')
+})
+
+test('expandQuote: 环形引用不会转圈（maxDepth 兜住）', async () => {
+  const fake = {
+    A: { message: [{ type: 'reply', data: { id: 'B' } }, { type: 'text', data: { text: 'A' } }], sender: { nickname: 'X' } },
+    B: { message: [{ type: 'reply', data: { id: 'A' } }, { type: 'text', data: { text: 'B' } }], sender: { nickname: 'X' } },
+  }
+  let calls = 0
+  const out = await expandQuote(quoteMsg('A'), {
+    fetchMsg: async (id) => { calls++; return fake[id] ?? null },
+    maxDepth: 2,
+  })
+  assert.equal(calls, 2, '最多只展两层')
+  assert.ok(out !== null)
+})
+
+test('expandQuote: 取不到就返回 null（调用方退回「[引用]」，不能整条消息丢掉）', async () => {
+  const errors = []
+  const out = await expandQuote(quoteMsg('404', ' 你引的是啥'), {
+    fetchMsg: async () => { throw new Error('消息不存在') },
+    onError: (id, err) => errors.push([id, err.message]),
+  })
+  assert.equal(out, null)
+  assert.deepEqual(errors, [['404', '消息不存在']])
+})
+
+test('extractText + expandQuote: 拼出来的正文是「你后面那句话 + 引用的原话」', async () => {
+  const msg = quoteMsg('1001', ' 你这话什么意思')
+  assert.equal(extractText(msg), '[引用] 你这话什么意思')
+  const out = await expandQuote(msg, {
+    fetchMsg: async () => ({ message: [{ type: 'text', data: { text: '外卖比我还重要？' } }], sender: { nickname: 'Never' } }),
+  })
+  const filled = extractText(msg).replace('[引用]', out)
+  assert.equal(filled, '[引用 Never]: 外卖比我还重要？ 你这话什么意思')
 })
 
 test('extractText: 空数组 / 非消息', () => {

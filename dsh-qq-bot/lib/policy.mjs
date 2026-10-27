@@ -131,7 +131,9 @@ export function extractText(message) {
         parts.push(`@${String(data.qq ?? '')}`)
         break
       case 'reply':
-        // 引用只记个标记，不展开
+        // 这里只留个占位。真正的原文由 index.js 的 expandQuote() 顺着
+        // reply 段里的 message_id 调 get_msg 填回来（见 extractQuoteId）。
+        // 填充失败时保留这个占位 —— 至少让模型知道自己漏了一段上下文。
         parts.push('[引用]')
         break
       case 'forward':
@@ -145,6 +147,135 @@ export function extractText(message) {
     }
   }
   return parts.join('').trim()
+}
+
+/**
+ * 取出「引用」段里被引用那条的 message_id。
+ *
+ * OneBot v11 的 reply 段长这样：`{ type:'reply', data:{ id:'1234567' } }`，
+ * 那个 id 就是被引用那条消息的 message_id —— 拿着它调 get_msg 才能把原文取回来。
+ * 没有 reply 段、或者段里没 id，返回 null。array 和 CQ 码字符串两种形态都认。
+ *
+ * @param {unknown} message
+ * @returns {string | null}
+ */
+export function extractQuoteId(message) {
+  if (typeof message === 'string') {
+    // CQ 码：…[CQ:reply,id=1234567]…（注意 id 不是最后一个参数，不能偷懒写 [^\]]+$）
+    const m = /\[CQ:reply,[^\]]*?\bid=([^,\]]+)/i.exec(message)
+    if (m === null) return null
+    const id = m[1].trim()
+    return id === '' ? null : id
+  }
+
+  if (!Array.isArray(message)) return null
+
+  for (const seg of message) {
+    if (seg === null || typeof seg !== 'object') continue
+    if (String(seg.type ?? '') !== 'reply') continue
+    const data = seg.data ?? {}
+    const id = data.id ?? data.message_id
+    if (id === undefined || id === null) return null
+    const text = String(id).trim()
+    return text === '' ? null : text
+  }
+  return null
+}
+
+/**
+ * 只留前 max 个图片段，其余的直接丢掉。
+ *
+ * 用在「引用的那条里有图」这条路上：他引用一条塞了九张图的消息，
+ * 不该让她一口气吃下九张图 —— 视觉 token 是要钱的，而且她也不需要。
+ * 文字段一律留着，占位和正文都还在。
+ *
+ * @param {unknown} message OneBot v11 的 message 字段
+ * @param {number} [max]
+ * @returns {unknown}  不是 array 的原样返回
+ */
+export function limitImageSegments(message, max = 4) {
+  if (!Array.isArray(message)) return message
+  const cap = Math.max(0, Math.floor(Number(max) || 0))
+  let seen = 0
+  const out = []
+  for (const seg of message) {
+    if (seg !== null && typeof seg === 'object' && (seg.type === 'image' || seg.type === 'mface')) {
+      seen += 1
+      if (seen > cap) continue
+    }
+    out.push(seg)
+  }
+  return out
+}
+
+/** 这条消息里有没有图片/表情段（引用带图的快捷判断）。 */
+export function hasImageSegments(message) {
+  if (!Array.isArray(message)) return false
+  return message.some((seg) => seg !== null && typeof seg === 'object' && (seg.type === 'image' || seg.type === 'mface'))
+}
+
+/**
+ * 把 get_msg 取回来的一条消息压成一行「[引用 昵称]: 原话」。
+ *
+ * inner 是「被引用那条自己引用的东西」，已经格式化好了；有的话就替换掉那三个字，
+ * 于是引用链读起来是：[引用 A]: 原话里还带着 [引用 B]: 更早那句。
+ *
+ * @param {any} data   OneBot get_msg 的返回体（含 message / sender）
+ * @param {{inner?: string | null, maxChars?: number}} [opts]
+ * @returns {string | null}  空消息 / 取不到正文返回 null
+ */
+export function formatQuote(data, { inner = null, maxChars = 300 } = {}) {
+  if (data === null || typeof data !== 'object') return null
+
+  let body = extractText(data.message)
+  if (typeof inner === 'string' && inner !== '') {
+    body = body === '' ? inner : body.replace('[引用]', inner)
+  }
+
+  // 引用里的换行会把一句引文拉成一整段，压平
+  const flat = body.replace(/\s+/g, ' ').trim()
+  if (flat === '') return null
+
+  const who = String(data.sender?.card || data.sender?.nickname || '').trim()
+  const head = who === '' ? '[引用]' : `[引用 ${who}]`
+  const cut = flat.length > maxChars ? `${flat.slice(0, maxChars)}…` : flat
+  return `${head}: ${cut}`
+}
+
+/**
+ * 顺着 reply 段里的 message_id 把被引用那条的原话取回来。
+ *
+ * 递归是有意的：他引用的那条自己也可能是一条引用（「你以为他说的是这个，其实是那个」），
+ * 只展一层等于让她读半句话。maxDepth 兜住环（A 引 B、B 又引 A）。
+ *
+ * fetchMsg 由调用方注入 —— policy.mjs 不认识 OneBot 连接，这样才测得动。
+ * 任何一步出错都只返回 null，让调用方退回原来的「[引用]」：丢一段上下文可以忍，
+ * 因为一个取不到的引用把整条消息弄丢不行。
+ *
+ * @param {unknown} message  触发这次引用的那条消息（OneBot v11 的 message 字段）
+ * @param {{fetchMsg: (id: string) => Promise<any>, maxDepth?: number, maxChars?: number, onError?: (id: string, err: unknown) => void}} opts
+ * @returns {Promise<string | null>}
+ */
+export async function expandQuote(message, { fetchMsg, maxDepth = 2, maxChars = 300, onError = null } = {}) {
+  if (typeof fetchMsg !== 'function') return null
+
+  /** @param {unknown} msg @param {number} depth */
+  const walk = async (msg, depth) => {
+    const id = extractQuoteId(msg)
+    if (id === null || depth >= maxDepth) return null
+    try {
+      const res = await fetchMsg(id)
+      const data = res?.data ?? res
+      if (data === null || typeof data !== 'object') return null
+      const inner = extractQuoteId(data.message) === null ? null : await walk(data.message, depth + 1)
+      return formatQuote(data, { inner, maxChars })
+    } catch (err) {
+      if (typeof onError === 'function') onError(id, err)
+      return null
+    }
+  }
+
+  return walk(message, 0)
 }
 
 /**

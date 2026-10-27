@@ -230,8 +230,8 @@ test('selectForPurge: 全是小图也能正常工作（不会一次删光）', (
 
 test('describeImages: 给出绝对路径 + 尺寸 + 明确要求 read_image', () => {
   const text = describeImages([
-    { path: 'C:\\temp\\dsh-data\\images\\a.png', width: 2127, height: 600, bytes: 139422, at: new Date(2026, 9, 25, 17, 30, 12).toISOString() },
-    { path: 'C:\\temp\\dsh-data\\images\\b.jpg', width: 0, height: 0, bytes: 2048, at: new Date(2026, 9, 25, 17, 30, 13).toISOString() },
+    { path: 'D:\\DSHBot\\data\\images\\a.png', width: 2127, height: 600, bytes: 139422, at: new Date(2026, 9, 25, 17, 30, 12).toISOString() },
+    { path: 'D:\\DSHBot\\data\\images\\b.jpg', width: 0, height: 0, bytes: 2048, at: new Date(2026, 9, 25, 17, 30, 13).toISOString() },
   ])
   assert.match(text, /他发来 2 张图片/)
   assert.match(text, /2127×600/)
@@ -348,7 +348,7 @@ test('parseImageSegments: includeEmotes=false 时把 mface 排除', () => {
 /* ── 原生附件 ────────────────────────────────────────────────────────── */
 
 test('resolveDshHome: 只认环境变量，没有就空串', () => {
-  assert.equal(resolveDshHome({ DSH_HOME: 'C:\\dsh-home' }), 'C:\\dsh-home')
+  assert.equal(resolveDshHome({ DSH_HOME: 'D:\\DSH\\dsh-home' }), 'D:\\DSH\\dsh-home')
   assert.equal(resolveDshHome({}), '')
   assert.equal(resolveDshHome(null), '')
 })
@@ -432,4 +432,32 @@ test('buildInboundText: 文件给路径，语音、视频明说做不到', () =>
 
 test('buildInboundText: 什么都没有就只剩原话', () => {
   assert.equal(buildInboundText('在吗', { images: [], files: [], voices: [], videos: [] }), '在吗')
+})
+
+/* ── 引用里带图（2026-10-28）──────────────────────────────────────────
+   他引一张图问「这个怎么办」：图要真的贴进来，而且要说明白
+   「这几张是引用里的」，别跟她刚发的那张混成一堆。 */
+
+test('buildInboundText: 区分「他刚发的」和「他引用那条里的」', () => {
+  const block = { type: 'image' }
+  const img = (file) => ({ file, path: `D:\\x\\${file}`, width: 10, height: 10, bytes: 100, kind: 'image', block })
+  const t = buildInboundText('[引用 Never]: [图片] 这个怎么办', {
+    images: [img('now.png'), img('quoted.png')],
+    files: [], voices: [], videos: [],
+  }, { nativeImages: true, quotedCount: 1 })
+  assert.match(t, /2 张图片/)
+  assert.match(t, /其中 1 张来自他引用的那条/)
+})
+
+test('buildInboundText: 没有引用时还是老说法（别把常走的那条路改了）', () => {
+  const img = { file: 'a.png', path: 'D:\\x\\a.png', width: 10, height: 10, bytes: 100, kind: 'image', block: { type: 'image' } }
+  const t = buildInboundText('看图', { images: [img], files: [], voices: [], videos: [] }, { nativeImages: true })
+  assert.match(t, /他发来 1 张图片/)
+  assert.ok(!t.includes('来自他引用的那条'))
+})
+
+test('buildInboundText: quotedCount 离谱也不崩（越界就夹住）', () => {
+  const img = { file: 'a.png', path: 'D:\\x\\a.png', width: 10, height: 10, bytes: 100, kind: 'image', block: { type: 'image' } }
+  const t = buildInboundText('看图', { images: [img], files: [], voices: [], videos: [] }, { nativeImages: true, quotedCount: 99 })
+  assert.match(t, /其中 1 张来自他引用的那条/)
 })

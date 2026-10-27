@@ -23,8 +23,11 @@ import { buildSocketUrl, parseConfig } from './config.js'
 import {
   RateLimiter,
   cleanMarkdown,
+  expandQuote,
   extractText,
+  hasImageSegments,
   isAllowedUser,
+  limitImageSegments,
   looksLikeWork,
   looksRejected,
   randomIn,
@@ -318,15 +321,19 @@ function createTaskMessage({ text, reason, kind }) {
  * 语音和视频是**明着说做不到**：模型没有耳朵、也吃不下视频，
  * 与其让她编一段"我听到了"，不如让她老实说"这条我听不了，打字给我"。
  */
-export function buildInboundText(text, collected, { nativeImages = false } = {}) {
+export function buildInboundText(text, collected, { nativeImages = false, quotedCount = 0 } = {}) {
   const lines = []
   if (typeof text === 'string' && text !== '') lines.push(text)
 
   const images = collected?.images ?? []
   if (images.length > 0) {
+    // 引用带图的张数也并进了 images。分开说清楚，否则她分不清哪张是他刚发的、
+    // 哪张是他引用的那条里的 —— 这两件事的「他想要什么」完全不一样。
+    const quoted = Math.min(Math.max(0, Math.floor(Number(quotedCount) || 0)), images.length)
+    const fromQuote = quoted > 0 ? `，其中 ${quoted} 张来自他引用的那条` : ''
     lines.push(nativeImages
-      ? `[他发来 ${images.length} 张图片，已经贴在这条消息里了，直接看]`
-      : `[他发来 ${images.length} 张图片，存在下面这些路径：]`)
+      ? `[${quoted > 0 ? '这条消息' : '他发来'} ${images.length} 张图片${fromQuote}，已经贴在这条消息里了，直接看]`
+      : `[${quoted > 0 ? '这条消息' : '他发来'} ${images.length} 张图片${fromQuote}，存在下面这些路径：]`)
     images.forEach((img, i) => {
       const dims = img.width > 0 && img.height > 0 ? `${img.width}×${img.height}` : '尺寸未知'
       const kind = img.kind === 'mface' ? '表情' : '图片'
@@ -1776,6 +1783,75 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  /* ── 引用展开 ────────────────────────────────────────────────────────────
+     extractText 把 reply 段压成三个字「[引用]」，于是她只看得见「你引用了某条」，
+     看不见引的到底是哪句 —— 他引用一句反问、一句吐槽，她全接不上。
+
+     2026-10-28 改成：顺着 reply 段里的 message_id 调 get_msg，把被引用那条的
+     原话取回来填进正文（逻辑在 policy.mjs 的 expandQuote，能单测）。
+
+     取不到就原样退回「[引用]」：少一段上下文可以忍，把整条消息丢了不行。 */
+
+  const QUOTE_MAX_DEPTH = 2
+  const QUOTE_MAX_CHARS = 300
+  /** 引用那条最多收几张图 —— 九宫格战报不该一次全塞进她的眼睛。 */
+  const QUOTE_MAX_IMAGES = 4
+
+  /**
+   * 给图片段补 url。
+   *
+   * 实时入站的图自带 url，引用就不一定了：老消息的 rkey 早过期，协议端有时只回 file。
+   * 没有 url 的话 saveOne 会直接跳过 —— 那就成了「引用的图还是看不见」。
+   * 所以缺 url 且还有 file 的时候，向协议端要一次 get_image。要不到也别炸，退回占位。
+   */
+  async function withImageUrls(message) {
+    if (!Array.isArray(message)) return message
+    const out = []
+    for (const seg of message) {
+      if (seg === null || typeof seg !== 'object' || (seg.type !== 'image' && seg.type !== 'mface')) {
+        out.push(seg)
+        continue
+      }
+      const data = seg.data ?? {}
+      const hasUrl = /^https?:\/\//i.test(String(data.url ?? ''))
+      const file = String(data.file ?? '')
+      if (hasUrl || file === '') {
+        out.push(seg)
+        continue
+      }
+      try {
+        const res = await client.call('get_image', { file })
+        const url = String(res?.data?.url ?? res?.url ?? '')
+        out.push(/^https?:\/\//i.test(url) ? { ...seg, data: { ...data, url } } : seg)
+      } catch (err) {
+        writeLog('WARN', `取图片 url 失败（file=${file}）：${err instanceof Error ? err.message : String(err)}`)
+        out.push(seg)
+      }
+    }
+    return out
+  }
+
+  /**
+   * 把正文里的「[引用]」换成被引用那条的原话；换不了就返回 null。
+   *
+   * onData 会在每取到一层时被叫一次（从最外层往里），handleInbound 用它
+   * 抓住被引用那条的消息体，好把里面的图也收下来。
+   */
+  async function resolveQuote(message, onData = null) {
+    return expandQuote(message, {
+      fetchMsg: async (id) => {
+        const res = await client.call('get_msg', { message_id: id })
+        if (typeof onData === 'function') onData(res?.data ?? res)
+        return res
+      },
+      maxDepth: QUOTE_MAX_DEPTH,
+      maxChars: QUOTE_MAX_CHARS,
+      onError: (id, err) => {
+        writeLog('WARN', `引用展开失败（message_id=${id}）：${err instanceof Error ? err.message : String(err)}`)
+      },
+    })
+  }
+
   /** 入站：一条 QQ 私聊。 */
   async function handleInbound(event) {
     const userId = String(event.user_id ?? '')
@@ -1785,7 +1861,7 @@ export function apply(ctx, rawConfig) {
     }
     if (config.selfId && userId === config.selfId) return
 
-    const text = extractText(event.message)
+    let text = extractText(event.message)
 
     /* 重复消息合并（2026-10-27 加的）：
        同一条话连发两遍（手滑 / 网络重投 / 复制粘贴）会被当成两轮，她就回两遍。
@@ -1846,6 +1922,40 @@ export function apply(ctx, rawConfig) {
       }
     }
 
+    /* 引用展开：把正文里的「[引用]」换成被引用那条的原话。
+       只在他真引用了才多打一次 get_msg，平时一毛钱开销没有。
+       顺手抓住被引用那条的消息体 —— 他要是引一张图问「这个怎么办」，
+       光有「[图片]」两个字等于没看见，下面得按图收。 */
+    let quotedMessage = null
+    if (text.includes('[引用]')) {
+      const expanded = await resolveQuote(event.message, (data) => {
+        if (quotedMessage === null) quotedMessage = data
+      })
+      if (expanded !== null) text = text.replace('[引用]', expanded)
+    }
+
+    /* 引用里带图：跟普通入站走同一条路（落附件库 + 挂原生附件），
+       张数按 QUOTE_MAX_IMAGES 封顶。失败只 WARN，引文本身照旧。 */
+    let quotedCount = 0
+    if (imageStore !== null && quotedMessage !== null && hasImageSegments(quotedMessage.message)) {
+      try {
+        const fromQuote = await imageStore.collectFromMessage(
+          await withImageUrls(limitImageSegments(quotedMessage.message, QUOTE_MAX_IMAGES)),
+          { uin: userId, said: text },
+        )
+        if (fromQuote.images.length > 0) {
+          quotedCount = fromQuote.images.length
+          collected = {
+            ...collected,
+            images: [...collected.images, ...fromQuote.images],
+            skipped: collected.skipped + fromQuote.skipped,
+          }
+        }
+      } catch (err) {
+        writeLog('WARN', `引用里的图片处理失败：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
     const nativeImages = collected.images.some((img) => img && img.block)
     const gotAnything = collected.images.length > 0 || collected.files.length > 0 ||
       collected.voices.length > 0 || collected.videos.length > 0
@@ -1856,7 +1966,7 @@ export function apply(ctx, rawConfig) {
     }
 
     /* 拼进会话的正文。光有图没文字的消息也要发 —— 那种以前会被上面这个空判断直接丢掉。 */
-    const promptText = buildInboundText(text, collected, { nativeImages })
+    const promptText = buildInboundText(text, collected, { nativeImages, quotedCount })
 
     // /qq 命令在插件本地处理，不送进 agent（关掉之后也还能用它开回来）
     const cmd = parseCommand(text)
