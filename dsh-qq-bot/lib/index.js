@@ -18,6 +18,10 @@ import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, statS
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
+import { spawn } from 'node:child_process'
+import net from 'node:net'
+import { fileURLToPath } from 'node:url'
+import { createUpdater, readLocalVersion } from './self-update.mjs'
 
 import { buildSocketUrl, parseConfig } from './config.js'
 import { ALIVE_GROUPS, BOT_GROUPS } from './settings-schema.mjs'
@@ -3559,7 +3563,129 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
      函数附近。放前面会撞 TDZ（临时性死区），2026-10-27 就是这么炸的：
      ReferenceError: Cannot access 'diaryTimer' before initialization。 */
 
-  startDiaryTimer()
+  /* ── 自更新 + SnowLuma 随宿主启停（2026-10-28）─────────────────────
+     自更新：启动先装上次下载好、校验过的包（本次仍跑旧代码，再启动才生效），
+     然后异步去 GitHub 看一眼有没有新 tag。只认发版 tag，不跟 main 提交。
+     SnowLuma：宿主起来时如果 3001 没人监听，就把协议端拉起来（静默）；
+     卸载时**只杀我们自己起的那个**，你手动开着的不动。
+     全程 try/catch —— 这两件事坏了都不该连累聊天。 */
+
+  const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+  const aliveRoot = join(dirname(pluginRoot), 'dsh-alive')
+
+  if (process.env.DSH_NO_AUTOUPDATE !== '1') {
+    try {
+      const updater = createUpdater({
+        repo: 'phfb/dsh-qq-bot',
+        localVersion: readLocalVersion(join(pluginRoot, 'package.json')),
+        dataDir: DATA_DIR,
+        mounts: [
+          { from: 'dsh-qq-bot', to: pluginRoot },
+          { from: 'dsh-alive', to: aliveRoot },
+        ],
+        log: (m) => writeLog('INFO', '更新：' + m),
+        warn: (m) => writeLog('WARN', '更新：' + m),
+      })
+      const installed = updater.applyPending()
+      if (installed !== null) writeLog('INFO', `更新：已装上 ${installed.tag}，再启动一次就是新代码`)
+      const timer = setTimeout(() => {
+        Promise.resolve(updater.checkAndStage()).catch(() => {})
+      }, 8000)
+      if (typeof timer.unref === 'function') timer.unref()
+    } catch (err) {
+      writeLog('WARN', `更新：初始化失败（不影响使用）：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /* ── SnowLuma 随宿主启停 ─────────────────────────────────────────── */
+  /** 我们自己拉起来的协议端进程；不是你手动开的那个。 */
+  let snowLumaChild = null
+
+  /** 从 baseUrl 里抠出 host/port，判断协议端在不在。 */
+  const oneBotTarget = () => {
+    try {
+      const u = new URL(config.baseUrl)
+      return { host: u.hostname || '127.0.0.1', port: Number(u.port) || 3001 }
+    } catch {
+      return { host: '127.0.0.1', port: 3001 }
+    }
+  }
+
+  /** 端口有没有人听（300ms 内连上就算在）。 */
+  const portOpen = (host, port) => new Promise((resolve) => {
+    const socket = net.connect({ host, port })
+    const done = (ok) => {
+      socket.destroy()
+      resolve(ok)
+    }
+    socket.setTimeout(400)
+    socket.once('connect', () => done(true))
+    socket.once('timeout', () => done(false))
+    socket.once('error', () => done(false))
+  })
+
+  /** SnowLuma 目录：默认跟数据目录同级（D:\DSHBot\data → D:\DSHBot\SnowLuma）。 */
+  const snowLumaDir = () => {
+    const fromConfig = typeof config.snowLumaDir === 'string' ? config.snowLumaDir.trim() : ''
+    if (fromConfig !== '') return fromConfig
+    return join(dirname(DATA_DIR), 'SnowLuma')
+  }
+
+  const stopSnowLuma = () => {
+    if (snowLumaChild === null) return
+    const pid = snowLumaChild.pid
+    snowLumaChild = null
+    try {
+      // node.exe 会再拉起子进程，kill 单个 pid 留幽灵 —— 整棵树带走
+      spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+      writeLog('INFO', `SnowLuma：随宿主退出，已关闭（pid ${pid}）`)
+    } catch (err) {
+      writeLog('WARN', `SnowLuma：关闭失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  const startSnowLuma = async () => {
+    if (config.enabled === false || config.snowLumaAutoStart === false) return
+    const { host, port } = oneBotTarget()
+    if (await portOpen(host, port)) {
+      writeLog('INFO', `SnowLuma：${host}:${port} 已经有人监听，不重复拉起`)
+      return
+    }
+    const dir = snowLumaDir()
+    const exe = join(dir, 'node.exe')
+    const script = join(dir, 'index.mjs')
+    if (!existsSync(exe) || !existsSync(script)) {
+      writeLog('WARN', `SnowLuma：找不到 ${exe} 或 ${script}，这次不拉（要改路径就设 snowLumaDir）`)
+      return
+    }
+    try {
+      const child = spawn(exe, [script], {
+        cwd: dir,
+        windowsHide: true,
+        stdio: 'ignore',
+        detached: false,
+      })
+      snowLumaChild = child
+      child.once('exit', (code) => {
+        if (snowLumaChild === child) snowLumaChild = null
+        writeLog('INFO', `SnowLuma：进程退出了（code ${code}）`)
+      })
+      child.once('error', (err) => {
+        if (snowLumaChild === child) snowLumaChild = null
+        writeLog('WARN', `SnowLuma：拉不起来：${err instanceof Error ? err.message : String(err)}`)
+      })
+      writeLog('INFO', `SnowLuma：宿主启动时拉起（pid ${child.pid}，${dir}）`)
+    } catch (err) {
+      writeLog('WARN', `SnowLuma：拉起失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  // 等自身的 ws 客户端先试一次；连不上再拉协议端（拉起来之后它会自己重连）
+  setTimeout(() => {
+    void startSnowLuma().catch(() => {})
+  }, 3000).unref?.()
+
+    startDiaryTimer()
   startPollTimer()
   startWatchdog()
 
@@ -3578,6 +3704,7 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
         offRoute = null
       }
       client.close()
+      if (config.snowLumaStopOnExit !== false) stopSnowLuma()
       for (const [, record] of sessions) {
         // 只 dispose 自己创建的 handle，别动宿主自己管理的会话
         if (record.handle && typeof record.handle.dispose === 'function') {
