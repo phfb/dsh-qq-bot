@@ -3254,7 +3254,7 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
                 : [{ type: 'text', text: value?.note ?? '没发出去。' }],
           },
           async execute(args) {
-            // 真正的活儿在 sendMemeCore —— 和 alive 走的���个入口，闸门、记账完全一致。
+            // 真正的活儿在 sendMemeCore —— 和 alive 走的同一个入口，闸门、记账完全一致。
             return sendMemeCore(args?.keyword)
           },
         }),
