@@ -509,6 +509,17 @@ window.__ModuleLoader__.load({
         h('circle', { cx: 18, cy: 17, r: 2, stroke: 'currentColor', strokeWidth: 1.6 }))
     }
 
+    /** 取点号路径的值（调参表里有 `moodRates.missing` 这种两层的）。 */
+    function pickByPath(obj, dotted) {
+      var cur = obj
+      var parts = String(dotted).split('.')
+      for (var i = 0; i < parts.length; i += 1) {
+        if (cur === null || cur === undefined || typeof cur !== 'object') return undefined
+        cur = cur[parts[i]]
+      }
+      return cur
+    }
+
     /** 一个字段：bool 是勾选框，其余是输入框（数字走 number，范围由 schema 夹）。 */
     function SchemaField(props) {
       var field = props.field
@@ -526,6 +537,25 @@ window.__ModuleLoader__.load({
             onChange: function (e) { onChange(e.target.checked) },
           }),
           h('span', null, field.label))
+      }
+
+      if (field.type === 'range') {
+        var num = Number(text)
+        var shown = Number.isFinite(num) ? num : Number(field.min) || 0
+        var t = props.extraText || ''
+        return h('label', { style: { display: 'block', padding: '6px 0' } },
+          h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 12, color: 'var(--dsw-alias-label-secondary)', marginBottom: 2 } },
+            h('span', null, field.label),
+            h('span', { style: { color: 'var(--dsw-alias-label-primary)' } }, shown.toFixed(1) + 'x' + (t ? ' · ' + t : ''))),
+          h('input', {
+            type: 'range',
+            min: field.min,
+            max: field.max,
+            step: field.step,
+            value: shown,
+            onChange: function (e) { onChange(e.target.value) },
+            style: { width: '100%', accentColor: 'var(--dsw-alias-brand-primary)' },
+          }))
       }
 
       return h('label', { style: { display: 'block', padding: '6px 0' } },
@@ -687,11 +717,29 @@ window.__ModuleLoader__.load({
             group.hint ? h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.7, marginBottom: 6 } }, group.hint) : null,
             h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '2px 14px' } },
               group.fields.map(function (field) {
-                var shown = Object.prototype.hasOwnProperty.call(draft, field.path) ? draft[field.path] : current[field.path]
+                var shown = Object.prototype.hasOwnProperty.call(draft, field.path) ? draft[field.path] : pickByPath(current, field.path)
+                // 速率滑条右边那列：满值要多久（跟 PowerShell 版一样实时算）
+                var fillRaw = Object.prototype.hasOwnProperty.call(draft, 'moodFillHours')
+                  ? draft.moodFillHours
+                  : pickByPath(current, 'moodFillHours')
+                var fill = Number(fillRaw) > 0 ? Number(fillRaw) : 6
+                var extra = ''
+                if (String(field.path).indexOf('moodRates.') === 0) {
+                  var mul = Number(shown)
+                  if (Number.isFinite(mul) && mul > 0) {
+                    if (field.path === 'moodRates.warmthGain') {
+                      extra = '每次哄 +' + Math.round(30 * mul) + '%'
+                    } else {
+                      var hours = fill / mul
+                      extra = hours >= 1 ? '满值约 ' + hours.toFixed(1) + ' 小时' : '满值约 ' + Math.round(hours * 60) + ' 分钟'
+                    }
+                  }
+                }
                 return h(SchemaField, {
                   key: field.path,
                   field: field,
                   value: shown,
+                  extraText: extra,
                   onChange: function (v) {
                     setDraft(function (prev) {
                       var next = Object.assign({}, prev)

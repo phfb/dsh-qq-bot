@@ -384,6 +384,21 @@ export const ALIVE_GROUPS = [
       ]
     },
     {
+      "title": "情绪速率（多久攒满）",
+      "hint": "每颗滑条是速率倍率 0.1x ~ 10x；1.0x = 用「基准」那栏的小时数从 0% 涨到 100%。涩涩那颗按上面的「启用涩涩模式」走，没勾也照样能调，只是她不会攒。",
+      "fields": [
+        { "key": "moodFillHours", "label": "基准：1.0x 时多久攒满（小时）", "path": "moodFillHours", "type": "number", "min": 1, "max": 72, "step": 0.5, "decimals": 1, "default": 6 },
+        { "key": "rate.missing", "label": "想他（深夜更快）", "path": "moodRates.missing", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 },
+        { "key": "rate.jealousy", "label": "吃醋（他没动静时）", "path": "moodRates.jealousy", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 },
+        { "key": "rate.warmthGain", "label": "暖意·涨（每次哄 +30%）", "path": "moodRates.warmthGain", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 },
+        { "key": "rate.warmthDecay", "label": "暖意·掉（冷到底）", "path": "moodRates.warmthDecay", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 },
+        { "key": "rate.worry", "label": "担心（凌晨他还没消息）", "path": "moodRates.worry", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 },
+        { "key": "rate.boredom", "label": "闲得慌（想他越久越快）", "path": "moodRates.boredom", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 },
+        { "key": "rate.annoyanceDecay", "label": "恼火·消气（60 点全消）", "path": "moodRates.annoyanceDecay", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 },
+        { "key": "rate.lust", "label": "涩涩", "path": "moodRates.lust", "type": "range", "min": 0.1, "max": 10, "step": 0.1, "decimals": 1 }
+      ]
+    },
+    {
       "title": "涩涩（对话驱动）",
       "hint": "不是随时间攒的：你在 QQ 里挑逗她 → 顶上去一截 → 事后慢慢回落到「余温下限」→ 再随「想他」自己爬，但爬到「自涨封顶」就停住，往上只能靠对话。建议搭配 purge-plus 插件用。",
       "fields": [

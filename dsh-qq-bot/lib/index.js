@@ -3331,6 +3331,31 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
    * 那张配置表单就是空的（所以他只能去开 PowerShell 窗口调参）。
    * 现在改成 defer 注入：服务什么时候起来，什么时候挂路由；插件卸载时注销。
    */
+  /**
+   * 点号路径读写：调参表里有 `moodRates.missing` 这种两层键（数据是嵌套对象，
+   * 直接 `next["moodRates.missing"]` 会写成一个平铺的怪键，alive 根本读不到）。
+   */
+  function getByPath(obj, dotted) {
+    let cur = obj
+    for (const part of String(dotted).split('.')) {
+      if (cur === null || typeof cur !== 'object') return undefined
+      cur = cur[part]
+    }
+    return cur
+  }
+
+  function setByPath(obj, dotted, value) {
+    const parts = String(dotted).split('.')
+    let cur = obj
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const key = parts[i]
+      if (cur[key] === null || typeof cur[key] !== 'object' || Array.isArray(cur[key])) cur[key] = {}
+      cur = cur[key]
+    }
+    cur[parts[parts.length - 1]] = value
+    return obj
+  }
+
   /** 两张「path → 字段定义」表：界面传回来的键必须在这两张表里才写。 */
   const BOT_BY_PATH = new Map(BOT_GROUPS.flatMap((g) => g.fields.map((f) => [f.path, f])))
   const ALIVE_BY_PATH = new Map(ALIVE_GROUPS.flatMap((g) => g.fields.map((f) => [f.path, f])))
@@ -3349,7 +3374,8 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
         .map((s) => s.trim())
         .filter((s) => s !== '')
     }
-    if (field.type === 'number') {
+    // range（滑条）跟 number 一样存数字 —— 漏了这条会把 2.5 写成字符串 "2.5"
+    if (field.type === 'number' || field.type === 'range') {
       const n = Number(value)
       if (!Number.isFinite(n)) return current ?? 0
       const min = Number.isFinite(field.min) ? field.min : -Infinity
@@ -3453,7 +3479,7 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
           skipped.push(`${label}.${k}（不在调参表里）`)
           continue
         }
-        next[field.path] = coerceField(field, v, next[field.path])
+        setByPath(next, field.path, coerceField(field, v, getByPath(next, field.path)))
         saved.push(`${label}.${field.path}`)
       }
       if (!writeJsonFile(file, next)) {
