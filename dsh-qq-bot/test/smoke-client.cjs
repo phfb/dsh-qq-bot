@@ -10,8 +10,10 @@ const path = require('node:path')
 
 const clientPath = process.argv[2]
 if (!clientPath) {
-  console.error('用法: node smoke-client.cjs <client.js>')
-  process.exit(2)
+  // `node --test` 会把 test/ 下所有文件都跑一遍，这里没参数是正常的 ——
+  // 原来直接 `process.exit(2)`，于是每次跑整套都多一条假红（2026-10-28 改）。
+  console.log('（跳过：手动冒烟需要 node smoke-client.cjs <client.js>）')
+  process.exit(0)
 }
 
 let captured = null
@@ -84,22 +86,34 @@ for (const c of calls) {
   console.log('  ', JSON.stringify(c.kind === 'register' ? { kind: c.kind, spec: c.spec, componentType: c.componentType } : c))
 }
 
-const injectCall = calls.find((c) => c.kind === 'inject')
-const registerCall = calls.find((c) => c.kind === 'register')
-
 let failed = false
-// 配置面板挂在**包详情页**（plugins.item），不是组件行详情页（plugins.row.config）——
-// 用户点插件列表里那一行进去看到的就是包页。
-if (!injectCall || injectCall.slotName !== 'plugins.item') {
-  console.error('FAIL: 没有 inject 到 plugins.item')
+
+/** 某个槽位上注册的那一格（按 id / key 找）。 */
+function findReg(name, field, value) {
+  return calls.find((c) => c.kind === 'register' && c.spec.name === name && c.spec[field] === value)
+}
+
+// ① 配置面板挂在**包详情页**（plugins.item），不是组件行详情页（plugins.row.config）——
+//    用户点插件列表里那一行进去看到的就是包页。
+const itemReg = findReg('plugins.item', 'id', 'dsh-qq-bot')
+if (!itemReg) {
+  console.error('FAIL: 没有在 plugins.item 上注册 dsh-qq-bot')
+  failed = true
+} else if (itemReg.componentType !== 'function') {
+  console.error('FAIL: plugins.item 没有给出渲染组件')
   failed = true
 }
-if (!registerCall || registerCall.spec.name !== 'plugins.item' || registerCall.spec.id !== 'dsh-qq-bot') {
-  console.error('FAIL: register 的 spec 不对')
+
+// ② 2026-10-28 新增：侧栏「调参」入口 + 同名主面板（跟「记忆 / 模型」并排）。
+//    两者 id 必须一致，否则点了侧栏按钮打不开页面。
+const listReg = findReg('sidebar.panellist', 'id', 'dsh-bot-settings')
+const mainReg = findReg('main', 'key', 'dsh-bot-settings')
+if (!listReg || listReg.componentType !== 'function') {
+  console.error('FAIL: 侧栏没有注册 dsh-bot-settings')
   failed = true
 }
-if (registerCall && registerCall.componentType !== 'function') {
-  console.error('FAIL: 没有给出渲染组件')
+if (!mainReg || mainReg.componentType !== 'function') {
+  console.error('FAIL: main 里没有 dsh-bot-settings 这个面板')
   failed = true
 }
 

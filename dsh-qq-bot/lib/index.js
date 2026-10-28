@@ -20,6 +20,7 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 
 import { buildSocketUrl, parseConfig } from './config.js'
+import { ALIVE_GROUPS, BOT_GROUPS } from './settings-schema.mjs'
 import {
   RateLimiter,
   cleanMarkdown,
@@ -208,6 +209,8 @@ function readBody(req, limitBytes = 256 * 1024) {
 }
 
 let CONFIG_FILE = ''
+/** alive（活人感插件）的配置文件；只用于调参面板读写，跟本插件的 config.json 同目录。 */
+let ALIVE_CONFIG_FILE = ''
 
 function readJsonFile(file) {
   try {
@@ -440,6 +443,9 @@ export function apply(ctx, rawConfig) {
   ensureDir(LOG_DIR)
   noteLogFile(join(LOG_DIR, 'qq-bot.log'))
   CONFIG_FILE = join(DATA_DIR, 'config.json')
+  /** alive 的配置文件。它没有对外接口，只能写它自己那份 json —— 和本插件共用一个 dataDir。 */
+  ALIVE_CONFIG_FILE = join(DATA_DIR, 'alive-config.json')
+
 
   /* 设置页保存过的值优先于 cordis.patch.yml 里的出厂默认 —— 这样用户在界面上
      点一下就能改，不用去动 profile 的 YAML（那文件改错会让整个宿主起不来）。 */
@@ -2994,16 +3000,28 @@ export function apply(ctx, rawConfig) {
       {
         name: 'qq_qzone',
         description: `QQ 空间，六件事：
-list = 列说说（不给 uin 就是他自己号的空间）、detail = 看某条说说的详情和评论、feeds = 好友动态、
+list = 列说说、detail = 看某条说说的详情和评论、feeds = 好友动态、
 post = 发一条说说、like = 给说说点赞、comment = 评论说说。
-想看他最近发了什么，直接 list 就行，不用问。删说说、改可见范围、封禁这几个是故意没开的。`,
+删说说、改可见范围、封禁这几个是故意没开的。
+
+**两个号别搞混（2026-10-28 修，之前这里写反过，导致她把 bot 号的说说当成自己的）：**
+- 不给 uin（默认）= **他的空间**（allowUsers 里那个人）。想看他最近发了什么，直接 list，不用问。
+- uin="me" = **我这号的空间** —— 就是挂载 bot 的那个号。我发说说用的也是这个号。
+- uin="<数字>" = 指定号。
+所以：post 发出去的说说挂在 **我这号** 名下，不是他的；list 默认看到的是 **他的**。
+别把 bot 号里的东西说成"他的"，也别把自己的说说说成"他发的"。
+post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径也不用管。`,
         parameters: {
           type: 'object',
           additionalProperties: false,
           required: ['action'],
           properties: {
             action: { type: 'string', enum: ['list', 'detail', 'feeds', 'post', 'like', 'comment'] },
-            uin: { type: 'string', description: '看谁的空间（list/detail/like/comment 用）。省略 = 他自己。' },
+            uin: {
+              type: 'string',
+              description:
+                '看谁的空间（list/detail/like/comment 用）。省略 = 他的（默认）；"me" = 我这号（挂载 bot 那个号）；也可以给具体数字号。',
+            },
             tid: { type: 'string', description: '说说 id（detail/like/comment 用）。' },
             content: { type: 'string', description: '发说说或评论的正文（post/comment 用）。' },
             images: { type: 'array', items: { type: 'string' }, description: '配图，本地路径或 URL（post 用，可省略）。' },
@@ -3023,24 +3041,36 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
         output: CALL_OUTPUT,
         async execute(args) {
           const act = String(args?.action ?? '').trim()
-          const uin = String(args?.uin ?? '').trim()
+          /**
+           * 把 uin 参数解析成 OneBot 的 target_uin。
+           *
+           * 2026-10-28 修：以前「不给 uin」= 不带 target_uin = OneBot 默认返回**挂载 bot
+           * 自己那个号**的空间，而工具描述写的是「他自己号的空间」—— 模型把「他」读成
+           * 用户，于是她拿 bot 号的说说当他的，反过来又把自己发的当他的。
+           * 现在：省略 = 他的空间；'me' = 我这号（不带 target_uin 让 OneBot 走自己）。
+           */
+          const selfUin = String(config.selfId ?? '').trim()
+          const rawUin = String(args?.uin ?? '').trim()
+          const wantMe = /^(me|self|myself|自己|我)$/i.test(rawUin)
+          const resolved = wantMe ? selfUin : rawUin === '' ? String(ownerUin()) : rawUin
+          /** @returns {Record<string, unknown>} 补上 target_uin（看自己那个号时故意不带） */
+          const withTarget = (params) => {
+            if (resolved !== '' && resolved !== selfUin) params.target_uin = Number(resolved)
+            return params
+          }
           const num = Number.isFinite(Number(args?.num))
             ? Math.max(1, Math.min(50, Number(args.num)))
             : 10
 
           if (act === 'list') {
-            const params = { pos: 0, num }
-            if (uin !== '') params.target_uin = Number(uin)
-            const r = await callOneBot('get_qzone_msg_list', params)
+            const r = await callOneBot('get_qzone_msg_list', withTarget({ pos: 0, num }))
             return r.ok ? { ok: true, note: '', json: jsonForModel(r.data) } : { ok: false, note: r.note, json: '' }
           }
 
           if (act === 'detail') {
             const tid = String(args?.tid ?? '').trim()
             if (tid === '') return { ok: false, note: 'detail 要给 tid。', json: '' }
-            const params = { tid, pos: 0, num }
-            if (uin !== '') params.target_uin = Number(uin)
-            const r = await callOneBot('get_qzone_msg_detail', params)
+            const r = await callOneBot('get_qzone_msg_detail', withTarget({ tid, pos: 0, num }))
             return r.ok ? { ok: true, note: '', json: jsonForModel(r.data) } : { ok: false, note: r.note, json: '' }
           }
 
@@ -3082,8 +3112,7 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
           if (act === 'like') {
             const tid = String(args?.tid ?? '').trim()
             if (tid === '') return { ok: false, note: 'like 要给 tid。', json: '' }
-            const params = { tid }
-            if (uin !== '') params.target_uin = Number(uin)
+            const params = withTarget({ tid })
             const r = await callOneBot('like_qzone', params)
             return r.ok ? { ok: true, note: '', json: '赞了' } : { ok: false, note: r.note, json: '' }
           }
@@ -3092,8 +3121,7 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
             const tid = String(args?.tid ?? '').trim()
             const content = String(args?.content ?? '').trim()
             if (tid === '' || content === '') return { ok: false, note: 'comment 要 tid 和 content。', json: '' }
-            const params = { tid, content }
-            if (uin !== '') params.target_uin = Number(uin)
+            const params = withTarget({ tid, content })
             const r = await callOneBot('comment_qzone', params)
             return r.ok ? { ok: true, note: '', json: '评论发出去了' } : { ok: false, note: r.note, json: '' }
           }
@@ -3281,68 +3309,249 @@ post = 发一条说说、like = 给说说点赞、comment = 评论说说。
     }
   }
 
-  const webServer = ctx.get?.('webServer')
   /**
-   * 设置页路由的注销句柄。宿主重载插件时（改 cordis.patch.yml、HMR）会先卸再装，
-   * 如果旧路由没注销，第二次注册就报 `duplicate prefix route`，设置页从此用不了。
-   * 2026-10-25 就是踩的这个坑 —— 日志里「设置页 API 注册失败」一直刷。
+   * 设置页 / 调参面板的 HTTP 路由。
+   *
+   * 2026-10-28 改：原来是在 apply 里 `ctx.get('webServer')` 直接取 —— 那个时刻宿主
+   * 往往还没挂上 webServer，于是每次启动都打一行「设置页 API 未注册」，插件页里
+   * 那张配置表单就是空的（所以他只能去开 PowerShell 窗口调参）。
+   * 现在改成 defer 注入：服务什么时候起来，什么时候挂路由；插件卸载时注销。
    */
-  let offRoute = null
-  if (webServer !== undefined && webServer !== null && typeof webServer.register === 'function') {
-    try {
-      const maybeOff = webServer.register({
-        kind: 'prefix',
-        path: API_PREFIX,
-        handler: async (req, res) => {
-          const route = (req.url ?? '').split('?')[0].slice(API_PREFIX.length) || '/'
-          try {
-            if (route === '/state' && req.method === 'GET') {
-              sendJson(res, 200, collectState())
-              return
-            }
-            if (route === '/save' && req.method === 'POST') {
-              const outcome = saveFromPanel(await readBody(req))
-              sendJson(res, outcome.ok ? 200 : 400, outcome)
-              return
-            }
-            if (route === '/accounts' && req.method === 'GET') {
-              sendJson(res, 200, await listAccounts())
-              return
-            }
-            if (route === '/reconnect' && req.method === 'POST') {
-              try {
-                client.close()
-              } catch {
-                // 没连上时 close 也可能抛，忽略
-              }
-              client.connect()
-              writeLog('INFO', '设置页触发了重新连接')
-              sendJson(res, 200, { ok: true, note: '已重新连接 OneBot' })
-              return
-            }
-            if (route === '/reset-session' && req.method === 'POST') {
-              sessions.clear()
-              saveMap()
-              writeLog('INFO', '设置页清空了会话映射')
-              sendJson(res, 200, { ok: true, note: '会话映射已清空，下一条消息会开新的一局' })
-              return
-            }
-            sendJson(res, 404, { ok: false, error: `未知接口 ${route}` })
-          } catch (err) {
-            sendJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) })
-          }
-        },
-      })
-      if (typeof maybeOff === 'function') offRoute = maybeOff
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      const hint = msg.includes('duplicate')
-        ? ' —— 宿主里还挂着上一次注册的路由，重启一次 DSH 就恢复（新版卸载时会自己注销，不会再复发）'
-        : ''
-      writeLog('WARN', `设置页 API 注册失败（不影响聊天）：${msg}${hint}`)
+  /** 两张「path → 字段定义」表：界面传回来的键必须在这两张表里才写。 */
+  const BOT_BY_PATH = new Map(BOT_GROUPS.flatMap((g) => g.fields.map((f) => [f.path, f])))
+  const ALIVE_BY_PATH = new Map(ALIVE_GROUPS.flatMap((g) => g.fields.map((f) => [f.path, f])))
+
+  /**
+   * 把界面送回来的值按字段类型洗干净。
+   *
+   * 数组字段（allowUsers / greetingWindows / quietHours / deepNightHours）在界面上是
+   * 逗号分隔的一行字，写回 json 必须是数组 —— 跟 PowerShell 那张表一个规矩。
+   * 数字按表里的 min/max/step/decimals 夹紧并取整，免得面板上敲个 1e9 把阈值干废。
+   */
+  function coerceField(field, value, current) {
+    if (Array.isArray(current) && !Array.isArray(value)) {
+      return String(value ?? '')
+        .split(/[,，;；\s]+/)
+        .map((s) => s.trim())
+        .filter((s) => s !== '')
     }
+    if (field.type === 'number') {
+      const n = Number(value)
+      if (!Number.isFinite(n)) return current ?? 0
+      const min = Number.isFinite(field.min) ? field.min : -Infinity
+      const max = Number.isFinite(field.max) ? field.max : Infinity
+      const step = Number.isFinite(field.step) && field.step > 0 ? field.step : 0
+      let v = Math.min(max, Math.max(min, n))
+      if (step > 0) v = Math.round(v / step) * step
+      const dec = Number.isInteger(field.decimals) ? field.decimals : 0
+      return Number(dec > 0 ? v.toFixed(dec) : Math.round(v))
+    }
+    if (field.type === 'bool') return value === true || value === 'true' || value === 'on' || value === 1
+    return String(value ?? '')
+  }
+
+  /** 面板读：两份配置的现值 + 各自的文件路径（面板上会显示，方便对账）。 */
+  function readPanelConfigs() {
+    const bot = readJsonFile(CONFIG_FILE)
+    const alive = readJsonFile(ALIVE_CONFIG_FILE)
+    return {
+      ok: true,
+      bot: bot !== null && typeof bot === 'object' ? bot : pickPersistable(config),
+      alive: alive !== null && typeof alive === 'object' ? alive : null,
+      files: { bot: CONFIG_FILE, alive: ALIVE_CONFIG_FILE },
+      // 调参表一起发下去：界面上那 71 个字段由数据生成，客户端不再抄一遍
+      schema: { bot: BOT_GROUPS, alive: ALIVE_GROUPS },
+      status: readAliveStatus(),
+      note: alive === null ? `读不到 ${ALIVE_CONFIG_FILE} —— 活人感那页先禁用` : '',
+    }
+  }
+
+  /**
+   * 只读状态：alive 那份 state.json 里的情绪、额度、静音 —— 原来 PowerShell 窗口
+   * 上会显示的那一堆。**只读**，面板不写它（那个文件是 alive 自己的运行时状态）。
+   */
+  function readAliveStatus() {
+    const state = readJsonFile(join(DATA_DIR, 'alive-state.json'))
+    if (state === null || typeof state !== 'object') return null
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
+    const mood = state.mood !== null && typeof state.mood === 'object' ? state.mood : {}
+    const control = state.control !== null && typeof state.control === 'object' ? state.control : {}
+    const quota = state.quota !== null && typeof state.quota === 'object' ? state.quota : {}
+    const stats = state.stats !== null && typeof state.stats === 'object' ? state.stats : {}
+    const focus = state.focus !== null && typeof state.focus === 'object' ? state.focus : {}
+    return {
+      updatedAt: typeof state.updatedAt === 'string' ? state.updatedAt : '',
+      control: {
+        enabled: control.enabled !== false,
+        hardOff: control.hardOff === true,
+        lastWasStop: control.lastWasStop === true,
+        mutedUntil: typeof control.mutedUntil === 'string' ? control.mutedUntil : null,
+        muteReason: typeof control.muteReason === 'string' ? control.muteReason : '',
+        dayQuotaSuspendedUntil: typeof control.dayQuotaSuspendedUntil === 'string' ? control.dayQuotaSuspendedUntil : null,
+      },
+      quota: {
+        hourCount: num(quota.hourCount),
+        dayCount: num(quota.dayCount),
+        consecutiveIgnored: num(quota.consecutiveIgnored),
+        consecutiveReplied: num(quota.consecutiveReplied),
+        lastProactiveAt: typeof quota.lastProactiveAt === 'string' ? quota.lastProactiveAt : '',
+      },
+      mood: {
+        missing: num(mood.missing),
+        jealousy: num(mood.jealousy),
+        warmth: num(mood.warmth),
+        worry: num(mood.worry),
+        boredom: num(mood.boredom),
+        lust: num(mood.lust),
+        annoyance: num(mood.annoyanceDebt),
+      },
+      stats: {
+        totalDelivered: num(stats.totalDelivered),
+        totalReplied: num(stats.totalReplied),
+        abandoned: num(stats.abandoned),
+      },
+      focus: {
+        lastHumanAt: typeof focus.lastHumanAt === 'string' ? focus.lastHumanAt : '',
+        lastQqAt: typeof focus.lastQqAt === 'string' ? focus.lastQqAt : '',
+      },
+    }
+  }
+
+  /** 面板写：只认表里有的键，其余原样保留（别把用户手写的键抹掉）。 */
+  function savePanelConfigs(body) {
+    const saved = []
+    const skipped = []
+    const src = body !== null && typeof body === 'object' ? body : {}
+    const touched = []
+
+    const applyTo = (file, table, incoming, label, required) => {
+      if (incoming === null || typeof incoming !== 'object') return true
+      const current = readJsonFile(file)
+      const hasFile = current !== null && typeof current === 'object'
+      if (!hasFile && required) {
+        skipped.push(`${label}：配置文件读不到，整页跳过`)
+        return false
+      }
+      const next = { ...(hasFile ? current : {}) }
+      for (const [k, v] of Object.entries(incoming)) {
+        const field = table.get(k)
+        if (field === undefined) {
+          skipped.push(`${label}.${k}（不在调参表里）`)
+          continue
+        }
+        next[field.path] = coerceField(field, v, next[field.path])
+        saved.push(`${label}.${field.path}`)
+      }
+      if (!writeJsonFile(file, next)) {
+        skipped.push(`${label}：写盘失败`)
+        return false
+      }
+      touched.push(required ? 'alive-config.json' : 'config.json')
+      return true
+    }
+
+    const okBot = applyTo(CONFIG_FILE, BOT_BY_PATH, src.bot, 'bot', false)
+    const okAlive = applyTo(ALIVE_CONFIG_FILE, ALIVE_BY_PATH, src.alive, 'alive', true)
+    const ok = okBot && okAlive
+    if (saved.length > 0) {
+      writeLog('INFO', `调参面板保存了 ${saved.length} 项 → ${touched.join(' + ') || '（没落盘）'}`)
+    }
+    return {
+      ok,
+      saved,
+      skipped,
+      note: ok
+        ? '已写入。能热应用的参数立刻生效；连接四项（baseUrl / accessToken / allowUsers / selfId）和 enabled 要重载插件。'
+        : '有一部分没写成，看 skipped。',
+    }
+  }
+
+  const installRoutes = (webServer) => {
+    const maybeOff = webServer.register({
+      kind: 'prefix',
+      path: API_PREFIX,
+      handler: async (req, res) => {
+        const route = (req.url ?? '').split('?')[0].slice(API_PREFIX.length) || '/'
+        try {
+          if (route === '/state' && req.method === 'GET') {
+            sendJson(res, 200, collectState())
+            return
+          }
+          if (route === '/save' && req.method === 'POST') {
+            const outcome = saveFromPanel(await readBody(req))
+            sendJson(res, outcome.ok ? 200 : 400, outcome)
+            return
+          }
+          if (route === '/panel' && req.method === 'GET') {
+            sendJson(res, 200, readPanelConfigs())
+            return
+          }
+          if (route === '/panel' && req.method === 'POST') {
+            const outcome = savePanelConfigs(await readBody(req))
+            sendJson(res, outcome.ok ? 200 : 400, outcome)
+            return
+          }
+          if (route === '/accounts' && req.method === 'GET') {
+            sendJson(res, 200, await listAccounts())
+            return
+          }
+          if (route === '/reconnect' && req.method === 'POST') {
+            try {
+              client.close()
+            } catch {
+              // 没连上时 close 也可能抛，忽略
+            }
+            client.connect()
+            writeLog('INFO', '设置页触发了重新连接')
+            sendJson(res, 200, { ok: true, note: '已重新连接 OneBot' })
+            return
+          }
+          if (route === '/reset-session' && req.method === 'POST') {
+            sessions.clear()
+            saveMap()
+            writeLog('INFO', '设置页清空了会话映射')
+            sendJson(res, 200, { ok: true, note: '会话映射已清空，下一条消息会开新的一局' })
+            return
+          }
+          sendJson(res, 404, { ok: false, error: `未知接口 ${route}` })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) })
+        }
+      },
+    })
+    return typeof maybeOff === 'function' ? maybeOff : null
+  }
+
+  let offRoute = null
+  if (typeof ctx.inject === 'function') {
+    // defer 注入：apply 时宿主常常还没有 webServer，等它起来再挂（记忆插件也是这个套路）
+    ctx.inject(['webServer'], (scope) => {
+      scope.effect(() => {
+        let off = null
+        try {
+          off = installRoutes(scope.webServer)
+        } catch (err) {
+          writeLog('WARN', `设置页 API 注册失败（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
+        }
+        return () => {
+          try {
+            off?.()
+          } catch {
+            // 注销失败不该影响卸载
+          }
+        }
+      })
+    })
   } else {
-    writeLog('INFO', '宿主没有 webServer 服务：设置页 API 未注册，配置请改 cordis.patch.yml')
+    // 老宿主 / 测试桩：没有 inject 就退回同步取，拿不到也不影响聊天
+    const webServer = ctx.get?.('webServer')
+    if (webServer !== undefined && webServer !== null && typeof webServer.register === 'function') {
+      try {
+        offRoute = installRoutes(webServer)
+      } catch (err) {
+        writeLog('WARN', `设置页 API 注册失败（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
   }
 
   /* ── 定时任务：放到这里启动 ──────────────────────────────────

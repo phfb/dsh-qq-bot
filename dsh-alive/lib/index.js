@@ -994,6 +994,11 @@ export function apply(ctx, rawConfig) {
     // 想他 / 涩涩 / 吃醋 → 戳一下最自然，而且不用说任何话
     if (missing >= 0.3 || lust >= 0.35 || jealousy >= 0.3) menu.push('poke')
 
+    // 想他 → 会去翻他的说说。
+    // 只读动作：翻了不一定要说话，但翻了才有的说 —— 所以门槛比自发开口低一点。
+    // 按 qzoneReadMissingPercent 配（100 = 关掉这个动作）。
+    if (missing * 100 >= config.qzoneReadMissingPercent) menu.push('qzoneRead')
+
     // 表情：跟原来一样，由 memeChancePercent 说了算
     if (config.memeChancePercent > 0) menu.push('meme')
 

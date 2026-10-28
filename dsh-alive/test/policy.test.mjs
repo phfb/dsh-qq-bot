@@ -1,7 +1,7 @@
 /**
  * dsh-alive 判定核心的单元测试。纯函数，不需要 DSH。
  *
- *   node --test "test/*.test.mjs"     （在 dsh-alive 目录下跑）
+ *   D:\Astrbot\Snowluma\node.exe --test "D:\DSHBot\plugin\dsh-alive\test\policy.test.mjs"
  */
 
 import { test } from 'node:test'
@@ -27,7 +27,6 @@ import {
   saidGoodbyeLast,
   scoreImpulse,
 } from '../lib/policy.mjs'
-import { LUST_ENABLED } from '../lib/mood.mjs'
 
 /* ── 抽取 ── */
 
@@ -442,12 +441,8 @@ test('buildFreeLoop: 涩涩没启用时不吃涩涩那一维', () => {
   })
   assert.equal(buildFreeLoop(st, { ...FREE_CFG, lustModeEnabled: false }, FREE_NOW), null)
   const on = buildFreeLoop(st, FREE_CFG, FREE_NOW)
-  if (LUST_ENABLED) {
-    assert.ok(on)
-    assert.equal(on.freeMood, 'lust')
-  } else {
-    assert.equal(on, null, 'LUST_ENABLED=false 时涩涩不该驱动自发念头')
-  }
+  assert.ok(on)
+  assert.equal(on.freeMood, 'lust')
 })
 
 test('scoreImpulse: 自发念头在情绪满的时候过得了默认阈值', () => {
@@ -497,6 +492,17 @@ test('renderImpulse: 发说说时把“所有人可见”的闸门带上', () =>
   assert.match(text, /所有人可见/)
   assert.match(text, /不许出现「他」/)
   assert.match(text, /学校、课程、住址/)
+})
+
+/* ── 2026-10-28：想他的时候可以真的去翻他的说说（只读） ── */
+
+test('renderImpulse: 菜单里有「翻他的说说」，说清那是他的空间、别顺手点赞', () => {
+  const text = renderImpulse(MENU_LOOP, { silentMin: 30, menu: ['speak', 'qzoneRead'] })
+  assert.match(text, /qq_qzone/)
+  assert.match(text, /不给就是他的空间/)
+  assert.match(text, /不要顺手 like \/ comment/)
+  assert.match(text, /uin="me"/, '得说清哪个号才是她自己')
+  assert.ok(!text.includes('所有人可见'), '翻说说不是发说说，不该带发布的闸门')
 })
 
 test('renderImpulse: 不给 qzone 就不啰嗦那条闸门', () => {

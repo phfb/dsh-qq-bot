@@ -143,6 +143,14 @@ export const DEFAULTS = Object.freeze({
   freeTalkMoodPercent: 45,
 
   /**
+   * 「想他」到多少百分比，才给她开「去翻他空间」这个动作。
+   *
+   * 翻说说是**只读**的：看了不一定要说话，但翻了才有的说。
+   * 所以门槛比自发开口（45）低一点。设 100 = 关掉这个动作。
+   */
+  qzoneReadMissingPercent: 35,
+
+  /**
    * 说完晚安之后，多久之内不再主动（分钟）。
    *
    * 她最后一句是道别、之后他没再说话 —— 那就是闭环了，别追着聊。
@@ -235,6 +243,7 @@ export function parseConfig(raw) {
     freeTalkSilenceMin: num(input.freeTalkSilenceMin, DEFAULTS.freeTalkSilenceMin, { min: 1, max: 600 }),
     freeTalkGapMin: num(input.freeTalkGapMin, DEFAULTS.freeTalkGapMin, { min: 1, max: 1440 }),
     freeTalkMoodPercent: num(input.freeTalkMoodPercent, DEFAULTS.freeTalkMoodPercent, { min: 0, max: 100 }),
+    qzoneReadMissingPercent: num(input.qzoneReadMissingPercent, DEFAULTS.qzoneReadMissingPercent, { min: 0, max: 100 }),
     goodnightSilenceMin: num(input.goodnightSilenceMin, DEFAULTS.goodnightSilenceMin, { min: 10, max: 1440 }),
     greetingEnabled: input.greetingEnabled !== false,
     greetingChancePercent: num(input.greetingChancePercent, DEFAULTS.greetingChancePercent, { min: 0, max: 100 }),

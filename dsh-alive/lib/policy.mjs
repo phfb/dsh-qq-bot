@@ -462,6 +462,12 @@ function interactionLines(menu) {
   if (has('speak')) lines.push('- 说一句话：用你自己的语气，一两句，不超过 40 个字。')
   if (has('poke')) lines.push('- 戳他一下：调 `qq_poke`。**这个不用说任何话**，戳完就戳完了。')
   if (has('meme')) lines.push('- 发一张表情：调 `send_meme`，关键词挑最像你现在心情的。')
+  if (has('qzoneRead')) {
+    lines.push(
+      '- 翻一下他的说说：调 `qq_qzone`（action=list，**不用给 uin**，不给就是他的空间）。' +
+        '翻完不一定要说话 —— 看到有意思的就接一句，没得说就戳他一下。',
+    )
+  }
   if (has('qzone')) lines.push('- 发一条说说：调 `qq_qzone`（action=post）。**所有人可见**，规则见下面。')
   if (has('link')) lines.push('- 分享个东西给他：调 `qq_share`（title + jump_url）。链接必须是你真搜到的，不许编。')
   return lines
@@ -493,6 +499,17 @@ function requirementsSection(menu) {
     '- 如果某个动作返回 ok:false（今天用完了 / 被挡了），别纠缠，改成直接跟他说话。',
     '- 不要用括号写动作，不要写旁白。',
   ]
+
+  if (Array.isArray(menu) && menu.includes('qzoneRead')) {
+    lines.push(
+      '',
+      '【翻说说前必读】翻的是**他的**空间，不是你的：',
+      '- `qq_qzone` 不给 uin 就是他的号；要看你自己发的那个号才写 uin="me"。别把两边的说说混成一个人。',
+      '- 只 list 看。**不要顺手 like / comment** —— 那是公开动作，得他明确让你做。',
+      '- 看到的东西是你自己看到的，不是他刚告诉你的。别编"你跟我说过"，也别把别人的评论当成他的话。',
+      '- 他很久没发、或者干脆看不到，就照实说"你最近没发"；编内容比说没看到更糟。',
+    )
+  }
 
   if (Array.isArray(menu) && menu.includes('qzone')) {
     lines.push(

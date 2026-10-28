@@ -390,6 +390,15 @@ window.__ModuleLoader__.load({
           h('span', null, '配置文件'),
           h('span', null, state.configFile)),
 
+        // 2026-10-28：按钮挪到字段上面 —— 跟「活人感」那页一致，33 个字段不用滚到底才能保存
+        h('div', { className: 'qqbot-actions' },
+          h('button', { className: 'qqbot-btn', 'data-primary': '1', disabled: busy, onClick: onSave }, busy ? '处理中…' : '保存'),
+          h('button', { className: 'qqbot-btn', disabled: busy, onClick: onReconnect }, '重新连接'),
+          h('button', { className: 'qqbot-btn', disabled: busy, onClick: onResetSession }, '清空会话（换新一局）'),
+          h('button', { className: 'qqbot-btn', disabled: busy, onClick: reload }, '刷新状态')),
+
+        msg !== null ? h('div', { className: 'qqbot-msg', 'data-kind': msg.kind }, msg.text) : null,
+
         GROUPS.map(function (group) {
           return h('div', { className: 'qqbot-group', key: group.title },
             h('div', { className: 'qqbot-group-title' }, group.title),
@@ -407,13 +416,6 @@ window.__ModuleLoader__.load({
             }))
         }),
 
-        h('div', { className: 'qqbot-actions' },
-          h('button', { className: 'qqbot-btn', 'data-primary': '1', disabled: busy, onClick: onSave }, busy ? '处理中…' : '保存'),
-          h('button', { className: 'qqbot-btn', disabled: busy, onClick: onReconnect }, '重新连接'),
-          h('button', { className: 'qqbot-btn', disabled: busy, onClick: onResetSession }, '清空会话（换新一局）'),
-          h('button', { className: 'qqbot-btn', disabled: busy, onClick: reload }, '刷新状态')),
-
-        msg !== null ? h('div', { className: 'qqbot-msg', 'data-kind': msg.kind }, msg.text) : null,
 
         state && state.logTail ? h('details', null,
           h('summary', { style: { cursor: 'pointer', color: 'var(--dsw-alias-label-secondary)' } }, '最近日志'),
@@ -442,6 +444,19 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       // 注册在**包详情页**（插件列表里点这一行进去就是它）。
       // 之前注册的是 plugins.row.config（组件行详情），用户第一眼看的是包页，所以找不到。
+      // 侧栏入口 + 主面板（2026-10-28）：跟「插件 / 自动化任务 / 记忆 / 模型」同一列，只占一格。
+      ctx.slots.inject('sidebar.panellist', function () {
+        return ctx.slots.register({
+          name: 'sidebar.panellist',
+          id: PANEL_ID,
+          order: 44,
+          label: function () { return 'DSH-BOT' },
+        }, PanelIcon)
+      })
+      ctx.slots.inject('main', function () {
+        return ctx.slots.register({ name: 'main', key: PANEL_ID }, BotSettingsPanel)
+      })
+
       ctx.slots.inject('plugins.item', function () {
         return ctx.slots.register({
           name: 'plugins.item',
@@ -455,6 +470,281 @@ window.__ModuleLoader__.load({
           return h(Boundary, null, h(QqBotPanel))
         })
       })
+    }
+
+    /* ── 调参面板：侧栏一个入口，两个标签（QQ 机器人 / 活人感） ──────────
+       原来这两个插件只能靠 DSH 外面的两个 PowerShell 窗口调参；这里把两份 json
+       接到 DSH 里来。QQ 那半边直接复用上面那张现成的表单（字段多、带状态和重连），
+       活人感那半边按宿主发下来的调参表（schema）现场生成 —— 39 个字段照表渲染，
+       以后加字段只改 lib/settings-schema.mjs 一处。 */
+
+    var PANEL_ID = 'dsh-bot-settings'
+
+    var fieldInputStyle = {
+      width: '100%',
+      boxSizing: 'border-box',
+      padding: '6px 9px',
+      borderRadius: 7,
+      border: '1px solid var(--dsw-alias-border-l1)',
+      background: 'var(--dsw-alias-bg-base)',
+      color: 'var(--dsw-alias-label-primary)',
+      font: 'inherit',
+      fontSize: 13,
+    }
+
+    function PanelIcon(props) {
+      var size = props && typeof props.size === 'number' ? props.size : 20
+      var active = Boolean(props && props.active)
+      return h('svg', {
+        width: size,
+        height: size,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        'aria-label': 'DSH-BOT',
+        role: 'img',
+        style: { display: 'block', opacity: active ? 1 : 0.72 },
+      },
+        h('path', { d: 'M4 7h9M18 7h2M4 12h4M13 12h7M4 17h11M20 17h0', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round' }),
+        h('circle', { cx: 15, cy: 7, r: 2, stroke: 'currentColor', strokeWidth: 1.6 }),
+        h('circle', { cx: 10, cy: 12, r: 2, stroke: 'currentColor', strokeWidth: 1.6 }),
+        h('circle', { cx: 18, cy: 17, r: 2, stroke: 'currentColor', strokeWidth: 1.6 }))
+    }
+
+    /** 一个字段：bool 是勾选框，其余是输入框（数字走 number，范围由 schema 夹）。 */
+    function SchemaField(props) {
+      var field = props.field
+      var value = props.value
+      var onChange = props.onChange
+      var text = Array.isArray(value) ? value.join(', ') : value === undefined || value === null ? '' : String(value)
+
+      if (field.type === 'bool') {
+        return h('label', {
+          style: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', fontSize: 13, color: 'var(--dsw-alias-label-primary)', cursor: 'pointer' },
+        },
+          h('input', {
+            type: 'checkbox',
+            checked: value === true,
+            onChange: function (e) { onChange(e.target.checked) },
+          }),
+          h('span', null, field.label))
+      }
+
+      return h('label', { style: { display: 'block', padding: '6px 0' } },
+        h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', marginBottom: 4 } }, field.label),
+        h('input', {
+          type: field.type === 'number' ? 'number' : 'text',
+          value: text,
+          min: field.min,
+          max: field.max,
+          step: field.step,
+          placeholder: field.placeholder || '',
+          onChange: function (e) { onChange(e.target.value) },
+          style: fieldInputStyle,
+        }))
+    }
+
+    /** 只读状态条：情绪七维 + 额度 + 静音。数据来自宿主读 alive-state.json。 */
+    function AliveStatus(props) {
+      var status = props.status
+      if (!status) return null
+      var pct = function (v) { return Math.round((Number(v) || 0) * 100) + '%' }
+      var shortTime = function (iso) {
+        if (!iso) return '—'
+        var d = new Date(iso)
+        if (isNaN(d.getTime())) return '—'
+        var two = function (n) { return String(n).padStart(2, '0') }
+        return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes())
+      }
+      var muted = status.control.mutedUntil && new Date(status.control.mutedUntil).getTime() > Date.now()
+      var chips = [
+        ['想他', status.mood.missing],
+        ['吃醋', status.mood.jealousy],
+        ['暖意', status.mood.warmth],
+        ['担心', status.mood.worry],
+        ['闲得慌', status.mood.boredom],
+        ['涩涩', status.mood.lust],
+        ['恼火', status.mood.annoyance],
+      ]
+      return h('section', {
+        style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 10, padding: '10px 14px', marginBottom: 12 },
+      },
+        h('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', marginBottom: 6 } }, '当前状态'),
+        h('div', { style: { display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.9 } },
+          h('span', null, muted ? ('静音中' + (status.control.muteReason ? '（' + status.control.muteReason + '）' : '')) : '没静音'),
+          h('span', null, '今天已开口 ' + status.quota.dayCount + ' 次 / 这一小时 ' + status.quota.hourCount + ' 次'),
+          h('span', null, '上次主动 ' + shortTime(status.quota.lastProactiveAt)),
+          h('span', null, '连续被忽略 ' + status.quota.consecutiveIgnored + ' 次'),
+          h('span', null, '累计投递 ' + status.stats.totalDelivered + ' · 他回 ' + status.stats.totalReplied),
+          h('span', null, '状态更新于 ' + shortTime(status.updatedAt))),
+        h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 } },
+          chips.map(function (pair) {
+            return h('span', {
+              key: pair[0],
+              style: {
+                fontSize: 12,
+                padding: '2px 8px',
+                borderRadius: 999,
+                border: '1px solid var(--dsw-alias-border-l1)',
+                color: 'var(--dsw-alias-label-secondary)',
+              },
+            }, pair[0] + ' ' + pct(pair[1]))
+          })))
+    }
+
+    /** 活人感（dsh-alive）那一页：表驱动，别在这里写死字段。 */
+    function AliveForm() {
+      var phaseRes = useState('loading')
+      var dataRes = useState(null)
+      var draftRes = useState({})
+      var msgRes = useState(null)
+      var busyRes = useState(false)
+      var phase = phaseRes[0]
+      var setPhase = phaseRes[1]
+      var data = dataRes[0]
+      var setData = dataRes[1]
+      var draft = draftRes[0]
+      var setDraft = draftRes[1]
+      var msg = msgRes[0]
+      var setMsg = msgRes[1]
+      var busy = busyRes[0]
+      var setBusy = busyRes[1]
+
+      var reload = useCallback(function () {
+        return request('GET', '/panel').then(function (res) {
+          if (!res || res.ok !== true) throw new Error((res && res.error) || '读不到配置')
+          setData(res)
+          setDraft({})
+          setPhase(res.alive === null ? 'missing' : 'ready')
+          if (res.alive === null && res.note) setMsg({ kind: 'warn', text: res.note })
+        }).catch(function (err) {
+          setPhase('error')
+          setMsg({ kind: 'err', text: '读配置失败：' + err.message })
+        })
+      }, [])
+
+      useEffect(function () { reload() }, [reload])
+
+      var save = function () {
+        var payload = {}
+        Object.keys(draft).forEach(function (k) { payload[k] = draft[k] })
+        if (Object.keys(payload).length === 0) {
+          setMsg({ kind: 'warn', text: '还没改任何一项' })
+          return
+        }
+        setBusy(true)
+        request('POST', '/panel', { alive: payload }).then(function (res) {
+          if (res && res.ok) {
+            setMsg({ kind: 'ok', text: '已保存 ' + (res.saved || []).length + ' 项。' + (res.note || '') })
+            reload()
+          } else {
+            setMsg({ kind: 'err', text: (res && res.note) || '保存失败' })
+          }
+        }).catch(function (err) {
+          setMsg({ kind: 'err', text: '保存失败：' + err.message })
+        }).then(function () { setBusy(false) })
+      }
+
+      if (phase === 'loading') return h('div', { style: { fontSize: 13, color: 'var(--dsw-alias-label-secondary)' } }, '读取中…')
+      if (phase === 'error') return h('div', { style: { fontSize: 13, color: 'var(--dsw-alias-state-error-primary)' } }, (msg && msg.text) || '读取失败')
+      if (phase === 'missing') {
+        return h('div', { style: { fontSize: 13, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.8 } },
+          (msg && msg.text) || '读不到 alive-config.json',
+          h('div', null, '路径：' + (data && data.files ? data.files.alive : '')))
+      }
+
+      var groups = data && data.schema && Array.isArray(data.schema.alive) ? data.schema.alive : []
+      var current = data.alive || {}
+      var dirty = Object.keys(draft).length
+
+      return h('div', null,
+        h(AliveStatus, { status: data.status }),
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 } },
+          h('button', {
+            type: 'button',
+            disabled: busy,
+            onClick: save,
+            style: { padding: '6px 14px', borderRadius: 7, border: '1px solid var(--dsw-alias-brand-primary)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)', fontWeight: 600, cursor: busy ? 'default' : 'pointer', fontSize: 13 },
+          }, busy ? '保存中…' : '保存'),
+          h('button', {
+            type: 'button',
+            disabled: busy || dirty === 0,
+            onClick: function () { setDraft({}); setMsg(null) },
+            style: { padding: '6px 14px', borderRadius: 7, border: '1px solid var(--dsw-alias-border-l1)', background: 'transparent', color: 'var(--dsw-alias-label-secondary)', cursor: 'pointer', fontSize: 13 },
+          }, '撤销改动'),
+          h('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, dirty > 0 ? '改了 ' + dirty + ' 项' : '没有改动'),
+          h('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, data.files ? data.files.alive : '')),
+        msg ? h('div', {
+          style: {
+            marginBottom: 10, fontSize: 12, lineHeight: 1.7,
+            color: msg.kind === 'err' ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-secondary)',
+          },
+        }, msg.text) : null,
+        groups.map(function (group) {
+          return h('section', {
+            key: group.title,
+            style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 10, padding: '10px 14px', marginBottom: 10 },
+          },
+            h('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', marginBottom: 2 } }, group.title),
+            group.hint ? h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.7, marginBottom: 6 } }, group.hint) : null,
+            h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '2px 14px' } },
+              group.fields.map(function (field) {
+                var shown = Object.prototype.hasOwnProperty.call(draft, field.path) ? draft[field.path] : current[field.path]
+                return h(SchemaField, {
+                  key: field.path,
+                  field: field,
+                  value: shown,
+                  onChange: function (v) {
+                    setDraft(function (prev) {
+                      var next = Object.assign({}, prev)
+                      next[field.path] = v
+                      return next
+                    })
+                  },
+                })
+              })))
+        }))
+    }
+
+    function BotSettingsPanel() {
+      var tabRes = useState('bot')
+      var tab = tabRes[0]
+      var setTab = tabRes[1]
+      var tabBtn = function (id, text) {
+        var on = tab === id
+        return h('button', {
+          key: id,
+          type: 'button',
+          onClick: function () { setTab(id) },
+          style: {
+            padding: '6px 14px',
+            borderRadius: 999,
+            fontSize: 13,
+            cursor: 'pointer',
+            border: '1px solid ' + (on ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l1)'),
+            background: on ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+            color: on ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+          },
+        }, text)
+      }
+      return h('div', {
+        style: {
+          // 2026-10-28：面板跟着主区域铺满高度并自己滚动。
+          // 不写 overflowY 的话这一页 33 个字段会被直接切掉（他的原话："你这没加滚动啊？？"）。
+          height: '100%',
+          overflowY: 'auto',
+          boxSizing: 'border-box',
+          padding: '18px 22px 40px',
+          color: 'var(--dsw-alias-label-primary)',
+        },
+      },
+      h('div', { style: { maxWidth: 900, margin: '0 auto' } },
+        h('h2', { style: { fontSize: 17, fontWeight: 600, margin: '0 0 6px' } }, 'DSH-BOT'),
+        h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.8, marginBottom: 12 } },
+          '这两个插件原来只能用 DSH 外面的两个 PowerShell 窗口调参。这里改完直接写回它们的 json；能热应用的参数立刻生效，连接四项和「启用」要重载插件。'),
+        h('div', { style: { display: 'flex', gap: 8, marginBottom: 14 } },
+          tabBtn('bot', 'QQ 机器人（dsh-qq-bot）'),
+          tabBtn('alive', '活人感（dsh-alive）')),
+        tab === 'bot' ? h(Boundary, null, h(QqBotPanel)) : h(Boundary, null, h(AliveForm))))
     }
 
     module.exports = {
