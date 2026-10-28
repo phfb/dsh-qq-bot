@@ -3,6 +3,39 @@
 这个仓库一次装两个插件：`dsh-qq-bot/`（QQ 私聊接入）和 `dsh-alive/`（活人感 / 主动开口）。
 版本号两边同步。
 
+## [1.0.2] - 2026-10-28
+
+### 修复：调参面板只渲染了三分之二（DSH-BOT）
+
+`tools/settings-ui.ps1` 有 9 组 34 项，DSH 里那张表只渲染了 **6 组 24 项** ——
+「每日说说（日记）7 项 / 说说互动 4 项 / 看门狗 3 项」三整组 14 项根本不存在，
+`安全` 组里的 `selfId`（带「读取」按钮那个）也漏了。
+
+- `lib/settings-schema.mjs`：BOT_GROUPS 6 组 24 项 → **11 组 48 项**：补齐那 14 项、
+  找回 `selfId`、新增「互动额度（每天最多几次）」4 项 +「其他」6 项，
+  收图组补 `imageTimeoutMs`；每项都带 hint
+- `lib/client.js`：删掉手抄的那张字段表，改成按宿主 `/state` 下发的 `schema.bot` 渲染
+  （和「活人感」那半边同一套机制）；顺手修掉整文件乱码（69 行 —— UTF-8 被当 GBK 读过一轮，
+  面板顶部的横幅、状态条、按钮文案全是「姝ｅ湪璇诲彇」这种）
+- `lib/index.js`：`pickPersistable()` 改**表驱动**（只认 `settings-schema.mjs` 里的 path），
+  另加 `PERSIST_EXTRA` 保住界面上故意不露的嵌套对象/长文案项。
+  上一版是手抄白名单，漏了 18 项 —— 表现是「面板上能改、点保存也返回成功，
+  但写进 `config.json` 那一步被静默丢掉，重启又变回老值」
+- 新增测试：`test/settings-panel.test.mjs`（9 条：字段 ↔ DEFAULTS ↔ 落盘三方对齐）、
+  `test/settings-render.test.cjs`（2 条：真的把面板渲染一遍再数组数，少一组就红）
+
+### 修复：自更新把仓库地址拼错（qq-bot 与记忆插件同一份模块）
+
+- `lib/self-update.mjs` 把 `repo` 直接拼进 `https://api.github.com/repos/${repo}/...`，
+  调用方一旦传整条网址（`repository.url` 那种）就变成 `repos/https://github.com/...` → 每次 404，
+  自更新等于死的。现在先过 `normalizeRepoSlug()`：`owner/repo`、`https://…`、`git+https://…`、
+  `git@github.com:…` 都认，认不出来返回空串（不再拿半截地址去拼 API）
+- 安装前**逐文件比字节**：一样的跳过，不一样的先备份到 `_update/backup/<时间戳>/` 再覆盖，
+  并写 `report.json` 记「替换了哪些 / 新增哪些 / 没动哪些」；`state.json` 成功一次就抹掉旧 `lastError`
+- `compareVersion`：`1.0` 与 `1.0.0` 现在算相等（以前缺位当 `undefined`，会误判方向）
+- mounts 收窄：只覆盖 `lib / package.json / cordis.patch.yml / README.md / LICENSE / tools`，
+  `test/`、`.gitignore` 不再跟着上游走 —— 免得盖掉本机手改过的同名文件
+
 ## [1.0.1] - 2026-10-28
 
 ### 新增：调参面板（DSH-BOT）

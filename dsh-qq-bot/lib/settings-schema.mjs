@@ -1,13 +1,16 @@
 /**
  * dsh-qq-bot / dsh-alive 两个插件的调参表 —— **从两个 PowerShell 设置窗里逐项抄出来的**。
  *
- * 为什么抄成数据表而不是再写一遍表单：71 个字段如果各写一份，两边迟早对不上，
+ * 为什么抄成数据表而不是再写一遍表单：96 个字段如果各写一份，两边迟早对不上，
  * 而且新加一项就得改三处。这里只有「键 / 标题 / 类型 / 范围」四件事，界面按表生成。
  *
  * 抄自：
- *   - tools/settings-ui.ps1     （qq-bot，33 项 / 9 组）
+ *   - tools/settings-ui.ps1     （qq-bot，34 项 / 9 组）—— 2026-10-28 全量对齐：
+ *     缺的「每日说说 / 说说互动 / 看门狗」14 项补回来了，selfId 也回到表里；
+ *     另外把 ps1 里从来没露过、但 config.js 支持的「互动额度 / 杂项」也收进来
+ *     （现在 48 项 / 11 组）。
  *   - tools/settings-alive.ps1  （alive，38 项 / 9 组，另加 2026-10-28 新加的
- *     qzoneReadMissingPercent —— 那个 PowerShell 窗口里还没有）
+ *     qzoneReadMissingPercent —— 那个 PowerShell 窗口里还没有；现在 48 项 / 10 组）。
  *
  * `path` 是写进 json 里的真实键名；`key` 是界面上的稳定 id（有的字段两者不同，
  * 比如 maxChars → maxCharsPerMessage）。**别拿 key 当 path 用。**
@@ -15,340 +18,243 @@
 
 /** qq-bot —— 写 <DATA_DIR>/config.json */
 export const BOT_GROUPS = [
-    {
-      "title": "连接（和 SnowLuma 对接）",
-      "hint": "SnowLuma 是 QQ 协议端：让 QQ 客户端登录小号，再在 SnowLuma 里挂载该号，这里填它的地址。",
-      "fields": [
-        {
-          "key": "baseUrl",
-          "label": "OneBot WS 地址",
-          "path": "baseUrl",
-          "type": "text",
-          "placeholder": "ws://127.0.0.1:3001/"
-        },
-        {
-          "key": "accessToken",
-          "label": "accessToken",
-          "path": "accessToken",
-          "type": "text",
-          "placeholder": "留空也能连（看服务端配没配）"
-        }
-      ]
-    },
-    {
-      "title": "安全（只服务你自己）",
-      "hint": "留空 = 谁都不服务。默认不响应任何人私聊。",
-      "fields": [
-        {
-          "key": "allowUsers",
-          "label": "你的 QQ 号（白名单）",
-          "path": "allowUsers",
-          "type": "text",
-          "placeholder": "多个用逗号分隔，例如 123456,789012"
-        }
-      ]
-    },
-    {
-      "title": "行为",
-      "hint": "",
-      "fields": [
-        {
-          "key": "enabled",
-          "label": "启用插件（关掉就不连、不转发）",
-          "path": "enabled",
-          "type": "bool"
-        },
-        {
-          "key": "dryRun",
-          "label": "只演练不发送（只写日志，不发到 QQ）",
-          "path": "dryRun",
-          "type": "bool"
-        },
-        {
-          "key": "contextLimitPercent",
-          "label": "上下文用到 % 换新局",
-          "path": "contextLimitPercent",
-          "type": "number",
-          "min": 0,
-          "max": 100,
-          "step": 5,
-          "decimals": 0
-        },
-        {
-          "key": "maxChars",
-          "label": "单条上限（字）",
-          "path": "maxCharsPerMessage",
-          "type": "number",
-          "min": 100,
-          "max": 5000,
-          "step": 100,
-          "decimals": 0
-        },
-        {
-          "key": "commandPrefix",
-          "label": "QQ 命令前缀",
-          "path": "commandPrefix",
-          "type": "text",
-          "placeholder": "/qq"
-        }
-      ]
-    },
-    {
-      "title": "表情包频率",
-      "hint": "这三个数决定她多久能发一张表情。嫌吵就把间隔调大、每小时张数调小。",
-      "fields": [
-        {
-          "key": "memeMin",
-          "label": "两张之间至少隔（分钟）",
-          "path": "memeMinIntervalMin",
-          "type": "number",
-          "min": 0,
-          "max": 600,
-          "step": 1,
-          "decimals": 0
-        },
-        {
-          "key": "memeMax",
-          "label": "每小时最多（张）",
-          "path": "memeMaxPerHour",
-          "type": "number",
-          "min": 1,
-          "max": 60,
-          "step": 1,
-          "decimals": 0
-        },
-        {
-          "key": "memeProb",
-          "label": "通过率（0~1）",
-          "path": "memeProbability",
-          "type": "number",
-          "min": 0,
-          "max": 1,
-          "step": 0.05,
-          "decimals": 2
-        }
-      ]
-    },
-    {
-      "title": "每日说说（日记）",
-      "hint": "到点让她自己写一篇日记发到 QQ 动态。默认关 —— 说说所有人可见，不该默认替你在社交圈发言。时间不做准点：会在「时间 + 窗口」里随机挑一分钟，免得一眼看出是机器人。",
-      "fields": [
-        {
-          "key": "diaryOn",
-          "label": "每天写一篇日记发说说",
-          "path": "qzoneDiaryEnabled",
-          "type": "bool"
-        },
-        {
-          "key": "diaryTime",
-          "label": "大概几点（HH:MM）",
-          "path": "qzoneDiaryTime",
-          "type": "text",
-          "placeholder": "18:00"
-        },
-        {
-          "key": "diaryWin",
-          "label": "时间窗口（分钟，在这段里随机）",
-          "path": "qzoneDiaryWindowMinutes",
-          "type": "number",
-          "min": 1,
-          "max": 720,
-          "step": 10,
-          "decimals": 0
-        },
-        {
-          "key": "diaryMinChars",
-          "label": "最少多少字",
-          "path": "qzoneDiaryMinChars",
-          "type": "number",
-          "min": 10,
-          "max": 2000,
-          "step": 10,
-          "decimals": 0
-        },
-        {
-          "key": "diaryMaxChars",
-          "label": "最多多少字",
-          "path": "qzoneDiaryMaxChars",
-          "type": "number",
-          "min": 100,
-          "max": 5000,
-          "step": 100,
-          "decimals": 0
-        },
-        {
-          "key": "diaryImgs",
-          "label": "配几张图（0~3）",
-          "path": "qzoneDiaryImageCount",
-          "type": "number",
-          "min": 0,
-          "max": 3,
-          "step": 1,
-          "decimals": 0
-        },
-        {
-          "key": "diaryImgW",
-          "label": "配图里「现画」的比例（%，剩下挑表情包）",
-          "path": "qzoneImageGenWeight",
-          "type": "number",
-          "min": 0,
-          "max": 100,
-          "step": 10,
-          "decimals": 0
-        }
-      ]
-    },
-    {
-      "title": "说说互动（只在想他/吃醋时）",
-      "hint": "情绪没到阈值的时候一次都不会去翻他空间 —— 那不是她，那是监控。到了阈值才按间隔看看自己说说下的新评论（只认他那个号）、以及他有没有发新说说。",
-      "fields": [
-        {
-          "key": "pollOn",
-          "label": "开启说说互动轮询",
-          "path": "qzonePollEnabled",
-          "type": "bool"
-        },
-        {
-          "key": "pollTrig",
-          "label": "想他/吃醋到多少 % 才开始",
-          "path": "qzonePollTriggerPercent",
-          "type": "number",
-          "min": 1,
-          "max": 100,
-          "step": 5,
-          "decimals": 0
-        },
-        {
-          "key": "pollGap",
-          "label": "轮询间隔（分钟）",
-          "path": "qzonePollIntervalMinutes",
-          "type": "number",
-          "min": 5,
-          "max": 720,
-          "step": 5,
-          "decimals": 0
-        },
-        {
-          "key": "pollDays",
-          "label": "只看最近几天",
-          "path": "qzonePollLookbackDays",
-          "type": "number",
-          "min": 1,
-          "max": 30,
-          "step": 1,
-          "decimals": 0
-        }
-      ]
-    },
-    {
-      "title": "她卡住时（看门狗）",
-      "hint": "她那一轮跑太久、一个字都没输出的时候，插件会先打断她、临时把思考关掉、再催一句「接着说」；还不行就开新局。太短会把「她在慢慢想」误杀（实测有一轮只是慢，整整 110 秒才回）。",
-      "fields": [
-        {
-          "key": "wdSecs",
-          "label": "多久没动静就算卡住（秒）",
-          "path": "watchdogSeconds",
-          "type": "number",
-          "min": 180,
-          "max": 900,
-          "step": 30,
-          "decimals": 0
-        },
-        {
-          "key": "wdStrikes",
-          "label": "一轮最多救几次（到了就开新局）",
-          "path": "watchdogMaxStrikes",
-          "type": "number",
-          "min": 0,
-          "max": 5,
-          "step": 1,
-          "decimals": 0
-        },
-        {
-          "key": "wdNoThink",
-          "label": "救的时候临时关掉思考（说完自动恢复）",
-          "path": "watchdogSwitchThinkingOff",
-          "type": "bool"
-        }
-      ]
-    },
-    {
-      "title": "收图（他发来的图片）",
-      "hint": "收到图片先下载到本地，再把绝对路径贴进消息让她自己 read_image 看。同目录的 INDEX.md 记着每张图什么时候来的、他说了什么、她怎么回的。",
-      "fields": [
-        {
-          "key": "imageEnabled",
-          "label": "收图并让她看（关掉就只剩「[图片]」占位）",
-          "path": "imageEnabled",
-          "type": "bool"
-        },
-        {
-          "key": "imageLimit",
-          "label": "缓存上限（MB，512 ~ 6144）",
-          "path": "imageCacheLimitMB",
-          "type": "number",
-          "min": 512,
-          "max": 6144,
-          "step": 128,
-          "decimals": 0
-        },
-        {
-          "key": "imagePurge",
-          "label": "一次清理掉（MB）",
-          "path": "imageCachePurgeMB",
-          "type": "number",
-          "min": 50,
-          "max": 6144,
-          "step": 50,
-          "decimals": 0
-        },
-        {
-          "key": "imageMaxMB",
-          "label": "单张上限（MB）",
-          "path": "imageMaxMB",
-          "type": "number",
-          "min": 1,
-          "max": 200,
-          "step": 1,
-          "decimals": 0
-        },
-        {
-          "key": "imageDir",
-          "label": "图片目录",
-          "path": "imageDir",
-          "type": "text",
-          "placeholder": "默认 <数据目录>\\images"
-        }
-      ]
-    },
-    {
-      "title": "路径",
-      "hint": "留空就用默认值。",
-      "fields": [
-        {
-          "key": "dataDir",
-          "label": "数据目录",
-          "path": "dataDir",
-          "type": "text",
-          "placeholder": "默认 ~/.dsh-qq-bot"
-        },
-        {
-          "key": "workspacePath",
-          "label": "QQ 会话工作目录",
-          "path": "workspacePath",
-          "type": "text",
-          "placeholder": "留空 = DSH 默认"
-        },
-        {
-          "key": "memesDir",
-          "label": "表情包目录",
-          "path": "memesDir",
-          "type": "text",
-          "placeholder": "默认 <数据目录>/memes"
-        }
-      ]
-    }
-  ];
+  {
+    title: '连接（和 SnowLuma 对接）',
+    hint: 'SnowLuma 是 QQ 协议端：让 QQ 客户端登录小号，再在 SnowLuma 里挂载该号，这里填它的 WS 地址。',
+    fields: [
+      {
+        key: 'baseUrl',
+        path: 'baseUrl',
+        label: 'OneBot WS 地址',
+        type: 'text',
+        placeholder: 'ws://127.0.0.1:3001/',
+        hint: 'SnowLuma 里 wsServers 的地址',
+      },
+      {
+        key: 'accessToken',
+        path: 'accessToken',
+        label: 'accessToken',
+        type: 'password',
+        placeholder: '留空也能连（看服务端配没配）',
+        hint: '和 SnowLuma 该账号的 token 一致；留空也能连（看服务端配没配）',
+      },
+    ],
+  },
+  {
+    title: '安全（只服务你自己）',
+    hint: '留空 = 谁都不服务。插件默认不响应任何人的私聊。',
+    fields: [
+      {
+        key: 'allowUsers',
+        path: 'allowUsers',
+        label: '你的 QQ 号（白名单）',
+        type: 'list',
+        placeholder: '多个用逗号分隔，例如 123456,789012',
+        hint: '多个用逗号分隔，例如 123456,789012',
+      },
+      {
+        key: 'selfId',
+        path: 'selfId',
+        label: 'BOT 的 QQ 号',
+        type: 'account',
+        hint: '点「读取」从 SnowLuma 直接读正在登录的号，选中即可。多开 QQ 时靠它确认挂的是哪个号',
+      },
+    ],
+  },
+  {
+    title: '行为',
+    hint: '',
+    fields: [
+      { key: 'enabled', path: 'enabled', label: '启用插件（关掉就不连、不转发）', type: 'bool', hint: '关掉后不连接、不转发' },
+      { key: 'dryRun', path: 'dryRun', label: '只演练不发送（只写日志）', type: 'bool', hint: '开着只写日志，消息不会真的发到 QQ' },
+      {
+        key: 'contextLimitPercent',
+        path: 'contextLimitPercent',
+        label: '上下文用到 % 换新局',
+        type: 'number',
+        min: 0,
+        max: 100,
+        step: 5,
+        decimals: 0,
+        hint: '0 = 关掉这个功能。换局点 = 这个百分比 × 下面的窗口大小',
+      },
+      {
+        key: 'contextWindow',
+        path: 'contextWindow',
+        label: '模型上下文窗口（token）',
+        type: 'number',
+        min: 8000,
+        max: 2000000,
+        step: 1000,
+        decimals: 0,
+        hint: 'deepseek-flash / deepseek-v4-pro 的真实窗口都是 1,000,000。填错会让换局提前或滞后十几倍',
+      },
+      {
+        key: 'stripTrailingPeriod',
+        path: 'stripTrailingPeriod',
+        label: '结尾不留句号',
+        type: 'bool',
+        hint: '非必要场景不用句号收尾。开着时每条发出去前抹掉结尾的「。」，问号、感叹号、省略号一律不动',
+      },
+      {
+        key: 'mergeOnWork',
+        path: 'mergeOnWork',
+        label: '正事整条发',
+        type: 'bool',
+        hint: '聊正事、干活时不分条，一条发完。两条通道：她在回复开头加 [[整条]]；或者内容里有代码块、三行以上列表、表格、命令行清单',
+      },
+      {
+        key: 'maxChars',
+        path: 'maxCharsPerMessage',
+        label: '单条上限（字）',
+        type: 'number',
+        min: 100,
+        max: 5000,
+        step: 100,
+        decimals: 0,
+      },
+      { key: 'commandPrefix', path: 'commandPrefix', label: 'QQ 命令前缀', type: 'text', placeholder: '/qq' },
+    ],
+  },
+  {
+    title: '表情包频率',
+    hint: '这三个数决定她多久能发一张表情。嫌吵就把间隔调大、每小时张数调小。',
+    fields: [
+      { key: 'memeMin', path: 'memeMinIntervalMin', label: '两张之间至少隔（分钟）', type: 'number', min: 0, max: 600, step: 1, decimals: 0 },
+      { key: 'memeMax', path: 'memeMaxPerHour', label: '每小时最多（张）', type: 'number', min: 1, max: 60, step: 1, decimals: 0 },
+      {
+        key: 'memeProb',
+        path: 'memeProbability',
+        label: '通过率（0~1）',
+        type: 'number',
+        min: 0,
+        max: 1,
+        step: 0.05,
+        decimals: 2,
+        hint: '过了前两道闸门后再掷一次骰子',
+      },
+    ],
+  },
+  {
+    title: '每日说说（日记）',
+    hint: '到点让她自己写一篇日记发到 QQ 动态。默认关 —— 说说所有人可见，不该默认替你在社交圈发言。时间不做准点：会在「时间 + 窗口」里随机挑一分钟，免得一眼看出是机器人。',
+    fields: [
+      { key: 'diaryOn', path: 'qzoneDiaryEnabled', label: '每天写一篇日记发说说', type: 'bool', default: false },
+      { key: 'diaryTime', path: 'qzoneDiaryTime', label: '大概几点（HH:MM）', type: 'text', placeholder: '18:00' },
+      { key: 'diaryWin', path: 'qzoneDiaryWindowMinutes', label: '时间窗口（分钟，在这段里随机）', type: 'number', min: 1, max: 720, step: 10, decimals: 0 },
+      { key: 'diaryMinChars', path: 'qzoneDiaryMinChars', label: '最少多少字', type: 'number', min: 10, max: 2000, step: 10, decimals: 0 },
+      { key: 'diaryMaxChars', path: 'qzoneDiaryMaxChars', label: '最多多少字', type: 'number', min: 100, max: 5000, step: 100, decimals: 0 },
+      { key: 'diaryImgs', path: 'qzoneDiaryImageCount', label: '配几张图（0~3）', type: 'number', min: 0, max: 3, step: 1, decimals: 0 },
+      {
+        key: 'diaryImgW',
+        path: 'qzoneImageGenWeight',
+        label: '配图里「现画」的比例（%，剩下挑表情包）',
+        type: 'number',
+        min: 0,
+        max: 100,
+        step: 10,
+        decimals: 0,
+      },
+    ],
+  },
+  {
+    title: '说说互动（只在想他/吃醋时）',
+    hint: '情绪没到阈值的时候一次都不会去翻他空间 —— 那不是她，那是监控。到了阈值才按间隔看看自己说说下的新评论（只认他那个号）、以及他有没有发新说说。',
+    fields: [
+      { key: 'pollOn', path: 'qzonePollEnabled', label: '开启说说互动轮询', type: 'bool', default: false },
+      {
+        key: 'pollTrig',
+        path: 'qzonePollTriggerPercent',
+        label: '想他/吃醋到多少 % 才开始',
+        type: 'number',
+        min: 1,
+        max: 100,
+        step: 5,
+        decimals: 0,
+      },
+      { key: 'pollGap', path: 'qzonePollIntervalMinutes', label: '轮询间隔（分钟）', type: 'number', min: 5, max: 720, step: 5, decimals: 0 },
+      { key: 'pollDays', path: 'qzonePollLookbackDays', label: '只看最近几天', type: 'number', min: 1, max: 30, step: 1, decimals: 0 },
+    ],
+  },
+  {
+    title: '她卡住时（看门狗）',
+    hint: '她那一轮跑太久、一个字都没输出的时候，插件会先打断她、临时把思考关掉、再催一句「接着说」；还不行就开新局。太短会把「她在慢慢想」误杀（实测有一轮只是慢，整整 110 秒才回）。',
+    fields: [
+      { key: 'wdSecs', path: 'watchdogSeconds', label: '多久没动静就算卡住（秒）', type: 'number', min: 180, max: 900, step: 30, decimals: 0 },
+      { key: 'wdStrikes', path: 'watchdogMaxStrikes', label: '一轮最多救几次（到了就开新局）', type: 'number', min: 0, max: 5, step: 1, decimals: 0 },
+      {
+        key: 'wdNoThink',
+        path: 'watchdogSwitchThinkingOff',
+        label: '救的时候临时关掉思考（说完自动恢复）',
+        type: 'bool',
+        default: true,
+      },
+    ],
+  },
+  {
+    title: '互动额度（每天最多几次）',
+    hint: '她主动去戳他 / 给他空间点互动 / 分享链接的天花板。全填 0 = 这类主动全关。',
+    fields: [
+      { key: 'pokeMax', path: 'interactPokeMaxPerDay', label: '每天最多拍一拍几次', type: 'number', min: 0, max: 100, step: 1, decimals: 0 },
+      { key: 'qzoneMax', path: 'interactQzoneMaxPerDay', label: '每天最多在空间互动几次', type: 'number', min: 0, max: 20, step: 1, decimals: 0 },
+      { key: 'linkMax', path: 'interactLinkMaxPerDay', label: '每天最多分享几个链接', type: 'number', min: 0, max: 20, step: 1, decimals: 0 },
+      {
+        key: 'ugcRight',
+        path: 'interactQzoneUgcRight',
+        label: '空间互动的可见范围',
+        type: 'number',
+        min: 1,
+        max: 128,
+        step: 1,
+        decimals: 0,
+        hint: '1 = 所有人可见，4 = 仅好友，64 = 仅自己',
+      },
+    ],
+  },
+  {
+    title: '收图（他发来的图片）',
+    hint: '收到图片先下载到本地，再把绝对路径贴进消息让她自己 read_image 看。同目录的 INDEX.md 记着每张图什么时候来的、他说了什么、她怎么回的。',
+    fields: [
+      { key: 'imageEnabled', path: 'imageEnabled', label: '收图并让她看（关掉就只剩「[图片]」占位）', type: 'bool', default: true },
+      {
+        key: 'imageLimit',
+        path: 'imageCacheLimitMB',
+        label: '缓存上限（MB，512 ~ 6144）',
+        type: 'number',
+        min: 512,
+        max: 6144,
+        step: 128,
+        decimals: 0,
+        hint: '超了从最老的开始删，一次删下面那个数，不会因为超一点点就清空图库',
+      },
+      { key: 'imagePurge', path: 'imageCachePurgeMB', label: '一次清理掉（MB）', type: 'number', min: 50, max: 6144, step: 50, decimals: 0, hint: '到了上限就一次性删掉这么多，默认 300' },
+      { key: 'imageMaxMB', path: 'imageMaxMB', label: '单张上限（MB）', type: 'number', min: 1, max: 200, step: 1, decimals: 0, hint: '超过就不存，防止一张几十兆的长图把盘吃满' },
+      { key: 'imageDir', path: 'imageDir', label: '图片目录', type: 'text', placeholder: '默认 <数据目录>\\images' },
+      { key: 'imageTimeoutMs', path: 'imageTimeoutMs', label: '单张下载超时（毫秒）', type: 'number', min: 1000, max: 120000, step: 1000, decimals: 0 },
+    ],
+  },
+  {
+    title: '路径',
+    hint: '留空就用默认值。数据目录里放会话映射、控制开关、日志和表情图库。',
+    fields: [
+      { key: 'dataDir', path: 'dataDir', label: '数据目录', type: 'text', placeholder: '默认 ~/.dsh-qq-bot' },
+      { key: 'workspacePath', path: 'workspacePath', label: 'QQ 会话工作目录', type: 'text', placeholder: '留空 = DSH 默认' },
+      { key: 'memesDir', path: 'memesDir', label: '表情包目录', type: 'text', placeholder: '默认 <数据目录>/memes' },
+    ],
+  },
+  {
+    title: '其他',
+    hint: '平时不用动。误触发、重复回复、日志太肥的时候才来调。',
+    fields: [
+      { key: 'dedupeSeconds', path: 'dedupeSeconds', label: '同一条消息去重窗口（秒）', type: 'number', min: 1, max: 60, step: 1, decimals: 0 },
+      { key: 'farewellGapMin', path: 'farewellGapMin', label: '说完再见后多久不再追（分钟）', type: 'number', min: 10, max: 1440, step: 10, decimals: 0 },
+      { key: 'taskWatchSec', path: 'taskDeliveryWatchSeconds', label: '子任务投递等多久算超时（秒）', type: 'number', min: 10, max: 600, step: 10, decimals: 0 },
+      { key: 'zeroTextTurns', path: 'zeroTextRolloverTurns', label: '连续几轮正文为空就换新局', type: 'number', min: 0, max: 10, step: 1, decimals: 0 },
+      { key: 'zeroTextNudge', path: 'zeroTextNudge', label: '正文为空时催她一句', type: 'bool', default: true },
+      { key: 'logRotateMB', path: 'logRotateMB', label: '日志滚到多大换新文件（MB）', type: 'number', min: 0, max: 512, step: 1, decimals: 0 },
+    ],
+  }
+];
 
 /** alive（活人感 / 主动开口）—— 写 <DATA_DIR>/alive-config.json */
 export const ALIVE_GROUPS = [

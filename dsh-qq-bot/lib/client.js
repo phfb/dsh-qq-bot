@@ -78,69 +78,12 @@ window.__ModuleLoader__.load({
       return next
     }
 
-    /* ── 字段表：顺序即渲染顺序 ───────────────────────────────────────── */
-
-    var GROUPS = [
-      {
-        title: '连接（和 SnowLuma 对接）',
-        hint: 'SnowLuma 是 QQ 协议端：先让 QQ 客户端登录小号，再在 SnowLuma 里挂载该号，这里填它的 WS 地址。',
-        items: [
-          { key: 'baseUrl', label: 'OneBot WS 地址', type: 'text', placeholder: 'ws://127.0.0.1:3001/', hint: 'SnowLuma 里 wsServers 的地址' },
-          { key: 'accessToken', label: 'accessToken', type: 'password', hint: '和 SnowLuma 该账号的 token 一致；留空也能连（看服务端配没配）' },
-        ],
-      },
-      {
-        title: '安全（只服务你自己）',
-        hint: '留空 = 谁都不服务。插件默认不响应任何人的私聊。',
-        items: [
-          { key: 'allowUsers', label: '你的 QQ 号（白名单）', type: 'list', hint: '多个用逗号分隔，例如 123456,789012' },
-          { key: 'selfId', label: 'BOT 的 QQ 号', type: 'account', hint: '点「读取」从 SnowLuma 直接读正在登录的号，选中即可。多开 QQ 时靠它确认挂的是哪个号' },
-        ],
-      },
-      {
-        title: '行为',
-        items: [
-          { key: 'enabled', label: '启用插件', type: 'bool', hint: '关掉后不连接、不转发' },
-          { key: 'dryRun', label: '只演练不发送', type: 'bool', hint: '开着只写日志，消息不会真的发到 QQ' },
-          { key: 'contextLimitPercent', label: '上下文用到 % 就换新一局', type: 'number', min: 0, max: 100, hint: '0 = 关掉这个功能。换局点 = 这个百分比 × 下面的窗口大小' },
-          { key: 'contextWindow', label: '模型上下文窗口（token）', type: 'number', min: 8000, max: 2000000, step: 1000, hint: 'deepseek-flash / deepseek-v4-pro 的真实窗口都是 1,000,000。填错会让换局提前或滞后十几倍' },
-          { key: 'segment.shortMax', label: '短句阈值（字）', type: 'number', min: 1, hint: '不超过这个字数 = 整条发（默认 25）。超过就按实际语意停顿分条，多长都分' },
-          { key: 'stripTrailingPeriod', label: '结尾不留句号', type: 'bool', hint: '非必要场景不用句号收尾。开着时每条发出去前抹掉结尾的「。」，问号、感叹号、省略号一律不动' },
-          { key: 'mergeOnWork', label: '正事整条发', type: 'bool', hint: '聊正事、干活时不分条，一条发完。两条通道：她在回复开头加 [[整条]]；或者内容里有代码块、三行以上列表、表格、命令行清单——这类东西切开发出去会碎' },
-          { key: 'maxCharsPerMessage', label: '单条上限（字）', type: 'number', min: 100 },
-          { key: 'commandPrefix', label: 'QQ 里的命令前缀', type: 'text', placeholder: '/qq' },
-        ],
-      },
-      {
-        title: '表情包频率',
-        hint: '这三个数决定她多久能发一张表情。嫌吵就把间隔调大、每小时张数调小。',
-        items: [
-          { key: 'memeMinIntervalMin', label: '两张之间至少隔（分钟）', type: 'number', min: 0, max: 600 },
-          { key: 'memeMaxPerHour', label: '每小时最多（张）', type: 'number', min: 1, max: 60 },
-          { key: 'memeProbability', label: '通过率（0 ~ 1）', type: 'number', min: 0, max: 1, step: 0.05, hint: '过了前两道闸门后再掷一次骰子' },
-        ],
-      },
-      {
-        title: '收图（他发来的图片）',
-        hint: '收到图片先下载到本地，再把绝对路径贴进消息让她自己去 read_image 看；同目录的 INDEX.md 记着每张图什么时候来的、他说了什么、她怎么回的。',
-        items: [
-          { key: 'imageEnabled', label: '收图并让她看', type: 'bool', hint: '关掉就退回「[图片]」占位 —— 模型一个字都看不到图' },
-          { key: 'imageCacheLimitMB', label: '图片缓存上限（MB）', type: 'number', min: 512, max: 6144, step: 128, hint: '512 ~ 6144（6 GB）。超了从最老的开始删，一次删下面那个数，不会因为超一点点就清空图库' },
-          { key: 'imageCachePurgeMB', label: '一次清理掉（MB）', type: 'number', min: 50, max: 6144, step: 50, hint: '到了上限就一次性删掉这么多，默认 300' },
-          { key: 'imageMaxMB', label: '单张上限（MB）', type: 'number', min: 1, max: 200, hint: '超过就不存，防止一张几十兆的长图把盘吃满' },
-          { key: 'imageDir', label: '图片目录', type: 'text', placeholder: '<数据目录>/images' },
-        ],
-      },
-      {
-        title: '路径',
-        hint: '留空就用默认值。数据目录里放会话映射、控制开关、日志和表情图库。',
-        items: [
-          { key: 'dataDir', label: '数据目录', type: 'text', placeholder: '~/.dsh-qq-bot' },
-          { key: 'workspacePath', label: 'QQ 会话工作目录', type: 'text', placeholder: '（留空 = DSH 默认）' },
-          { key: 'memesDir', label: '表情包目录', type: 'text', placeholder: '<数据目录>/memes' },
-        ],
-      },
-    ]
+    /* ── 字段表 ─────────────────────────────────────────────────────────
+       2026-10-28：这一块原来是手抄的硬编码数组（只抄了 6 组 24 项，
+       每日说说 / 说说互动 / 看门狗 整三组都漏了）。现在**不再抄**：
+       字段全部来自宿主随 /state 一起发下来的调参表（lib/settings-schema.mjs），
+       加字段只改那一处，面板自动长出来。
+       面板必须自洽的两条：schema 里的 path 就是 json 键；界面按 type 选控件。 */
 
     /* ── 样式 ─────────────────────────────────────────────────────────── */
 
@@ -188,7 +131,9 @@ window.__ModuleLoader__.load({
       var item = props.item
       var form = props.form
       var onChange = props.onChange
-      var raw = getPath(form, item.key)
+      // 调参表里叫 path（就是 json 键），老的硬编码表叫 key —— 两个都认
+      var fieldKey = item.path && item.path !== '' ? item.path : String(item['key'] || '')
+      var raw = getPath(form, fieldKey)
 
       var common = {
         className: 'qqbot-input',
@@ -196,11 +141,11 @@ window.__ModuleLoader__.load({
           var value = event.target.value
           if (item.type === 'number') {
             var n = Number(value)
-            onChange(item.key, value === '' ? '' : Number.isFinite(n) ? n : raw)
+            onChange(fieldKey, value === '' ? '' : Number.isFinite(n) ? n : raw)
           } else if (item.type === 'list') {
-            onChange(item.key, value.split(/[,，\s]+/).filter(function (s) { return s !== '' }))
+            onChange(fieldKey, value.split(/[,，\s]+/).filter(function (s) { return s !== '' }))
           } else {
-            onChange(item.key, value)
+            onChange(fieldKey, value)
           }
         },
       }
@@ -211,7 +156,7 @@ window.__ModuleLoader__.load({
           type: 'checkbox',
           className: 'qqbot-check',
           checked: raw === true,
-          onChange: function (event) { onChange(item.key, event.target.checked) },
+          onChange: function (event) { onChange(fieldKey, event.target.checked) },
         })
       } else if (item.type === 'account') {
         // 读出来选，不要让人手打：候选来自 OneBot 的 get_login_info
@@ -226,7 +171,7 @@ window.__ModuleLoader__.load({
           h('select', {
             className: 'qqbot-input',
             value: raw === undefined || raw === null ? '' : String(raw),
-            onChange: function (event) { onChange(item.key, event.target.value) },
+            onChange: function (event) { onChange(fieldKey, event.target.value) },
           }, options),
           h('button', {
             className: 'qqbot-btn',
@@ -238,7 +183,7 @@ window.__ModuleLoader__.load({
         control = h('input', Object.assign({}, common, {
           type: 'text',
           value: Array.isArray(raw) ? raw.join(', ') : '',
-          placeholder: '填你自己的 QQ 号',
+          placeholder: item.placeholder || '填你自己的 QQ 号',
         }))
       } else {
         control = h('input', Object.assign({}, common, {
@@ -367,6 +312,8 @@ window.__ModuleLoader__.load({
 
       var runtime = state && state.runtime ? state.runtime : {}
       var sessions = Array.isArray(runtime.sessions) ? runtime.sessions : []
+      // 字段表来自宿主（lib/settings-schema.mjs），这里不再手抄一份
+      var schemaGroups = state && state.schema && Array.isArray(state.schema.bot) ? state.schema.bot : []
 
       return h('div', { className: 'qqbot-wrap' },
         h('div', { className: 'qqbot-banner' },
@@ -398,13 +345,13 @@ window.__ModuleLoader__.load({
 
         msg !== null ? h('div', { className: 'qqbot-msg', 'data-kind': msg.kind }, msg.text) : null,
 
-        GROUPS.map(function (group) {
+        schemaGroups.map(function (group) {
           return h('div', { className: 'qqbot-group', key: group.title },
             h('div', { className: 'qqbot-group-title' }, group.title),
-            group.hint !== undefined ? h('div', { className: 'qqbot-group-hint' }, group.hint) : null,
-            group.items.map(function (item) {
+            group.hint !== undefined && group.hint !== '' ? h('div', { className: 'qqbot-group-hint' }, group.hint) : null,
+            (Array.isArray(group.fields) ? group.fields : []).map(function (item) {
               return h(Field, {
-                key: item.key,
+                key: item.path || item.key,
                 item: item,
                 form: form,
                 onChange: onChange,
@@ -473,9 +420,10 @@ window.__ModuleLoader__.load({
 
     /* ── 调参面板：侧栏一个入口，两个标签（QQ 机器人 / 活人感） ──────────
        原来这两个插件只能靠 DSH 外面的两个 PowerShell 窗口调参；这里把两份 json
-       接到 DSH 里来。QQ 那半边直接复用上面那张现成的表单（字段多、带状态和重连），
-       活人感那半边按宿主发下来的调参表（schema）现场生成 —— 39 个字段照表渲染，
-       以后加字段只改 lib/settings-schema.mjs 一处。 */
+       接到 DSH 里来。**两半边都按宿主发下来的调参表（schema）现场生成**：
+       bot 48 项 / 11 组、alive 48 项 / 10 组，字段全在 lib/settings-schema.mjs，
+       以后加字段只改那一处（2026-10-28 修：QQ 那半边原来是手抄的硬编码表，
+       只抄了 24 项，每日说说 / 说说互动 / 看门狗 整三组都漏了）。 */
 
     var PANEL_ID = 'dsh-bot-settings'
 

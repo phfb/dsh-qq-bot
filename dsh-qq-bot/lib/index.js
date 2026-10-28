@@ -233,42 +233,71 @@ function writeJsonFile(file, value) {
   }
 }
 
-/** 从配置对象里挑出「设置页能改、且允许落盘」的字段（不落敏感派生值）。 */function pickPersistable(config) {
-  return {
-    baseUrl: config.baseUrl,
-    accessToken: config.accessToken,
-    allowUsers: config.allowUsers,
-    selfId: config.selfId,
-    enabled: config.enabled,
-    dryRun: config.dryRun,
-    dataDir: config.dataDir,
-    workspacePath: config.workspacePath,
-    sessionIdPrefix: config.sessionIdPrefix,
-    rateLimit: config.rateLimit,
-    maxQueue: config.maxQueue,
-    segment: config.segment,
-    typingDelayMs: config.typingDelayMs,
-    cleanMarkdown: config.cleanMarkdown,
-    maxCharsPerMessage: config.maxCharsPerMessage,
-    rateLimitReply: config.rateLimitReply,
-    busyReply: config.busyReply,
-    reconnect: config.reconnect,
-    contextLimitPercent: config.contextLimitPercent,
-    contextWindow: config.contextWindow,
-    rolloverNotice: config.rolloverNotice,
-    memesDir: config.memesDir,
-    commandPrefix: config.commandPrefix,
-    memeMinIntervalMin: config.memeMinIntervalMin,
-    memeMaxPerHour: config.memeMaxPerHour,
-    memeProbability: config.memeProbability,
-    // 入站图片（2026-10-25）
-    imageEnabled: config.imageEnabled,
-    imageDir: config.imageDir,
-    imageCacheLimitMB: config.imageCacheLimitMB,
-    imageCachePurgeMB: config.imageCachePurgeMB,
-    imageMaxMB: config.imageMaxMB,
-    imageTimeoutMs: config.imageTimeoutMs,
+/** 点号路径读（`moodRates.missing` 这种两层的也能读）。 */
+function pickByPath(obj, dotted) {
+  let cur = obj
+  for (const part of String(dotted).split('.')) {
+    if (cur === null || typeof cur !== 'object') return undefined
+    cur = cur[part]
   }
+  return cur
+}
+
+/** 点号路径写（中间层不是对象就补成对象）。 */
+function putByPath(obj, dotted, value) {
+  const parts = String(dotted).split('.')
+  let cur = obj
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    const key = parts[i]
+    if (cur[key] === null || typeof cur[key] !== 'object' || Array.isArray(cur[key])) cur[key] = {}
+    cur = cur[key]
+  }
+  cur[parts[parts.length - 1]] = value
+  return obj
+}
+
+/**
+ * config 支持、但界面上**故意不露**的项（嵌套对象 / 长提示文案）。
+ * 漏了它们不会让面板变空，但一次「保存」就会把它们从 config.json 里抹掉，
+ * 所以显式列出来保命。
+ */
+const PERSIST_EXTRA = Object.freeze([
+  'sessionIdPrefix',
+  'rateLimit',
+  'maxQueue',
+  'segment',
+  'typingDelayMs',
+  'cleanMarkdown',
+  'rateLimitReply',
+  'busyReply',
+  'reconnect',
+  'rolloverNotice',
+  'stuckRolloverNotice',
+  'zeroTextNudgeText',
+  'watchdogNudgeText',
+])
+
+/**
+ * 从配置对象里挑出「设置页能改、且允许落盘」的字段（不落敏感派生值）。
+ *
+ * 2026-10-28 改成**表驱动**：调参表（settings-schema.mjs）里出现的 path 一律落盘。
+ * 上一版是手抄白名单，抄的时候漏了 18 项（每日说说 7 / 说说互动 4 / 看门狗 3 /
+ * 互动额度 4 …）——面板上看得见、点保存也返回成功，但写进 config.json 那一步被
+ * 静默丢掉，表现就是「改了没反应、重启还是老值」。手抄的地方迟早会再漏，所以
+ * 现在只认 settings-schema.mjs 一处。
+ */
+export function pickPersistable(config) {
+  const out = {}
+  for (const group of BOT_GROUPS) {
+    for (const field of group.fields) {
+      const value = pickByPath(config, field.path)
+      if (value !== undefined) putByPath(out, field.path, value)
+    }
+  }
+  for (const key of PERSIST_EXTRA) {
+    if (config[key] !== undefined) out[key] = config[key]
+  }
+  return out
 }
 
 /**
@@ -3295,6 +3324,8 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
       dataDir: DATA_DIR,
       configFile: CONFIG_FILE,
       config: pickPersistable(config),
+      // 调参表一起发下去：面板按表渲染，以后加字段只改 settings-schema.mjs 一处
+      schema: { bot: BOT_GROUPS },
       runtime: {
         forwarding: runtime.forwarding,
         connected: linkState === STATE.OPEN,
@@ -3616,8 +3647,14 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
         localVersion: readLocalVersion(join(pluginRoot, 'package.json')),
         dataDir: DATA_DIR,
         mounts: [
-          { from: 'dsh-qq-bot', to: pluginRoot },
-          { from: 'dsh-alive', to: aliveRoot },
+          /**
+           * 只覆盖「给用户真正跑的东西」：lib + 清单 + 说明 + 发行带的 tools。
+           * test/ 是开发自用（本机新加了两份防回归测试，上游包里没有），
+           * .gitignore / .sentry-native 这类也不该跟着上游走。
+           * 2026-10-28：以前是整目录覆盖，等于把本机手改过的同名文件无声盖掉。
+           */
+          { from: 'dsh-qq-bot', to: pluginRoot, only: ['lib', 'package.json', 'cordis.patch.yml', 'README.md', 'LICENSE', 'tools'] },
+          { from: 'dsh-alive', to: aliveRoot, only: ['lib', 'package.json', 'README.md', 'LICENSE', 'tools'] },
         ],
         log: (m) => writeLog('INFO', '更新：' + m),
         warn: (m) => writeLog('WARN', '更新：' + m),
