@@ -674,6 +674,16 @@ export function apply(ctx, rawConfig) {
       for (const [uin, record] of sessions) {
         out[uin] = { sessionId: record.sessionId, createdAt: record.createdAt ?? null, generation: record.generation ?? 1 }
       }
+      // 2026-10-28 事故：内存里 sessions 是空的（离线冒烟、异常路径重载）时，
+      // 这里会把 {} 写进真实映射，QQ 那一局的 id 就此丢掉 —— 恢复只能靠手工。
+      // 现在：内存空、磁盘有 → 拒绝覆盖。
+      if (Object.keys(out).length === 0) {
+        const onDisk = readJsonFile(mapPath)
+        if (onDisk !== null && typeof onDisk === 'object' && Object.keys(onDisk).length > 0) {
+          writeLog('WARN', '会话映射：内存里是空的、磁盘上有记录 —— 跳过写盘，免得把真实映射抹掉')
+          return
+        }
+      }
       writeFileSync(mapPath, `${JSON.stringify(out, null, 2)}\n`, 'utf8')
     } catch (err) {
       writeLog('WARN', `会话映射落盘失败：${err instanceof Error ? err.message : String(err)}`)

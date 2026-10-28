@@ -536,7 +536,7 @@ export function apply(ctx, rawConfig) {
    *   - 固定 id：配置里写死的那个，原样用。
    *   - 'auto'：跟 qq-bot 的会话映射走 —— 他在 QQ 里聊的那一局就是目标
    *             （宿主生成的是 session-<uuid>，重启也不会变）。
-   *             读不到就退到"他最近说话的那个会话"；再拿不到就返回空串，
+   *             读不到就返回空串（这一轮不投 —— 绝不往桌面会话里塞念头）。
    *             这一轮不投 —— 宁可不说，也别把念头丢进一个不存在的会话。
    */
   function resolveTargetSession() {
@@ -552,9 +552,10 @@ export function apply(ctx, rawConfig) {
       // 映射文件还没有：qq-bot 还没建过会话，往下退
     }
 
-    const focused = state?.focus?.sessionId
-    if (typeof focused === 'string' && focused !== '') return focused
-
+    // 2026-10-28 修：这里原来还会退到 state.focus.sessionId（他最近说话的那个会话），
+    // 但那个会话可能是**桌面 GUI 里的** —— 于是她的主动开口被投进了他在干活的对话里
+    // （真事：14:43 那条「你那条还钉在最上面呢」进了 Web 会话）。
+    // 她主动开口只有 QQ 一条通道；映射读不到就闭嘴，这一轮不投。
     return ''
   }
 
