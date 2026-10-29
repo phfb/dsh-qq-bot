@@ -3,6 +3,60 @@
 这个仓库一次装两个插件：`dsh-qq-bot/`（QQ 私聊接入）和 `dsh-alive/`（活人感 / 主动开口）。
 版本号两边同步。
 
+## [1.0.5] - 2026-10-30
+
+### 修复：自更新 100% 失效 —— 校验时用 spawnSync 建管道，被宿主环境挡住
+
+反馈里那两条日志是同一个事故：
+
+```
+更新：发现新版本 v1.0.4（来源 tag），开始下载…
+更新：新版本校验失败，已丢弃：dsh-qq-bot/lib\client.js: 语法检查没过
+      （PostQueuedCompletionStatus: (6) 句柄无效。）
+```
+
+`lib/client.js` 在 1.0.3 和 1.0.4 里逐字节相同、手跑 `node --check` 退出码 0 ——
+它压根没语法问题。真凶是校验那一步：
+
+```js
+spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' })   // ← 1.0.4 及以前
+```
+
+`encoding` 会让 libuv 给子进程开 stdout/stderr **两条管道**，而插件跑在 Electron 宿主
+进程里（`ELECTRON_RUN_AS_NODE=1` 的 Node），那个环境建管道会失败，`spawnSync` 直接返回
+`status: null` + `error.message = "PostQueuedCompletionStatus: (6) 句柄无效。"`。
+老判断只写 `r.status !== 0`，而 `null !== 0` 成立 —— 于是**每个新版本**都被判「语法检查不过」，
+下载成功也整包删掉，自更新永远装不上。日志里那条错误还跟语法毫无关系，看着像谜。
+
+- `dsh-qq-bot/lib/self-update.mjs`：新增 `checkSyntaxViaNode()`，三层降级 ——
+  ① `stdio: 'ignore'` 只取退出码（不建管道，宿主里能过）
+  ② 真报错了再单开 stderr 捞具体那一行（`encoding` 只在这一步用）
+  ③ 两种姿势都起不来 → `{ ok: null }`：这是**环境不给子进程**，不是代码坏了
+- `dsh-qq-bot/lib/self-update.mjs`：新增 `checkTextGuard()` —— 空文件 / 只有空白 /
+  含 `U+FFFD` 乱码一律拦下（下载被截断时 zip 照样能解开，这种坏法比语法错更常见）
+- `dsh-qq-bot/lib/self-update.mjs`：新增 `classifyStagedFile()` 把「坏文件」和
+  「没法校验」分成两件事 —— `ok:null` 只进 `unverified` 并告警，**不再整包丢弃**；
+  继续丢弃的代价（自更新永久死掉）比放行大得多，而 `applyPending()` 本来就是逐文件备份再覆盖
+- `dsh-qq-bot/lib/self-update.mjs`：新增 `pickSyntaxErrorLine()` —— 报错行优先取
+  `SyntaxError` / `Error:` / `ERR_` 那一行，不再取尾巴上的 `Node.js v24.x.x`
+- `dsh-qq-bot/lib/self-update.mjs`：`checkAndStage()` 失败分支把**本次探测到的 tag**
+  写进 `state.json`（以前沿用上一次成功写入的 `latestTag`，于是「刚丢弃了 v1.0.4」
+  在 state 里显示成 v1.0.2，排查时被带偏）
+- 测试：新增 `test/self-update-verify.test.mjs` 17 条 —— 三态判定、报错行挑选、
+  编码守卫、真文件（好 / 坏 / 空）各走一遍
+
+验证（都是真跑，不是纸面推演）：
+
+```
+① 真仓库端到端：checkAndStage() → 发现 v1.0.4（来源 tag）→ 下载 61 个文件 → 校验通过
+   → applyPending() 装到临时目录：新增 61 / 未变 0
+② 现场注入（execPath 指到不存在的文件，让子进程真的起不来）：
+   老姿势 spawnSync(...{encoding}) → status = null, error = ENOENT
+   新 checkAndStage() → WARN「语法校验子进程不可用，已按编码守卫放行」
+                      → result { ok: true, staged: true }   ← 不再丢包
+③ node --test：231 条全绿
+```
+
 ## [1.0.4] - 2026-10-30
 
 ### 修复：取不到内容的时候，正文里不再一声不吭

@@ -54,6 +54,145 @@ function isLoadablePath(rel) {
 }
 
 /**
+ * 从 `node --check` 的 stderr 里挑一行**有用的**报错。
+ *
+ * Node 出错时 stderr 尾巴永远是 `Node.js v24.x.x`，`split('\n').pop()` 拿到的
+ * 就是它 —— 以前日志里因此只有一句「语法检查没过（Node.js v24.22.1）」，
+ * 真正写着 `SyntaxError: Unexpected end of input` 的那一行反而被丢了，
+ * 下次排障等于从零开始。
+ *
+ * @param {unknown} stderr
+ * @param {number} status
+ * @returns {string}
+ */
+export function pickSyntaxErrorLine(stderr, status) {
+  const lines = String(stderr ?? '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+  const useful =
+    lines.find((l) => /SyntaxError|Error:|ERR_/.test(l)) ||
+    lines.find((l) => !/^Node\.js v/.test(l) && !/^\s*[\^~]+\s*$/.test(l) && !/^at\s/.test(l))
+  return useful || `退出码 ${status}`
+}
+
+/**
+ * 语法校验（2026-10-30 重写：以前这里把自更新整条命门掐死了）。
+ *
+ * 老写法是 `spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' })`。
+ * `encoding` 让 libuv 给子进程建 **stdout/stderr 两条管道**，而插件跑在 Electron
+ * 宿主进程里（`ELECTRON_RUN_AS_NODE=1` 的那种 Node），这个环境建管道会直接失败：
+ *
+ *   status: null
+ *   error.message: "PostQueuedCompletionStatus: (6) 句柄无效。"
+ *
+ * 老判断只写 `r.status !== 0`，而 `null !== 0` 成立 —— 于是**每个新版本**
+ * 都被判「语法检查没过」整包丢弃。日志里那句 `lib/client.js` 明明语法没问题
+ * （1.0.3 / 1.0.4 逐字节相同，手跑 `node --check` 退出码 0），自更新却 100% 失效。
+ *
+ * 现在的策略是三层降级：
+ *   1. `stdio: 'ignore'` —— 不建管道，只要退出码（宿主环境里这一步能过）
+ *   2. 真报错了，再单开 stderr 捞具体那一行（`encoding` 只在这一步用）
+ *   3. 两种姿势都起不来 → `{ ok: null }`：这是**环境不给子进程**，不是代码坏了，
+ *      交给调用方按「未校验」处理，别拿它当「校验失败」把整包扔掉
+ *
+ * @param {string} file
+ * @param {{run?: Function, execPath?: string, timeout?: number}} [opts]
+ * @returns {{ok: boolean | null, detail: string}}
+ */
+export function checkSyntaxViaNode(file, { run = spawnSync, execPath = process.execPath, timeout = 20000 } = {}) {
+  const attempts = [
+    { stdio: 'ignore', wantText: false },
+    { stdio: ['ignore', 'ignore', 'pipe'], wantText: true },
+  ]
+  let lastErr = ''
+  let statusFail = null
+
+  for (const attempt of attempts) {
+    let r
+    try {
+      r = run(execPath, ['--check', file], {
+        // 只有需要报错文本那次才要求编码（= 才建管道）
+        ...(attempt.wantText ? { encoding: 'utf8' } : {}),
+        stdio: attempt.stdio,
+        timeout,
+        windowsHide: true,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      })
+    } catch (err) {
+      lastErr = err instanceof Error ? err.message : String(err)
+      continue
+    }
+    if (r !== null && typeof r === 'object' && r.error) {
+      lastErr = r.error instanceof Error ? r.error.message : String(r.error)
+      continue
+    }
+    if (r === null || typeof r !== 'object' || typeof r.status !== 'number') {
+      lastErr = '子进程没有返回退出码'
+      continue
+    }
+    if (r.status === 0) return { ok: true, detail: '' }
+    statusFail = r.status
+    if (attempt.wantText) return { ok: false, detail: pickSyntaxErrorLine(r.stderr, r.status) }
+  }
+
+  if (statusFail !== null) return { ok: false, detail: `退出码 ${statusFail}` }
+  // 连子进程都起不来 —— 环境问题，别赖到代码头上
+  return { ok: null, detail: lastErr }
+}
+
+/**
+ * 编码守卫：下载坏掉最常见的样子是空文件 / U+FFFD 乱码，比语法错更常见也更致命。
+ *
+ * 下载不完整时 zip 照样能解开（codeload 偶尔会截断），解开后的 .js 可能：
+ *   · 一个字节都没有
+ *   · 或者中间夹着 U+FFFD（UTF-8 解码失败留下的替换字符）
+ * 这两种在 `node --check` 眼里不一定是语法错（空文件甚至能过），所以单独查一遍。
+ *
+ * @param {string} file
+ * @param {{read?: Function}} [opts]
+ * @returns {string} 有问题返回原因，没问题返回空串
+ */
+export function checkTextGuard(file, { read = readFileSync } = {}) {
+  let buf
+  try {
+    buf = read(file)
+  } catch (err) {
+    return `读不了（${err instanceof Error ? err.message : String(err)}）`
+  }
+  if (buf.length === 0) return '文件是空的'
+  const text = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf)
+  if (text.includes('\uFFFD')) return '含 U+FFFD 乱码（下载不完整或编码坏了）'
+  if (text.trim() === '') return '文件只有空白'
+  return ''
+}
+
+/**
+ * 一个待安装的 .js/.mjs 文件该怎么判：编码守卫 → 语法。
+ *
+ * 三种结果各有各的去处，混了就是这次事故的根源：
+ *   ok: true   → 放过
+ *   ok: false  → 记进 bad，整包丢弃（文件真的坏了）
+ *   ok: null   → 记进 unverified，只警告（**环境起不了子进程**，不是文件的问题）
+ *
+ * 老代码把 `status === null`（子进程没起来）和 `status !== 0`（语法错）混成
+ * 一回事，于是宿主环境里每个新版本都被判「语法检查没过」，自更新 100% 失效。
+ * 单拎出来一个函数，就是为了让这个「三态」能被测住。
+ *
+ * @param {string} file
+ * @param {{guard?: Function, syntax?: Function}} [opts]
+ * @returns {{ok: boolean | null, detail: string}}
+ */
+export function classifyStagedFile(file, { guard = checkTextGuard, syntax = checkSyntaxViaNode } = {}) {
+  const guarded = guard(file)
+  if (guarded !== '') return { ok: false, detail: guarded }
+  const verdict = syntax(file)
+  if (verdict.ok === true) return { ok: true, detail: '' }
+  if (verdict.ok === false) return { ok: false, detail: `语法检查没过（${verdict.detail}）` }
+  return { ok: null, detail: verdict.detail }
+}
+
+/**
  * 把各种写法的仓库地址归一成 `owner/repo`。
  *
  * 认这些：
@@ -294,8 +433,9 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
     }
     if (written === 0) throw new Error(`包里没有匹配 mounts 的文件（顶层目录 ${top}）`)
 
-    // 校验：JSON 能 parse，js/mjs 过一遍语法检查
+    // 校验：JSON 能 parse；js/mjs 先过编码守卫，再过语法
     const bad = []
+    const unverified = []
     for (const mount of mounts) {
       const root = join(staged, String(mounts.indexOf(mount)))
       if (!existsSync(root)) continue
@@ -308,15 +448,19 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
             bad.push(`${mount.from}/${rel}: JSON 坏了（${err instanceof Error ? err.message : err}）`)
           }
         } else if ((rel.endsWith('.js') || rel.endsWith('.mjs')) && isLoadablePath(rel)) {
-          const r = spawnSync(process.execPath, ['--check', file], {
-            encoding: 'utf8',
-            timeout: 20000,
-            windowsHide: true,
-            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-          })
-          if (r.status !== 0) bad.push(`${mount.from}/${rel}: 语法检查没过（${(r.stderr || '').trim().split('\n').pop()}）`)
+          const verdict = classifyStagedFile(file)
+          if (verdict.ok === false) bad.push(`${mount.from}/${rel}: ${verdict.detail}`)
+          else if (verdict.ok === null) unverified.push(`${mount.from}/${rel}（${verdict.detail}）`)
         }
       }
+    }
+    if (unverified.length > 0) {
+      /* 2026-10-30：宿主环境（Electron + ELECTRON_RUN_AS_NODE）里起不了
+         `node --check` 子进程时，走这条 —— 以前这里会被判成「语法检查没过」，
+         于是自更新 100% 失效（下载成功 → 校验失败 → 整包删掉）。
+         包里已经过了「下载 + TLS + 编码守卫」，而 applyPending 是逐文件备份
+         再覆盖的；继续丢弃的代价比放行大得多，所以只警告、不丢包。 */
+      warn(`语法校验子进程不可用，已按编码守卫放行：${unverified.slice(0, 3).join('; ')}`)
     }
     if (bad.length > 0) {
       rmSync(pendingDir, { recursive: true, force: true })
@@ -420,8 +564,13 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
 
   /** 检查 + 下载 + 校验，全程不抛。 */
   async function checkAndStage() {
+    /* 这次真的探测到哪个 tag。失败分支要把它写进 state.json ——
+       以前那里沿用的是「上一次成功写入」的 latestTag，于是
+       「刚下载并丢弃了 v1.0.4」在 state 里显示成 v1.0.2，排查时被带偏。 */
+    let probedTag = ''
     try {
       const { tag, from } = await latestTag()
+      probedTag = tag
       if (compareVersion(tag, localVersion) <= 0) {
         // 成功一次就把上次的 lastError 抹掉：不然面板/state.json 里会一直挂着
         // 一条早就修好的 404，看着像「还是坏的」
@@ -443,9 +592,12 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
       return { ok: true, updated: true, staged: true, tag }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
+      const prev = readJson(statePath) || {}
       writeJson(statePath, {
-        ...(readJson(statePath) || {}),
+        ...prev,
         checkedAt: new Date().toISOString(),
+        // 本次探测到了就记本次的；连 tag 都没探到才沿用旧值
+        latestTag: probedTag !== '' ? probedTag : prev.latestTag,
         lastError: msg,
       })
       warn(`检查更新失败（不影响使用）：${msg}`)
