@@ -215,6 +215,78 @@ export function hasImageSegments(message) {
 }
 
 /**
+ * 数一下这条消息里有多少图片/表情段。
+ *
+ * 2026-10-30 加的。`hasImageSegments` 只能回答「有没有」，可「有没有」和
+ * 「有没有取到」是两件事：他发了一张图，下载失败之后正文里只剩一个裸的
+ * `[图片]`，她既不知道那是几张、也不知道自己其实没看见 —— 只能回他
+ * 「图没传过来」。有了这个数，inbound 就能在正文里把话说清楚。
+ *
+ * @param {unknown} message OneBot v11 的 message 字段
+ * @returns {number}
+ */
+export function countImageSegments(message) {
+  if (!Array.isArray(message)) return 0
+  return message.filter(
+    (seg) => seg !== null && typeof seg === 'object' && (seg.type === 'image' || seg.type === 'mface'),
+  ).length
+}
+
+/**
+ * 数一下这条消息里有几段「合并转发」。
+ *
+ * 转发的内容根本不在正文里，只有一个 id —— 光丢个占位她是不会去展开的。
+ * inbound 靠这个数决定要不要在正文里点她一句「必须用 qq_read_forward」。
+ *
+ * array 和 CQ 码字符串两种形态都认。
+ *
+ * @param {unknown} message OneBot v11 的 message 字段
+ * @returns {number}
+ */
+export function countForwardSegments(message) {
+  if (typeof message === 'string') {
+    return (message.match(/\[CQ:forward,/gi) ?? []).length
+  }
+  if (!Array.isArray(message)) return 0
+  return message.filter((seg) => seg !== null && typeof seg === 'object' && String(seg.type ?? '') === 'forward')
+    .length
+}
+
+/**
+ * 把她可能照抄过来的整段 `[合并转发:xxx]` 剥成一个干净的 id。
+ *
+ * 工具说明写的是「把那个 id 给这个工具」，可她手上看见的是带方括号的整段，
+ * 顺手连 `[合并转发:` 一起抄进来太正常了 —— 那种 id 打过去必然查不到，
+ * 而失败提示只会说「没读到」，看着就像「转发读不了」。
+ *
+ * 只剥壳，不动内容：base64 里的 `+`、`/`、`=` 一个都不能碰。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function normalizeForwardId(raw) {
+  let s = String(raw ?? '').trim()
+  if (s === '') return ''
+  s = s.replace(/^\[CQ:forward,[^\]]*?id=/i, '')
+  s = s.replace(/^[\[【(（]?\s*合并转发\s*[:：]?\s*/u, '')
+  s = s.replace(/[\]】)）\s]+$/u, '')
+  s = s.replace(/^[\[【(（]+/, '')
+  // 引号/反引号也一起剥：`"xxx"` / `` `xxx` `` 都不是 id 的一部分，
+  // 而它们一个都不在 base64 字母表里，剥掉不会伤到真内容。
+  s = s.replace(/^["'`「『]+/, '').replace(/["'`」』]+$/, '')
+  return s.trim()
+}
+
+/**
+ * 引用展开失败时，正文里留下的占位。
+ *
+ * 以前一律退回原来的 `[引用]` —— 那个占位和「已展开但内容为空」长得一模一样，
+ * 她看不出「这里本来有一段上下文，只是没取到」，于是要么当没看见，要么自己编。
+ * 现在明写「原文没取到」：少一段上下文可以忍，假装自己有上下文不行。
+ */
+export const QUOTE_MISSING = '[引用·原文没取到]'
+
+/**
  * 把 get_msg 取回来的一条消息压成一行「[引用 昵称]: 原话」。
  *
  * inner 是「被引用那条自己引用的东西」，已经格式化好了；有的话就替换掉那三个字，

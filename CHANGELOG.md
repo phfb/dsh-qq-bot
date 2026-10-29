@@ -3,6 +3,42 @@
 这个仓库一次装两个插件：`dsh-qq-bot/`（QQ 私聊接入）和 `dsh-alive/`（活人感 / 主动开口）。
 版本号两边同步。
 
+## [1.0.4] - 2026-10-30
+
+### 修复：取不到内容的时候，正文里不再一声不吭
+
+三个症状（引用看不到内容、发图片看不到图片、转发看不到内容）挨个查下来，
+**接口全是通的** —— 日志里 `get_msg` / `get_forward_msg` 都成功返回过，
+引用文字展开过十几次。问题出在「取不到之后的收尾」：正文里那个占位跟
+「本来就没有」长得一模一样，她只能回一句「图没传过来」。
+
+- `dsh-qq-bot/lib/index.js`：图下载失败（日志里的 `fetch failed`）或者拿不到可用地址时，
+  正文补一句「本来有 N 张图，一张都没取到（下载失败或者没有可用地址），别假装看见，
+  让他重发」；以前这种消息只剩一个裸的 `[图片]`
+- `dsh-qq-bot/lib/index.js`：引用里的图没取到（协议端只回 `file`、不给能直接下载的 `url`）
+  时，在引文后面单独点明「引用里还有 N 张图没取到」—— 引文有、图没有，她以前以为
+  引用里只有文字
+- `dsh-qq-bot/lib/index.js`：`withImageUrls` 拿不到可下载 url 时打 WARN。
+  以前静默放过，事后只能看到一句「没有可下载的 url」，分不清是谁的问题
+- `dsh-qq-bot/lib/index.js`：引用展开彻底失败时，占位由 `[引用]` 换成
+  `[引用·原文没取到]`，跟「已展开但内容为空」区分开
+- `dsh-qq-bot/lib/index.js`：合并转发在正文里补硬指令 —— 内容不在正文里，
+  必须调 `qq_read_forward` 展开，不展开等于没看见。以前只丢一个 id，
+  没人叫她读，十次里八次直接跳过
+- `dsh-qq-bot/lib/index.js`：`qq_read_forward` 打接口前先剥壳，
+  她照抄整段 `[合并转发:xxx]` 过来也能用
+- `dsh-qq-bot/lib/forward.mjs`（新文件）：转发格式化从工具里抽成纯函数并补测 ——
+  单节截断 200 → 600 字，图 / 表情 / 语音 / 视频 / 文件 / @ / 嵌套转发都留占位，
+  不再静默丢掉（丢掉之后模型会以为那条里只有文字）
+- `dsh-qq-bot/lib/policy.mjs`：新增 `countImageSegments` / `countForwardSegments` /
+  `normalizeForwardId` / `QUOTE_MISSING`。`normalizeForwardId` 剥掉
+  `[合并转发:…]`、方括号、引号，base64 里的 `+` `/` `=` 一个都不动
+- `dsh-qq-bot/lib/image-store.js`：图片下载失败重试一次（QQ 图床偶发 reset），
+  「太大」这类非暂时性错误不重试
+
+测试：`node --test` 207 条全绿，新增 `test/inbound-fallbacks.test.mjs` 19 条，
+把上面每一条「不许再沉默」的断言都钉住。
+
 ## [1.0.3] - 2026-10-29
 
 ### 新增：活人感那一页把独立设置窗口的内容全搬过来了

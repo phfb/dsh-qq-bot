@@ -124,6 +124,25 @@ export function createImageStore({
   /* ── 下载 ───────────────────────────────────────────────────────────── */
 
   async function download(url) {
+    // 2026-10-30：QQ 的图片 CDN 偶尔会无理由 reset 一次（日志里的
+    // 「图片下载失败：fetch failed」就是这种），隔一会儿再来一次基本都能过。
+    // 以前一次失败就 return null —— 于是他发的图她看不见，全凭运气。
+    // 「太大」不是暂时性错误，重试没意义，直接抛。
+    let lastErr = null
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        return await downloadOnce(url)
+      } catch (err) {
+        lastErr = err
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg.startsWith('太大')) throw err
+        if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 350))
+      }
+    }
+    throw lastErr ?? new Error('下载失败')
+  }
+
+  async function downloadOnce(url) {
     const res = await fetch(url, {
       redirect: 'follow',
       signal: AbortSignal.timeout(timeoutMs),

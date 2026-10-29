@@ -1,6 +1,6 @@
 {
   "name": "dsh-qq-bot",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "把 QQ 私聊接进 DeepSeek Harness：让 DSH 常驻在你的手机 QQ 里，随时都能找她说话。私聊陪伴向，不是群管机器人。",
   "type": "module",
   "main": "lib/index.js",

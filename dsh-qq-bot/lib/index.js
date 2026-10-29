@@ -26,8 +26,11 @@ import { createUpdater, readLocalVersion } from './self-update.mjs'
 import { buildSocketUrl, parseConfig } from './config.js'
 import { ALIVE_GROUPS, BOT_GROUPS } from './settings-schema.mjs'
 import {
+  QUOTE_MISSING,
   RateLimiter,
   cleanMarkdown,
+  countForwardSegments,
+  countImageSegments,
   expandQuote,
   extractText,
   hasImageSegments,
@@ -35,6 +38,7 @@ import {
   limitImageSegments,
   looksLikeWork,
   looksRejected,
+  normalizeForwardId,
   randomIn,
   segmentText,
   sleep,
@@ -44,7 +48,8 @@ import {
 } from './policy.mjs'
 import { OneBotClient, STATE } from './onebot.mjs'
 import { createImageStore } from './image-store.js'
-import { formatBytes, stampParts } from './images.mjs'
+import { formatBytes, parseImageSegments, stampParts } from './images.mjs'
+import { renderForward } from './forward.mjs'
 import { socialEventToText } from './notice.mjs'
 import { ALLOWED_ACTIONS, checkAction, clampTarget } from './api-allowlist.mjs'
 import { checkBudget, emptyBudget, rollDay, takeBudget } from './interact-budget.mjs'
@@ -356,8 +361,16 @@ function createTaskMessage({ text, reason, kind }) {
  *   - 原生附件失败 → 必须把绝对路径 + `read_image` 指令写清楚，否则她只能瞎猜
  * 语音和视频是**明着说做不到**：模型没有耳朵、也吃不下视频，
  * 与其让她编一段"我听到了"，不如让她老实说"这条我听不了，打字给我"。
+ *
+ * 2026-10-30 补：除了「拿到了什么」，这里还得说清楚「有什么没拿到」——
+ * 图全没取到、引用里的图没取到、合并转发没展开，这三种在正文里都看不出来。
+ * 末尾那几个 *Missing / forwards 参数就是干这个的。
  */
-export function buildInboundText(text, collected, { nativeImages = false, quotedCount = 0 } = {}) {
+export function buildInboundText(
+  text,
+  collected,
+  { nativeImages = false, quotedCount = 0, forwards = 0, imagesMissing = 0, quotedImagesMissing = 0 } = {},
+) {
   const lines = []
   if (typeof text === 'string' && text !== '') lines.push(text)
 
@@ -385,6 +398,37 @@ export function buildInboundText(text, collected, { nativeImages = false, quoted
     } else {
       lines.push('[用 read_image 逐张看清楚再回答；别装作看过，也别只按文件名猜内容]')
     }
+  }
+
+  /* ── 没取到的图 / 引用的图 / 合并转发 ─────────────────────────────────────
+     2026-10-30 补的三段。共同点是「正文里那个占位看不出异常」：
+       · 图下载失败 → 只剩裸的 `[图片]`，她以为那就是全部
+       · 引用里带图但没取到 → 引文有、图没有，她以为引用里只有文字
+       · 合并转发 → 只有 id，没人叫她展开，她就当没看见
+     少说一句的下场是她只能回「图没传过来」「你发的是空的」。 */
+
+  const forwardCount = Math.max(0, Math.floor(Number(forwards) || 0))
+  if (forwardCount > 0) {
+    lines.push(
+      `[他发了 ${forwardCount} 条合并转发 —— 内容不在正文里，只给了 id。` +
+        '必须调 qq_read_forward 把 id 展开才看得到；不展开就等于没看见，别猜里面写了什么]',
+    )
+  }
+
+  const missingImages = Math.max(0, Math.floor(Number(imagesMissing) || 0))
+  if (missingImages > 0 && images.length === 0) {
+    lines.push(
+      `[这条消息里本来有 ${missingImages} 张图，一张都没取到（下载失败或者没有可用地址）。` +
+        '别假装看见、也别按文件名猜内容 —— 直接跟他说没收到，让他重发]',
+    )
+  }
+
+  const missingInQuote = Math.max(0, Math.floor(Number(quotedImagesMissing) || 0))
+  if (missingInQuote > 0 && quotedCount === 0) {
+    lines.push(
+      `[他引用的那条里还有 ${missingInQuote} 张图没取到 —— 引文是他引的那句话，图你没有。` +
+        '要说得上话就得先承认没看到那张图]',
+    )
   }
 
   const files = collected?.files ?? []
@@ -1917,7 +1961,15 @@ export function apply(ctx, rawConfig) {
       try {
         const res = await client.call('get_image', { file })
         const url = String(res?.data?.url ?? res?.url ?? '')
-        out.push(/^https?:\/\//i.test(url) ? { ...seg, data: { ...data, url } } : seg)
+        if (/^https?:\/\//i.test(url)) {
+          out.push({ ...seg, data: { ...data, url } })
+        } else {
+          // 2026-10-30：以前这里静默放过，于是「引用里的图看不见」在日志里
+          // 连一行都不留 —— 查的时候只能看见一句「没有可下载的 url」，
+          // 分不清是协议端没给、还是给了个不能直接 GET 的东西。
+          writeLog('WARN', `get_image 没给出能直接下载的 url（file=${file}），这张图大概率看不到`)
+          out.push(seg)
+        }
       } catch (err) {
         writeLog('WARN', `取图片 url 失败（file=${file}）：${err instanceof Error ? err.message : String(err)}`)
         out.push(seg)
@@ -1957,6 +2009,10 @@ export function apply(ctx, rawConfig) {
     if (config.selfId && userId === config.selfId) return
 
     let text = extractText(event.message)
+    /* 这条里有几段合并转发 —— 转发的内容根本不在正文里，只有一个 id。
+       数出来是为了让正文能点她一句「必须调工具展开」：
+       不点的话她十次里有八次会直接跳过，然后回一句「你发的是空的」。 */
+    const forwardCount = countForwardSegments(event.message)
 
     /* 重复消息合并（2026-10-27 加的）：
        同一条话连发两遍（手滑 / 网络重投 / 复制粘贴）会被当成两轮，她就回两遍。
@@ -2017,6 +2073,13 @@ export function apply(ctx, rawConfig) {
       }
     }
 
+    /* 这一条里本来有图、实际收到几张。
+       差值 > 0 就是「图没下下来」—— 正文必须说清楚，否则她只看见一个裸的
+       `[图片]`，只能回他「图没传过来」，而他自己在 QQ 里明明看得见那张图。
+       注意这里只数「这一条自己的图」，引用的那部分在下面单独算。 */
+    const plainImageSegments = parseImageSegments(event.message).length
+    const imagesMissing = Math.max(0, plainImageSegments - collected.images.length)
+
     /* 引用展开：把正文里的「[引用]」换成被引用那条的原话。
        只在他真引用了才多打一次 get_msg，平时一毛钱开销没有。
        顺手抓住被引用那条的消息体 —— 他要是引一张图问「这个怎么办」，
@@ -2026,12 +2089,20 @@ export function apply(ctx, rawConfig) {
       const expanded = await resolveQuote(event.message, (data) => {
         if (quotedMessage === null) quotedMessage = data
       })
-      if (expanded !== null) text = text.replace('[引用]', expanded)
+      // 取不到原文时别留下跟「已展开但内容为空」长得一模一样的 `[引用]`。
+      // 明写「没取到」，她才不会把「缺了一段上下文」当成「本来就没什么」。
+      text = text.replace('[引用]', expanded !== null ? expanded : QUOTE_MISSING)
     }
 
     /* 引用里带图：跟普通入站走同一条路（落附件库 + 挂原生附件），
        张数按 QUOTE_MAX_IMAGES 封顶。失败只 WARN，引文本身照旧。 */
     let quotedCount = 0
+    /* 引用里本来有几张。按 QUOTE_MAX_IMAGES 封顶 —— 超出的那几张是我们主动
+       不收的（省视觉 token），不算「没取到」，不能拿去吓她。 */
+    const quotedImageSegments =
+      quotedMessage !== null && hasImageSegments(quotedMessage.message)
+        ? Math.min(countImageSegments(quotedMessage.message), QUOTE_MAX_IMAGES)
+        : 0
     if (imageStore !== null && quotedMessage !== null && hasImageSegments(quotedMessage.message)) {
       try {
         const fromQuote = await imageStore.collectFromMessage(
@@ -2051,6 +2122,8 @@ export function apply(ctx, rawConfig) {
       }
     }
 
+    const quotedImagesMissing = Math.max(0, quotedImageSegments - quotedCount)
+
     const nativeImages = collected.images.some((img) => img && img.block)
     const gotAnything = collected.images.length > 0 || collected.files.length > 0 ||
       collected.voices.length > 0 || collected.videos.length > 0
@@ -2061,7 +2134,13 @@ export function apply(ctx, rawConfig) {
     }
 
     /* 拼进会话的正文。光有图没文字的消息也要发 —— 那种以前会被上面这个空判断直接丢掉。 */
-    const promptText = buildInboundText(text, collected, { nativeImages, quotedCount })
+    const promptText = buildInboundText(text, collected, {
+      nativeImages,
+      quotedCount,
+      forwards: forwardCount,
+      imagesMissing,
+      quotedImagesMissing,
+    })
 
     // /qq 命令在插件本地处理，不送进 agent（关掉之后也还能用它开回来）
     const cmd = parseCommand(text)
@@ -3010,7 +3089,7 @@ export function apply(ctx, rawConfig) {
 
       {
         name: 'qq_read_forward',
-        description: '展开一条合并转发，读里面到底写了什么。他发来合并转发时，消息里只有一个「[合并转发:xxx]」，把那个 id 给这个工具就能读到内容。',
+        description: '展开一条合并转发，读里面到底写了什么。他发来合并转发时，消息里只有一个「[合并转发:xxx]」，把那个 id（连方括号整段抄过来也认）给这个工具就能读到内容。不调这个工具，转发等于没发。',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -3021,29 +3100,16 @@ export function apply(ctx, rawConfig) {
         },
         output: CALL_OUTPUT,
         async execute(args) {
-          const id = String(args?.id ?? '').trim()
+          // 2026-10-30：她手上看见的是带方括号的整段，顺手连 `[合并转发:` 一起抄
+          // 进来是常事 —— 那种 id 打过去必然查不到，回来一句「读不到」，
+          // 看着就像「转发功能坏了」。先剥壳再发。
+          const id = normalizeForwardId(args?.id)
           if (id === '') return { ok: false, note: '没给 id。', json: '' }
           const r = await callOneBot('get_forward_msg', { id })
           if (!r.ok) return { ok: false, note: r.note, json: '' }
-          const list = Array.isArray(r.data?.messages) ? r.data.messages : []
-          const lines = list.map((node) => {
-            const sender = String(node?.sender?.nickname ?? node?.sender?.card ?? node?.user_id ?? '某人')
-            const segs = Array.isArray(node?.message) ? node.message : (Array.isArray(node?.content) ? node.content : [])
-            const body = segs.map((seg) => {
-              const t = String(seg?.type ?? '')
-              if (t === 'text') return String(seg?.data?.text ?? '')
-              if (t === 'image') return '[图片]'
-              if (t === 'face' || t === 'mface') return '[表情]'
-              if (t === 'record') return '[语音]'
-              return ''
-            }).join('')
-            return `${sender}：${body.slice(0, 200)}`
-          }).filter((s) => s.trim() !== '')
-          return {
-            ok: true,
-            note: '',
-            json: lines.length > 0 ? lines.join('\n') : '（这条转发是空的，或者已经过期读不到了）',
-          }
+          // 格式化在 lib/forward.mjs（纯函数、有单测）：单节 600 字上限，
+          // 图 / 表情 / 语音 / 文件 / 嵌套转发都留占位，不再静默丢掉。
+          return { ok: true, note: '', json: renderForward(r.data) }
         },
       },
 
