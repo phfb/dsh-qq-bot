@@ -1003,6 +1003,52 @@ export function apply(ctx, rawConfig) {
     }
   }, 5000)
 
+  let offRoute = null
+  /** OneBot 客户端。插件关着（早退）的时候一直留空 —— 见下面 new OneBotClient 那段注释。 */
+  let client = null
+
+  /**
+   * 把调参面板的 API 挂到宿主 webServer 上。
+   *
+   * 2026-10-29：这段原来是写在 apply 末尾的 —— 而 apply 在「插件关着」/「allowUsers 为空」
+   * 那两条早退分支里就 return 了，于是**关掉插件以后设置页整个打不开**（/panel 直接 404），
+   * 想再打开都没地方点。现在挪到早退之前，面板永远在。
+   */
+  function installPanelRoutes() {
+    if (typeof ctx.inject === 'function') {
+      // defer 注入：apply 时宿主常常还没有 webServer，等它起来再挂（记忆插件也是这个套路）
+      ctx.inject(['webServer'], (scope) => {
+        scope.effect(() => {
+          let off = null
+          try {
+            off = installRoutes(scope.webServer)
+          } catch (err) {
+            writeLog('WARN', `设置页 API 注册失败（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
+          }
+          return () => {
+            try {
+              off?.()
+            } catch {
+              // 注销失败不该影响卸载
+            }
+          }
+        })
+      })
+      return
+    }
+    // 老宿主 / 测试桩：没有 inject 就退回同步取，拿不到也不影响聊天
+    const webServer = ctx.get?.('webServer')
+    if (webServer !== undefined && webServer !== null && typeof webServer.register === 'function') {
+      try {
+        offRoute = installRoutes(webServer)
+      } catch (err) {
+        writeLog('WARN', `设置页 API 注册失败（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+  }
+
+  installPanelRoutes()
+
   if (!config.enabled) {
     writeLog('INFO', 'enabled=false，本次不连接、不转发。改配置后插件会重载。')
     return
@@ -2141,8 +2187,14 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** 建立连接。 */
-  const client = new OneBotClient({
+  /**
+   * 建立连接。
+   *
+   * 2026-10-29：原来是 `const client = ...`，而它建在「插件关着」那条早退之后 ——
+   * 关掉插件时设置页的路由还在（有人在早退前挂上了），可 /reconnect 一取 client 就是 TDZ。
+   * 现在提前声明成 let，关着的时候它一直是 null，面板点「重新连接」会得到一句人话。
+   */
+  client = new OneBotClient({
     url: buildSocketUrl(config),
     onEvent: onOneBotEvent,
     onLog: (m) => writeLog('INFO', m),
@@ -3437,35 +3489,114 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
     }
   }
 
+  /** alive 插件的目录（跟本插件同一个 release 目录下的兄弟）。 */
+  /* 用 function 声明而不是 const 箭头：下面「插件关着」那条早退分支也要挂路由，
+     而早退发生在这一行之前 —— 箭头函数在那一刻还在 TDZ 里。 */
+  function alivePluginDir() {
+    return join(dirname(dirname(dirname(fileURLToPath(import.meta.url)))), 'dsh-alive')
+  }
+
+  /**
+   * alive 的代码级开关：涩涩那两行常量写在 lib/mood.mjs 顶上，不读它分不清
+   * 「代码里没开」「面板没勾」「真开着」三种状态 —— 老 PowerShell 窗口也是这么读的。
+   */
+  function readMoodSwitches() {
+    const out = { lustEnabled: false, lustSliderEnabled: false }
+    try {
+      const src = readFileSync(join(alivePluginDir(), 'lib', 'mood.mjs'), 'utf8')
+      out.lustEnabled = /export\s+const\s+LUST_ENABLED\s*=\s*true/.test(src)
+      out.lustSliderEnabled = /export\s+const\s+LUST_SLIDER_ENABLED\s*=\s*true/.test(src)
+    } catch { /* 读不到就当没开 */ }
+    return out
+  }
+
   /**
    * 只读状态：alive 那份 state.json 里的情绪、额度、静音 —— 原来 PowerShell 窗口
    * 上会显示的那一堆。**只读**，面板不写它（那个文件是 alive 自己的运行时状态）。
+   *
+   * 2026-10-29 补全：老窗口里还有「今天封顶 / 挂着的念头 / 你上次说话 / 作废几条 /
+   * 主情绪 / 额度上限 / 现在为什么不会发」这些行，网页那半边一直没有 —— 这次全搬过来。
+   * 「为什么不会发」不在这里算，读 alive 每跳写进 state.runtime.blocked 的那一份：
+   * 闸门只归它自己管，宿主抄一遍迟早走岔。
    */
   function readAliveStatus() {
     const state = readJsonFile(join(DATA_DIR, 'alive-state.json'))
-    if (state === null || typeof state !== 'object') return null
+    const aliveCfg = readJsonFile(ALIVE_CONFIG_FILE)
+    const cfg = aliveCfg !== null && typeof aliveCfg === 'object' ? aliveCfg : {}
     const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
+    const str = (v) => (typeof v === 'string' ? v : '')
+    const maxPerDay = Number.isFinite(Number(cfg.maxPerDay)) ? Number(cfg.maxPerDay) : 4
+    const maxPerHour = Number.isFinite(Number(cfg.maxPerHour)) ? Number(cfg.maxPerHour) : 1
+    const muteEnabled = cfg.muteEnabled !== false
+    const switches = readMoodSwitches()
+    const files = {
+      state: join(DATA_DIR, 'alive-state.json'),
+      config: ALIVE_CONFIG_FILE,
+      log: join(DATA_DIR, 'logs', 'alive.log'),
+      control: join(DATA_DIR, 'alive-control.json'),
+    }
+    if (state === null || typeof state !== 'object') {
+      return {
+        ok: false,
+        missing: true,
+        files,
+        limits: { maxPerDay, maxPerHour },
+        muteEnabled,
+        blocked: ['状态文件不存在，说明插件还没启动过'],
+        blockedAt: '',
+        note: `读不到 ${files.state}`,
+      }
+    }
+
     const mood = state.mood !== null && typeof state.mood === 'object' ? state.mood : {}
     const control = state.control !== null && typeof state.control === 'object' ? state.control : {}
     const quota = state.quota !== null && typeof state.quota === 'object' ? state.quota : {}
     const stats = state.stats !== null && typeof state.stats === 'object' ? state.stats : {}
     const focus = state.focus !== null && typeof state.focus === 'object' ? state.focus : {}
+    const runtime = state.runtime !== null && typeof state.runtime === 'object' ? state.runtime : {}
+    const now = Date.now()
+    const timeOf = (iso) => {
+      if (typeof iso !== 'string' || iso === '') return null
+      const t = new Date(iso).getTime()
+      return Number.isFinite(t) ? t : null
+    }
+    const mutedUntilAt = timeOf(control.mutedUntil)
+    const stopAt = timeOf(control.dayQuotaSuspendedUntil)
+    const dayCount = num(quota.dayCount)
+    const hourCount = num(quota.hourCount)
+    const openLoops = (Array.isArray(state.loops) ? state.loops : [])
+      .filter((l) => l !== null && typeof l === 'object' && l.status === 'open')
+      .map((l) => ({ what: str(l.what), kind: str(l.kind), at: str(l.expectedBackAt) }))
+    const blocked = Array.isArray(runtime.blocked)
+      ? runtime.blocked.filter((x) => typeof x === 'string')
+      : []
+
     return {
-      updatedAt: typeof state.updatedAt === 'string' ? state.updatedAt : '',
+      ok: true,
+      missing: false,
+      files,
+      updatedAt: str(state.updatedAt),
+      blockedAt: str(runtime.at),
+      limits: { maxPerDay, maxPerHour },
+      muteEnabled,
       control: {
         enabled: control.enabled !== false,
         hardOff: control.hardOff === true,
         lastWasStop: control.lastWasStop === true,
-        mutedUntil: typeof control.mutedUntil === 'string' ? control.mutedUntil : null,
-        muteReason: typeof control.muteReason === 'string' ? control.muteReason : '',
-        dayQuotaSuspendedUntil: typeof control.dayQuotaSuspendedUntil === 'string' ? control.dayQuotaSuspendedUntil : null,
+        mutedUntil: str(control.mutedUntil),
+        muteReason: str(control.muteReason),
+        dayQuotaSuspendedUntil: str(control.dayQuotaSuspendedUntil),
+        muted: mutedUntilAt !== null && mutedUntilAt > now,
+        stopToday: stopAt !== null && stopAt > now,
       },
       quota: {
-        hourCount: num(quota.hourCount),
-        dayCount: num(quota.dayCount),
+        hourCount,
+        dayCount,
+        hourLeft: Math.max(0, maxPerHour - hourCount),
+        dayLeft: Math.max(0, maxPerDay - dayCount),
         consecutiveIgnored: num(quota.consecutiveIgnored),
         consecutiveReplied: num(quota.consecutiveReplied),
-        lastProactiveAt: typeof quota.lastProactiveAt === 'string' ? quota.lastProactiveAt : '',
+        lastProactiveAt: str(quota.lastProactiveAt),
       },
       mood: {
         missing: num(mood.missing),
@@ -3475,6 +3606,14 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
         boredom: num(mood.boredom),
         lust: num(mood.lust),
         annoyance: num(mood.annoyanceDebt),
+        // 恼火是"欠债点数"不是百分比：60 点满，够 45 就全线闭嘴（G9）
+        annoyanceMax: 60,
+        annoyanceSilenceAt: 45,
+        lustCodeEnabled: switches.lustEnabled,
+        lustSliderEnabled: switches.lustSliderEnabled,
+        lustModeEnabled: cfg.lustModeEnabled === true,
+        // 真开着的条件跟插件里一致：代码开关 + 面板开关
+        lustOn: switches.lustEnabled && cfg.lustModeEnabled === true,
       },
       stats: {
         totalDelivered: num(stats.totalDelivered),
@@ -3482,9 +3621,12 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
         abandoned: num(stats.abandoned),
       },
       focus: {
-        lastHumanAt: typeof focus.lastHumanAt === 'string' ? focus.lastHumanAt : '',
-        lastQqAt: typeof focus.lastQqAt === 'string' ? focus.lastQqAt : '',
+        lastHumanAt: str(focus.lastHumanAt),
+        lastQqAt: str(focus.lastQqAt),
+        lastTickAt: str(focus.lastTickAt),
       },
+      openLoops,
+      blocked,
     }
   }
 
@@ -3537,7 +3679,80 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
     }
   }
 
-  const installRoutes = (webServer) => {
+  /* ── 面板上的那几个按钮（2026-10-29 从老 PowerShell 窗口搬过来）────────────
+
+     老窗口那几个按钮是这么干的：不能直接改插件的内存，就往 alive 的「信箱」
+     （alive-control.json）里写一条命令，插件扫到没见过的 id 就执行，执行完把 cmd 清空、
+     写 doneAt 回执，窗口轮询到 cmd 空 = 办完了。
+     这里照抄同一套 —— 不新开通道，也不碰 alive 的运行时状态文件。 */
+
+  /** alive 真正在用的数据目录（配置里能改，所以别假定跟本插件一样）。 */
+  function aliveDataDir() {
+    const cfg = readJsonFile(ALIVE_CONFIG_FILE)
+    if (cfg !== null && typeof cfg === 'object' && typeof cfg.dataDir === 'string' && cfg.dataDir.trim() !== '') {
+      return cfg.dataDir.trim()
+    }
+    return DATA_DIR
+  }
+
+  /** 写一条命令进信箱，等插件回执（最多 ~5 秒，跟老窗口一样）。 */
+  async function sendAliveCommand(cmd) {
+    // 白名单写在这里而不是外面那个 const：那个 const 在「插件关着」早退之后才初始化，
+    // 面板在关着的状态下点按钮会直接撞 TDZ。
+    if (!new Set(['unmute', 'reset-quota']).has(cmd)) return { ok: false, error: `不认识的命令：${cmd}` }
+    const controlPath = join(aliveDataDir(), 'alive-control.json')
+    const id = randomUUID()
+    try {
+      writeFileSync(controlPath, `${JSON.stringify({
+        cmd,
+        id,
+        requestedAt: new Date().toISOString(),
+      }, null, 2)}\n`, 'utf8')
+    } catch (err) {
+      return { ok: false, error: `写信箱失败：${err instanceof Error ? err.message : String(err)}` }
+    }
+    for (let i = 0; i < 13; i += 1) {
+      await sleep(400)
+      const cur = readJsonFile(controlPath)
+      if (cur !== null && typeof cur === 'object' && cur.id === id && (cur.cmd === '' || cur.cmd === undefined)) {
+        writeLog('INFO', `设置页发了命令 ${cmd}（插件已回执）`)
+        return {
+          ok: true,
+          note: cmd === 'unmute'
+            ? '已解除静音，当天封顶也一起撤了'
+            : '今日 / 本小时额度清零了，冷却也清了',
+        }
+      }
+    }
+    writeLog('WARN', `设置页发了命令 ${cmd} 但没等到回执（插件可能没在跑 / 还是旧代码）`)
+    return {
+      ok: false,
+      error: '没等到插件回执：DSH 里那个活人感插件可能没在跑（或者还是旧代码）',
+    }
+  }
+
+  /** 面板点「打开状态文件」：给宿主进程拉起记事本，路径只认白名单。 */
+  function openAliveFile(which) {
+    const dir = aliveDataDir()
+    const table = {
+      state: join(dir, 'alive-state.json'),
+      mood: join(dir, 'alive-mood.json'),
+      config: ALIVE_CONFIG_FILE,
+      log: join(dir, 'logs', 'alive.log'),
+    }
+    const target = table[String(which ?? '')]
+    if (target === undefined) return { ok: false, error: `不认识的文件：${which}` }
+    try {
+      const child = spawn('notepad.exe', [target], { detached: true, stdio: 'ignore', windowsHide: false })
+      child.unref()
+      return { ok: true, note: `已打开 ${target}` }
+    } catch (err) {
+      return { ok: false, error: `打不开 ${target}：${err instanceof Error ? err.message : String(err)}` }
+    }
+  }
+
+  /** 设置页 API（同 function 声明的原因，见 alivePluginDir 上面那行注释）。 */
+  function installRoutes(webServer) {
     const maybeOff = webServer.register({
       kind: 'prefix',
       path: API_PREFIX,
@@ -3567,6 +3782,10 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
             return
           }
           if (route === '/reconnect' && req.method === 'POST') {
+            if (client === null) {
+              sendJson(res, 200, { ok: false, error: '插件现在是关着的（enabled=false）—— 先把「启用插件」勾上保存，再连' })
+              return
+            }
             try {
               client.close()
             } catch {
@@ -3584,6 +3803,19 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
             sendJson(res, 200, { ok: true, note: '会话映射已清空，下一条消息会开新的一局' })
             return
           }
+          /* 活人感那几个按钮：跟老 PowerShell 窗口一套命令信箱 */
+          if (route === '/alive-command' && req.method === 'POST') {
+            const body = await readBody(req)
+            const outcome = await sendAliveCommand(String(body?.cmd ?? ''))
+            sendJson(res, outcome.ok ? 200 : 400, outcome)
+            return
+          }
+          if (route === '/open-file' && req.method === 'POST') {
+            const body = await readBody(req)
+            const outcome = openAliveFile(body?.file)
+            sendJson(res, outcome.ok ? 200 : 400, outcome)
+            return
+          }
           sendJson(res, 404, { ok: false, error: `未知接口 ${route}` })
         } catch (err) {
           sendJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) })
@@ -3593,37 +3825,8 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
     return typeof maybeOff === 'function' ? maybeOff : null
   }
 
-  let offRoute = null
-  if (typeof ctx.inject === 'function') {
-    // defer 注入：apply 时宿主常常还没有 webServer，等它起来再挂（记忆插件也是这个套路）
-    ctx.inject(['webServer'], (scope) => {
-      scope.effect(() => {
-        let off = null
-        try {
-          off = installRoutes(scope.webServer)
-        } catch (err) {
-          writeLog('WARN', `设置页 API 注册失败（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
-        }
-        return () => {
-          try {
-            off?.()
-          } catch {
-            // 注销失败不该影响卸载
-          }
-        }
-      })
-    })
-  } else {
-    // 老宿主 / 测试桩：没有 inject 就退回同步取，拿不到也不影响聊天
-    const webServer = ctx.get?.('webServer')
-    if (webServer !== undefined && webServer !== null && typeof webServer.register === 'function') {
-      try {
-        offRoute = installRoutes(webServer)
-      } catch (err) {
-        writeLog('WARN', `设置页 API 注册失败（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
-      }
-    }
-  }
+  /* 设置页路由已经在前面（早退之前）挂好了，这里不再重复注册 —— 重复会撞
+     「duplicate prefix route」，而且会让关着插件的那两条早退分支没有面板。 */
 
   /* ── 定时任务：放到这里启动 ──────────────────────────────────
      必须在这之后 —— diaryTimer / pollTimer 是 let，声明在下面那些
@@ -3697,7 +3900,7 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
     socket.once('error', () => done(false))
   })
 
-  /** SnowLuma 目录：默认跟数据目录同级（D:\DSHBot\data → D:\DSHBot\SnowLuma）。 */
+  /** SnowLuma 目录：默认跟数据目录同级（`<数据目录>` → 同级的 `SnowLuma/`）。 */
   const snowLumaDir = () => {
     const fromConfig = typeof config.snowLumaDir === 'string' ? config.snowLumaDir.trim() : ''
     if (fromConfig !== '') return fromConfig
@@ -3776,7 +3979,7 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
         try { offRoute() } catch { /* 宿主可能已经自己清掉了 */ }
         offRoute = null
       }
-      client.close()
+      if (client !== null) client.close()
       if (config.snowLumaStopOnExit !== false) stopSnowLuma()
       for (const [, record] of sessions) {
         // 只 dispose 自己创建的 handle，别动宿主自己管理的会话

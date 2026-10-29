@@ -1,7 +1,7 @@
 /**
  * dsh-alive 判定核心的单元测试。纯函数，不需要 DSH。
  *
- *   D:\Astrbot\Snowluma\node.exe --test "D:\DSHBot\plugin\dsh-alive\test\policy.test.mjs"
+ *   node --test "test/policy.test.mjs"
  */
 
 import { test } from 'node:test'

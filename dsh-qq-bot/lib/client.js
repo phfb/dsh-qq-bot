@@ -520,41 +520,238 @@ window.__ModuleLoader__.load({
         }))
     }
 
-    /** 只读状态条：情绪七维 + 额度 + 静音。数据来自宿主读 alive-state.json。 */
+    /** 只读状态条：整块照「DSH 活人感 · 设置」那个老窗口搬过来（2026-10-29）。
+     *
+     *  老窗口上有的，这里一行不缺：
+     *    今日额度（已投/上限/还剩）· 本小时（用了几次/上限）· 静音（到几点 + 原因）
+     *    今天封顶（是/否）· 挂着的念头（几条 + 分别是什么、几点到点）
+     *    情绪（七维百分比 + 恼火 n/60）· 主情绪 · 上次主动 · 你上次说话（QQ / DSH）
+     *    累计（投出 / 他回 / 作废）· 状态更新于 · 现在能发 / 现在为什么不会发
+     *  再加上老窗口那四个按钮：刷新 / 马上解除静音 / 今日额度清零 / 打开状态文件。
+     *
+     *  数据全来自宿主 GET /panel 的 status 字段（宿主读 alive-state.json + alive-config.json）；
+     *  「为什么不会发」是插件每一跳自己算好写进 state.runtime.blocked 的，面板只读。 */
+
+    /** ISO → HH:mm（本地时间）。 */
+    function fmtClock(iso) {
+      if (!iso) return '—'
+      var d = new Date(iso)
+      if (isNaN(d.getTime())) return '—'
+      var two = function (n) { return String(n).padStart(2, '0') }
+      return two(d.getHours()) + ':' + two(d.getMinutes())
+    }
+
+    /** ISO → 「刚刚 / N 分钟前 / N 小时前（HH:mm） / MM-dd HH:mm」，跟老窗口一套说法。 */
+    function fmtAgo(iso) {
+      if (!iso) return '—'
+      var d = new Date(iso)
+      if (isNaN(d.getTime())) return '—'
+      var span = Date.now() - d.getTime()
+      var two = function (n) { return String(n).padStart(2, '0') }
+      var clock = two(d.getHours()) + ':' + two(d.getMinutes())
+      if (span < 0) return clock
+      var min = span / 60000
+      if (min < 1) return '刚刚'
+      if (min < 60) return Math.floor(min) + ' 分钟前'
+      if (min < 1440) return Math.floor(min / 60) + ' 小时前（' + clock + '）'
+      return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + clock
+    }
+
+    /** 一行「标签 —— 值」，标签那列窄一点，跟老窗口那个等宽文本块对齐的感觉。 */
+    function statusLine(label, value, props) {
+      return h('div', {
+        style: {
+          display: 'grid',
+          gridTemplateColumns: props && props.narrow ? '92px 1fr' : '92px 1fr',
+          gap: '2px 10px',
+          fontSize: 12,
+          lineHeight: 1.85,
+        },
+      },
+        h('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, label),
+        h('span', { style: { color: 'var(--dsw-alias-label-primary)', wordBreak: 'break-all' } }, value))
+    }
+
     function AliveStatus(props) {
       var status = props.status
-      if (!status) return null
-      var pct = function (v) { return Math.round((Number(v) || 0) * 100) + '%' }
-      var shortTime = function (iso) {
-        if (!iso) return '—'
-        var d = new Date(iso)
-        if (isNaN(d.getTime())) return '—'
-        var two = function (n) { return String(n).padStart(2, '0') }
-        return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes())
+      var onRefresh = typeof props.onRefresh === 'function' ? props.onRefresh : null
+      var busyRes = useState(false)
+      var msgRes = useState(null)
+      var busy = busyRes[0]
+      var setBusy = busyRes[1]
+      var msg = msgRes[0]
+      var setMsg = msgRes[1]
+
+      if (!status || typeof status !== 'object') {
+        return h('section', {
+          style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 10, padding: '10px 14px', marginBottom: 12 },
+        },
+          h('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', marginBottom: 4 } }, '当前状态'),
+          h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', lineHeight: 1.8 } },
+            '宿主这次没把运行状态发下来 —— 插件可能刚重启、或者状态文件还没生成。点「刷新」再试。'))
       }
-      var muted = status.control.mutedUntil && new Date(status.control.mutedUntil).getTime() > Date.now()
-      var chips = [
-        ['想他', status.mood.missing],
-        ['吃醋', status.mood.jealousy],
-        ['暖意', status.mood.warmth],
-        ['担心', status.mood.worry],
-        ['闲得慌', status.mood.boredom],
-        ['涩涩', status.mood.lust],
-        ['恼火', status.mood.annoyance],
+
+      var pct = function (v) { return Math.round((Number(v) || 0) * 100) + '%' }
+      /* 老宿主（还没重启）发下来的 status 缺新字段 —— 一律退成「—」而不是满屏 undefined */
+      var show = function (v) { return v === undefined || v === null || v === '' ? '—' : v }
+      var limit = status.limits || {}
+      var maxPerDay = Number(limit.maxPerDay)
+      var maxPerHour = Number(limit.maxPerHour)
+      var quota = status.quota || {}
+      var mood = status.mood || {}
+      var focus = status.focus || {}
+      var stats = status.stats || {}
+      var control = status.control || {}
+      var blocked = Array.isArray(status.blocked) ? status.blocked : null
+      var dayLeft = quota.dayLeft !== undefined
+        ? quota.dayLeft
+        : (Number.isFinite(maxPerDay) ? Math.max(0, maxPerDay - (Number(quota.dayCount) || 0)) : '—')
+
+      /* 静音 / 封顶：老宿主只给 mutedUntil 字符串，那就自己比一下 */
+      var muted = typeof control.muted === 'boolean'
+        ? control.muted
+        : Boolean(control.mutedUntil && new Date(control.mutedUntil).getTime() > Date.now())
+      var stopToday = typeof control.stopToday === 'boolean'
+        ? control.stopToday
+        : Boolean(control.dayQuotaSuspendedUntil && new Date(control.dayQuotaSuspendedUntil).getTime() > Date.now())
+
+      var muteLine = '没静音'
+      if (muted) {
+        muteLine = '静音到 ' + fmtClock(control.mutedUntil) + '（' + (control.muteReason || '—') + '）'
+      } else if (status.muteEnabled === false) {
+        muteLine = '禁言机制关着'
+      }
+
+      /* 封顶 */
+      var stopLine = stopToday
+        ? '是 —— 封顶到 24:00（说「别发了」的后果，点「马上解除静音」能撤）'
+        : '否'
+
+      /* 挂着的念头 */
+      var loops = Array.isArray(status.openLoops) ? status.openLoops : []
+      var loopsText = loops.length === 0
+        ? '0 条'
+        : loops.length + ' 条 —— ' + loops.map(function (l) {
+          return '「' + (l.what || '（没说是什么）') + '」（约 ' + fmtClock(l.at) + ' 到点）'
+        }).join('；')
+
+      /* 情绪七维。涩涩三种说法分开写（跟老窗口一致）：
+         代码里没开 / 面板没勾 / 真开着 —— 别让人以为它在偷偷涨 */
+      var lustSeg = '涩涩 未开放'
+      if (mood.lustCodeEnabled) {
+        lustSeg = mood.lustOn ? ('涩涩 ' + pct(mood.lust)) : ('涩涩 ' + pct(mood.lust) + '（未启用）')
+      }
+      var debt = Number(mood.annoyance) || 0
+      var debtMax = Number(mood.annoyanceMax) || 60
+      var silenceAt = Number(mood.annoyanceSilenceAt) || 45
+      var moodText = [
+        '想他 ' + pct(mood.missing),
+        '吃醋 ' + pct(mood.jealousy),
+        '暖意 ' + pct(mood.warmth),
+        '担心 ' + pct(mood.worry),
+        '闲得慌 ' + pct(mood.boredom),
+        lustSeg,
+        '恼火 ' + pct(debt / debtMax) + '（' + Math.round(debt) + '/' + debtMax + '）',
+      ].join(' · ')
+
+      /* 主情绪：跟老窗口同一套判法（涩涩没真开就不参与评比，恼火按 /60 折算） */
+      var dims = [
+        ['missing', '想他', Number(mood.missing) || 0],
+        ['jealousy', '吃醋', Number(mood.jealousy) || 0],
+        ['warmth', '暖意', Number(mood.warmth) || 0],
+        ['worry', '担心', Number(mood.worry) || 0],
+        ['boredom', '闲得慌', Number(mood.boredom) || 0],
       ]
+      if (mood.lustOn) dims.push(['lust', '涩涩', Number(mood.lust) || 0])
+      var topKey = ''
+      var topName = ''
+      var topVal = 0
+      dims.forEach(function (d) {
+        if (d[2] > topVal) { topVal = d[2]; topKey = d[0]; topName = d[1] }
+      })
+      if (debt / debtMax > topVal) { topKey = 'annoyance'; topVal = debt / debtMax; topName = '恼火' }
+      var moodTop = '平静（还没攒起什么情绪）'
+      if (topVal >= 0.25) {
+        moodTop = topKey === 'annoyance'
+          ? ('有点恼（恼火 ' + pct(debt / debtMax) + '，到 ' + silenceAt + '/' + debtMax + ' 就闭嘴）')
+          : (topName + ' ' + pct(topVal))
+      }
+
+      var act = function (path, body, okText) {
+        if (!path) return
+        setBusy(true)
+        setMsg({ kind: 'info', text: '正在执行…' })
+        request('POST', path, body).then(function (res) {
+          setMsg({ kind: 'ok', text: (res && res.note) || okText || '办了' })
+          if (onRefresh !== null) onRefresh()
+        }).catch(function (err) {
+          setMsg({ kind: 'err', text: err.message })
+        }).then(function () { setBusy(false) })
+      }
+
+      var statusBtn = function (label, onClick, primary) {
+        return h('button', {
+          type: 'button',
+          disabled: busy,
+          onClick: onClick,
+          style: {
+            padding: '5px 12px',
+            borderRadius: 7,
+            fontSize: 12.5,
+            cursor: busy ? 'default' : 'pointer',
+            border: '1px solid ' + (primary ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l1)'),
+            background: primary ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+            color: primary ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+            fontWeight: primary ? 600 : 400,
+            opacity: busy ? 0.6 : 1,
+          },
+        }, label)
+      }
+
       return h('section', {
         style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 10, padding: '10px 14px', marginBottom: 12 },
       },
-        h('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', marginBottom: 6 } }, '当前状态'),
-        h('div', { style: { display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.9 } },
-          h('span', null, muted ? ('静音中' + (status.control.muteReason ? '（' + status.control.muteReason + '）' : '')) : '没静音'),
-          h('span', null, '今天已开口 ' + status.quota.dayCount + ' 次 / 这一小时 ' + status.quota.hourCount + ' 次'),
-          h('span', null, '上次主动 ' + shortTime(status.quota.lastProactiveAt)),
-          h('span', null, '连续被忽略 ' + status.quota.consecutiveIgnored + ' 次'),
-          h('span', null, '累计投递 ' + status.stats.totalDelivered + ' · 他回 ' + status.stats.totalReplied),
-          h('span', null, '状态更新于 ' + shortTime(status.updatedAt))),
+        h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 6, flexWrap: 'wrap' } },
+          h('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } }, '当前状态'),
+          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            statusBtn('刷新', function () {
+              if (onRefresh === null) return
+              setBusy(true)
+              setMsg(null)
+              Promise.resolve(onRefresh()).then(function () { setMsg({ kind: 'ok', text: '已刷新' }) }).then(function () { setBusy(false) })
+            }),
+            statusBtn('马上解除静音', function () { act('/alive-command', { cmd: 'unmute' }) }, true),
+            statusBtn('今日额度清零', function () { act('/alive-command', { cmd: 'reset-quota' }) }),
+            statusBtn('打开状态文件', function () { act('/open-file', { file: 'state' }) }))),
+
+        status.ok === false
+          ? h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-state-warn-primary)', lineHeight: 1.8 } },
+            (status.note || '读不到状态文件') + '——插件还没启动过？')
+          : h('div', null,
+            statusLine('今日额度', '已投 ' + show(quota.dayCount) + ' 条 / 上限 ' + show(limit.maxPerDay) + ' 条，还剩 ' + show(dayLeft) + ' 条'),
+            statusLine('本小时', show(quota.hourCount) + ' / ' + show(limit.maxPerHour) + ' 条'),
+            statusLine('静音', muteLine),
+            statusLine('今天封顶', stopLine),
+            statusLine('挂着的念头', loopsText),
+            statusLine('情绪', moodText),
+            statusLine('主情绪', moodTop),
+            statusLine('上次主动', fmtAgo(quota.lastProactiveAt)),
+            statusLine('你上次说话', 'QQ 里 ' + fmtAgo(focus.lastQqAt) + '　　DSH 里 ' + fmtAgo(focus.lastHumanAt)),
+            statusLine('累计', '投出 ' + show(stats.totalDelivered) + ' 条，他回了 ' + show(stats.totalReplied) + ' 次，作废 ' + show(stats.abandoned) + ' 条'),
+            statusLine('连续被忽略', (quota.consecutiveIgnored || 0) + ' 次（连续被回 ' + (quota.consecutiveReplied || 0) + ' 次）'),
+            statusLine('状态更新于', fmtAgo(status.updatedAt) + '（原因算于 ' + fmtClock(status.blockedAt) + '）')),
+
         h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 } },
-          chips.map(function (pair) {
+          [
+            ['想他', mood.missing],
+            ['吃醋', mood.jealousy],
+            ['暖意', mood.warmth],
+            ['担心', mood.worry],
+            ['闲得慌', mood.boredom],
+            // 涩涩没真开着就不摆这一颗，免得以为它在偷偷涨
+          ].concat(mood.lustOn ? [['涩涩', mood.lust]] : [])
+            .concat([['恼火', debt / debtMax]])
+            .map(function (pair) {
             return h('span', {
               key: pair[0],
               style: {
@@ -565,7 +762,31 @@ window.__ModuleLoader__.load({
                 color: 'var(--dsw-alias-label-secondary)',
               },
             }, pair[0] + ' ' + pct(pair[1]))
-          })))
+          })),
+
+        /* 现在为什么不会发 —— 老窗口里最值钱的那块：卡在哪一条，直接摊开 */
+        blocked === null
+          ? h('div', { style: { marginTop: 8, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', lineHeight: 1.8 } },
+            '「为什么不会发」要宿主重启一次才会显示：插件每跳把原因写进 alive-state.json，面板只是读它')
+          : blocked.length === 0
+            ? h('div', { style: { marginTop: 8, fontSize: 12, color: 'var(--dsw-alias-state-ok-primary, #3fb950)', lineHeight: 1.8 } },
+              '现在能发：闸门全过，只要有念头到点就会开口')
+            : h('div', { style: { marginTop: 8, fontSize: 12, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.8 } },
+              h('div', { style: { color: 'var(--dsw-alias-label-primary)' } }, '现在为什么不会发：'),
+              blocked.map(function (b, i) {
+                return h('div', { key: i }, '· ' + b)
+              })),
+
+        msg !== null
+          ? h('div', {
+            style: {
+              marginTop: 6,
+              fontSize: 12,
+              lineHeight: 1.7,
+              color: msg.kind === 'err' ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-secondary)',
+            },
+          }, msg.text)
+          : null)
     }
 
     /** 活人感（dsh-alive）那一页：表驱动，别在这里写死字段。 */
@@ -634,7 +855,7 @@ window.__ModuleLoader__.load({
       var dirty = Object.keys(draft).length
 
       return h('div', null,
-        h(AliveStatus, { status: data.status }),
+        h(AliveStatus, { status: data.status, onRefresh: reload }),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 } },
           h('button', {
             type: 'button',

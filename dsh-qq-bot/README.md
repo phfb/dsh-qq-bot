@@ -562,6 +562,38 @@ Copy-Item bot-config.example.json bot-config.json
 
 ---
 
+## 调参面板（DSH-BOT，DSH 里那一页）
+
+装好之后 DSH 侧栏多一个 **DSH-BOT** 入口，两个标签：**QQ 机器人（dsh-qq-bot）** /
+**活人感（dsh-alive）**。它和 `tools\settings-ui.ps1` 改的是同一份 `config.json` / `alive-config.json`，
+但字段不是手抄的 —— 全部来自 `lib/settings-schema.mjs`（`BOT_GROUPS` 11 组 48 项、
+`ALIVE_GROUPS` 10 组 48 项），以后加字段只改那一处，两个界面自动长出来。
+
+「活人感」那页顶部是只读状态卡：额度（已投 / 上限 / 还剩）、本小时、静音到点 + 原因、
+今天封顶、挂着的念头、七维情绪（恼火按 `n/60`）、主情绪、上次主动、你在 QQ / DSH 各自最后一次说话、
+累计（投出 / 回 / 作废 / 连续被忽略）、状态更新时间，最后一栏是**「现在为什么不会发」** ——
+卡在哪一条闸门就列哪一条。
+
+卡片右上角四个按钮：**刷新** / **马上解除静音** / **今日额度清零** / **打开状态文件**。
+和独立窗口一样，前两个不是直接改内存，而是往 `alive-control.json` 写一条命令、等插件回执 ——
+插件没在跑（或还是旧代码）时会明确告诉你「没等到回执」，不会假装成功。
+
+接口（同源、需要浏览器凭证，前缀 `/api/dsh-qq-bot`）：
+
+| 接口 | 方法 | 作用 |
+|---|---|---|
+| `/panel` | GET | 两份配置现值 + 调参表 + 只读状态（`status` 里就是上面那张卡的数据） |
+| `/panel` | POST | 存配置；只认调参表里的 path，数字按 min/max/step 夹紧，数组字段逗号分隔 |
+| `/alive-command` | POST | `{cmd:"unmute"}` 解静音 / `{cmd:"reset-quota"}` 清额度，等回执最多 ~5 秒 |
+| `/open-file` | POST | `{file:"state"}`（还能 `config` / `log` / `mood`）用记事本打开，路径走白名单 |
+| `/reconnect` | POST | 重连 OneBot；插件关着（`enabled: false`）时返回一句人话而不是报错 |
+| `/state` `/save` `/accounts` `/reset-session` | — | 老的运行状态 / 存配置 / 读号 / 清会话 |
+
+> 面板的路由在 `apply` 里**早退之前**就挂上了：插件关着、`allowUsers` 空着的时候，
+> 设置页照样打得开（以前是整页 404，想再打开都没地方点）。
+
+---
+
 ## 常见问题
 
 ### 消息进来了她不回

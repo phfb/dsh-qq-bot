@@ -3,6 +3,56 @@
 这个仓库一次装两个插件：`dsh-qq-bot/`（QQ 私聊接入）和 `dsh-alive/`（活人感 / 主动开口）。
 版本号两边同步。
 
+## [1.0.3] - 2026-10-29
+
+### 新增：活人感那一页把独立设置窗口的内容全搬过来了
+
+1.0.1 起 DSH 里就有「活人感（dsh-alive）」这一页，但顶部状态卡只搬了 6 行，
+`tools\settings-alive.ps1` 那个独立窗口里的东西**缺了一大半** ——
+最要命的是「现在为什么不会发」整块没有，她莫名不开口的时候只能干瞪眼。
+
+- `dsh-qq-bot/lib/client.js`：状态卡按老窗口逐行重画 —— 今日额度（已投 / 上限 / 还剩）、
+  本小时、静音到几点 + 原因、今天封顶、挂着的念头（几条 / 什么事 / 约几点到点）、
+  七维情绪（恼火按 `n/60`，涩涩分「未开放 / 未启用 / 真开着」三种说法）、主情绪、上次主动、
+  你上次说话（QQ 里 / DSH 里两个时间）、累计（投出 / 回 / 作废 / 连续被忽略）、状态更新时间，
+  最后是**「现在为什么不会发」逐条列出**（闸门全过时写「现在能发」）
+- `dsh-qq-bot/lib/client.js`：卡片右上角补齐四个按钮 —— **刷新 / 马上解除静音 /
+  今日额度清零 / 打开状态文件**，跟独立窗口那排一一对应
+- `dsh-qq-bot/lib/index.js`：`GET /panel` 的 `status` 给全（上限、剩余、封顶、
+  `openLoops`、`lastTickAt`、恼火满值 60、涩涩三态、`blocked`、四个文件路径）；
+  顺带读一次 `dsh-alive/lib/mood.mjs` 的两行常量，好分清涩涩的三种状态
+- `dsh-qq-bot/lib/index.js`：新增 `POST /api/dsh-qq-bot/alive-command`
+  （`unmute` / `reset-quota`）与 `POST /api/dsh-qq-bot/open-file`。
+  前者不碰内存，照老窗口那套往 `alive-control.json` 写一条命令、等插件回执；
+  后者只认白名单里的四个文件，用记事本打开
+- `dsh-alive/lib/index.js`：把闸门判断抽成 `blockedReasons()`，每轮心跳落盘前算一遍写进
+  `alive-state.json` 的 `runtime.blocked`（带 `at` 时间戳）。**闸门规则只此一份**，
+  面板和 PowerShell 窗口都只读不算 —— 以前窗口在外面抄了一遍规则，插件一改它就跟着错
+
+### 修复：插件关着的时候，设置页整个打不开
+
+`apply` 在「`enabled: false`」和「`allowUsers` 为空」这两条早退分支里直接 `return` 了，
+而设置页路由是挂在 `apply` 末尾的 —— 结果就是**把插件关掉之后 DSH-BOT 面板整页 404**，
+想再打开都没地方点，只能去手改 json。
+
+- 路由注册挪到早退之前（`installPanelRoutes()`），关着也能开面板改配置
+- `OneBotClient` 的 `const client` 提前成 `let client = null`：关着的时候面板点「重新连接」
+  会得到一句「插件现在是关着的」而不是 TDZ 报错；卸载清理里也加了空值判断
+
+### 顺带（上一轮没提交的）
+
+- `dsh-alive/lib/policy.mjs` / `lib/index.js`：`renderImpulse()` 和情绪注入段里各加一句
+  「这里提到的『他』就是正在跟你说话的那个人，说出口一律叫『你』」——
+  不写死这句，模型会把「他」原样说出口
+
+### 测试
+
+- `dsh-qq-bot/test/settings-render.test.cjs` 加 4 条：老窗口那十行状态一行都不能少、
+  「现在为什么不会发」逐条渲染、四个按钮都在、调参那 10 组照样渲染
+- 另有用例脚本在临时目录里真跑过一遍：两跳心跳后 `runtime.blocked` 落盘、`/panel` 字段齐全、
+  命令信箱被真插件执行并回执、任意路径被白名单挡掉（不进仓库）
+- 全套：`dsh-qq-bot` 188 项、`dsh-alive` 111 项，全绿
+
 ## [1.0.2] - 2026-10-28
 
 ### 修复：调参面板只渲染了三分之二（DSH-BOT）

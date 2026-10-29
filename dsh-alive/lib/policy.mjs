@@ -543,6 +543,7 @@ export function renderImpulse(loop, ctx) {
     const when = label === '早上好' ? '早上' : label === '中午好' ? '中午' : label === '晚上好' ? '晚上' : '这会儿'
     const lines = [
       '[你心里冒出来的话]',
+      '（下面提到的「他」就是你正在说话的那个人；说出口一律叫「你」，别跟着用第三人称。）',
       '',
       `现在是${when}。`,
       '你想主动跟他说一句 —— 不是他找你，也不是你想他想得难受，就是到这个时候了。',
@@ -567,6 +568,7 @@ export function renderImpulse(loop, ctx) {
   if (loop?.kind === 'free') {
     const lines = [
       '[你心里冒出来的话]',
+      '（下面提到的「他」就是你正在说话的那个人；说出口一律叫「你」，别跟着用第三人称。）',
       '',
       `他已经 ${ctx?.silentMin ?? '?'} 分钟没在 QQ 上跟你说话了，也没交代去哪儿。`,
       `你心里那点「${String(loop?.what ?? '想他')}」攒到了 ${loop?.freePercent ?? '?'}%。`,
@@ -588,6 +590,7 @@ export function renderImpulse(loop, ctx) {
   const quote = String(loop?.quote ?? '').slice(0, 40)
   const lines = [
     '[你心里冒出来的话]',
+      '（下面提到的「他」就是你正在说话的那个人；说出口一律叫「你」，别跟着用第三人称。）',
     '',
     `他在 ${ctx?.silentMin ?? '?'} 分钟前说「${quote}」，到现在没有回来。`,
   ]

@@ -243,6 +243,11 @@ function emptyState(config) {
     episodes: [],
     stats: { byKind: {}, totalDelivered: 0, totalReplied: 0, abandoned: 0 },
     focus: { sessionId: null, lastHumanAt: null, lastQqAt: null, lastAssistantAt: null, lastTickAt: null, shortTerm: [] },
+    /* 2026-10-29 加：每跳把「现在为什么不会发」算一遍写在这里。
+       设置页（浏览器那半边）读的是这个文件，它自己算不出闸门原因 ——
+       以前老 PowerShell 窗口是在外面照抄了一遍规则，两处一旦走岔就对不上。
+       现在只有这里算，外面只负责显示。 */
+    runtime: { at: null, blocked: [] },
   }
 }
 
@@ -270,6 +275,12 @@ function normalizeState(state, config) {
     loops: Array.isArray(state.loops) ? state.loops : [],
     episodes: Array.isArray(state.episodes) ? state.episodes : [],
   }
+  merged.runtime = state.runtime !== null && typeof state.runtime === 'object'
+    ? {
+        at: typeof state.runtime.at === 'string' ? state.runtime.at : null,
+        blocked: Array.isArray(state.runtime.blocked) ? state.runtime.blocked.filter((x) => typeof x === 'string') : [],
+      }
+    : { ...base.runtime }
   if (!Array.isArray(merged.rhythm.hourly) || merged.rhythm.hourly.length !== 24) {
     merged.rhythm.hourly = new Array(24).fill(0)
   }
@@ -504,6 +515,8 @@ export function apply(ctx, rawConfig) {
     }
     try {
       state.updatedAt = new Date().toISOString()
+      // 落盘前顺手刷新「为什么不会发」—— 设置页读的是这一份，别让它过时
+      refreshRuntimeBlocked()
       // 只留最近 200 条 episode
       if (state.episodes.length > 200) state.episodes = state.episodes.slice(-200)
       writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
@@ -921,6 +934,9 @@ export function apply(ctx, rawConfig) {
       const lines = [
         `【你现在的心情】${label} ${pct}%（活人感插件自动给的，不必复述数字）`,
         `→ ${TONE_LINE[tone] ?? TONE_LINE.flat}`,
+        // 2026-10-29：这段里的「他」指的是正在跟你说话的那个人。不写死这句，
+        // 模型读完这段就会把「他」原样说出口（人格里明明定的是「说你」）。
+        '（上面提到的「他」就是正在跟你说话的那个人；说出口一律叫「你」。）',
       ]
       if (top.key === 'lust') lines.push(LUST_EXTRA)
       return lines.join('\n')
@@ -1453,8 +1469,14 @@ export function apply(ctx, rawConfig) {
   }
 
   /** 一条人能看懂的状态快照。 */
-  function collectState() {
-    const now = Date.now()
+  /**
+   * 「现在为什么不会发」—— 所有能判断的闸门跑一遍，返回原因数组（空 = 现在能发）。
+   *
+   * 2026-10-29 从 collectState 里抽出来的：心跳每跳都要算一次，写完落进
+   * state.runtime.blocked，设置页（浏览器 / 老 PowerShell 窗口）只读不清。
+   * 规则只此一份，别在别处再抄第二遍。
+   */
+  function blockedReasons(now = Date.now()) {
     const openLoops = state.loops.filter((l) => l.status === 'open')
     const muted = typeof state.control.mutedUntil === 'string' &&
       (parseTime(state.control.mutedUntil) ?? 0) > now
@@ -1465,7 +1487,6 @@ export function apply(ctx, rawConfig) {
     const dayLeft = Math.max(0, config.maxPerDay - dayCount)
     const hourLeft = Math.max(0, config.maxPerHour - hourCount)
 
-    // 现在为什么不会发 —— 把能判断的都跑一遍，面板直接摊开给他看
     const blocked = []
     /* 2026-10-28 修：原来只认 state.control.enabled（运行期开关），
        而设置页那个「启用活人感」写的是 config.enabled —— 于是那个勾选框是死的。
@@ -1512,6 +1533,35 @@ export function apply(ctx, rawConfig) {
     if (lastPro !== null && now - lastPro < cooldownMs) {
       blocked.push(`冷却中，还要 ${Math.max(1, Math.ceil((cooldownMs - (now - lastPro)) / 60_000))} 分钟`)
     }
+    return blocked
+  }
+
+  /** 每跳把上面那串原因连同时间戳落进 state —— 设置页读它。 */
+  function refreshRuntimeBlocked(now = Date.now()) {
+    try {
+      state.runtime = { at: new Date(now).toISOString(), blocked: blockedReasons(now) }
+    } catch (err) {
+      state.runtime = {
+        at: new Date(now).toISOString(),
+        blocked: [`（心跳算原因时出错了：${err instanceof Error ? err.message : String(err)}）`],
+      }
+    }
+  }
+
+  function collectState() {
+    const now = Date.now()
+    const openLoops = state.loops.filter((l) => l.status === 'open')
+    const muted = typeof state.control.mutedUntil === 'string' &&
+      (parseTime(state.control.mutedUntil) ?? 0) > now
+    const stopUntil = parseTime(state.control.dayQuotaSuspendedUntil)
+    const stopToday = stopUntil !== null && now < stopUntil
+    const dayCount = Number(state.quota.dayCount) || 0
+    const hourCount = Number(state.quota.hourCount) || 0
+    const dayLeft = Math.max(0, config.maxPerDay - dayCount)
+    const hourLeft = Math.max(0, config.maxPerHour - hourCount)
+
+    // 现在为什么不会发 —— 跟心跳写进 state.runtime 的是同一份规则、同一个函数
+    const blocked = blockedReasons(now)
 
     return {
       ok: true,
