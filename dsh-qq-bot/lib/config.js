@@ -18,6 +18,23 @@ export const DEFAULTS = Object.freeze({
   /** bot 自己的 QQ 号，用来过滤自己发的消息。 */
   selfId: '',
 
+  /**
+   * 跟着宿主一起启停 SnowLuma（2026-10-30 补成真键）。
+   *
+   * 原来 `startSnowLuma()` 里已经写了 `config.snowLumaAutoStart === false` 的
+   * 判断，可 config.js **从来没解析过这个键** —— parseConfig 是照着已知字段
+   * 重建对象的，未知键直接丢。于是写进 config.json 也没人读，
+   * `=== false` 永远不成立，等于根本没有这个开关。
+   *
+   * 现在它是真键：false = DSH 启动时不拉协议端（没拉起过，退出时也就不会关它）。
+   */
+  snowLumaAutoStart: true,
+  /**
+   * SnowLuma 目录。空串 = 数据目录的同级 `SnowLuma/`（和以前一样）。
+   * 同样是 2026-10-30 补的：`snowLumaDir()` 一直在读这个键，可它以前也不存在。
+   */
+  snowLumaDir: '',
+
   /** 总开关。false = 不连接、不转发。 */
   enabled: true,
   /** true = 走到发送那一步只打日志，不真发。 */
@@ -352,6 +369,10 @@ export function parseConfig(raw) {
     accessToken,
     allowUsers,
     selfId: String(input.selfId ?? '').trim(),
+    /* 2026-10-30：这两个以前只出现在 index.js 里，config.js 从没解析过它们。
+       所以「随宿主启停」「SnowLuma 目录」两个开关一直是死的。 */
+    snowLumaAutoStart: input.snowLumaAutoStart !== false,
+    snowLumaDir: typeof input.snowLumaDir === 'string' ? input.snowLumaDir.trim() : '',
 
     enabled: input.enabled !== false,
     dryRun: input.dryRun === true,

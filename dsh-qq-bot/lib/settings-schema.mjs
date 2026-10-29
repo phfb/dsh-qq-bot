@@ -38,6 +38,21 @@ export const BOT_GROUPS = [
         placeholder: '留空也能连（看服务端配没配）',
         hint: '和 SnowLuma 该账号的 token 一致；留空也能连（看服务端配没配）',
       },
+      {
+        key: 'snowLumaAutoStart',
+        path: 'snowLumaAutoStart',
+        label: '跟着 DSH 一起启停 SnowLuma',
+        type: 'bool',
+        hint: '关掉 = DSH 启动时不再拉起 SnowLuma，退出时也不会关它（协议端你自己管）',
+      },
+      {
+        key: 'snowLumaDir',
+        path: 'snowLumaDir',
+        label: 'SnowLuma 目录',
+        type: 'text',
+        placeholder: '留空 = 数据目录同级的 SnowLuma\\',
+        hint: '留空就用 <数据目录> 同级的 SnowLuma\\；找不到 node.exe / index.mjs 时只记一条 WARN，不会拉',
+      },
     ],
   },
   {

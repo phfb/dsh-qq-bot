@@ -39,6 +39,20 @@
 测试：`node --test` 207 条全绿，新增 `test/inbound-fallbacks.test.mjs` 19 条，
 把上面每一条「不许再沉默」的断言都钉住。
 
+### 修复：`snowLumaAutoStart` / `snowLumaDir` 两个开关是死的
+
+`startSnowLuma()` 里 2026-10-28 就写好了「`config.snowLumaAutoStart === false` 就别拉」，
+`snowLumaDir()` 也一直在读 `config.snowLumaDir` —— 可 `config.js` 的 `parseConfig()`
+是照已知字段重建对象的，**这两个键从来没被解析过**，写进 `config.json` 直接被丢掉。
+于是 `=== false` 永远不成立：想关掉「随宿主启停」根本没地方关。
+
+- `dsh-qq-bot/lib/config.js`：`DEFAULTS` 补 `snowLumaAutoStart: true` / `snowLumaDir: ''`，
+  `parseConfig` 补两行解析（`snowLumaAutoStart` 只认布尔 false，写成字符串 `"false"`
+  仍按开着算，免得手改 json 时反而悄悄关掉）
+- `dsh-qq-bot/lib/settings-schema.mjs`：连接组补这两项，面板上能看见、能改、能落盘
+- 测试：新增 `test/snowluma-autostart.test.mjs` 7 条（默认值 / 解析 / 面板表 /
+  `pickPersistable` 落盘 / 端到端）；面板渲染断言从 48 项改成 50 项
+
 ## [1.0.3] - 2026-10-29
 
 ### 新增：活人感那一页把独立设置窗口的内容全搬过来了
