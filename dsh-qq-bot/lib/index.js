@@ -3017,6 +3017,42 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /** tid → 它属于哪个空间（'me' 我这号 / 'owner' 他的号）。2026-10-31 加。 */
+  const tidSpaceCache = new Map()
+
+  /** 列表返回值里有没有这个 tid。结构可能是数组，也可能裹在 msglist / data.msglist 里。 */
+  function listHasTid(data, tid) {
+    const list = Array.isArray(data) ? data : (data?.msglist ?? data?.data?.msglist ?? [])
+    return Array.isArray(list) && list.some((m) => String(m?.tid ?? '') === tid)
+  }
+
+  /**
+   * 认一条说说是谁的：先翻我这号的列表，再翻他的列表。
+   *
+   * 为什么要有这一步：comment_qzone / like_qzone 都在 TARGET_CLAMPED 里，
+   * 一旦带上 target_uin 就会被钉成「他的号」。要是这条说说其实是我自己发的，
+   * 拿他的号去找这个 tid 必然找不到，服务端只回一句「该条内容已被删除」——
+   * 那个提示会把人带到「内容没了」的错方向上去（2026-10-31 踩过）。
+   *
+   * 两边都翻不到（比如刚发完还没进列表）就按「他的空间」处理，跟旧行为一致。
+   */
+  async function resolveTidSpace(tid, selfUin, owner) {
+    if (tidSpaceCache.has(tid)) return tidSpaceCache.get(tid)
+    let space = ''
+    const selfList = await callOneBot('get_qzone_msg_list', { pos: 0, num: 20 })
+    if (selfList.ok && listHasTid(selfList.data, tid)) {
+      space = 'me'
+    } else {
+      const p = { pos: 0, num: 20 }
+      if (String(owner) !== '' && String(owner) !== String(selfUin)) p.target_uin = Number(owner)
+      const ownerList = await callOneBot('get_qzone_msg_list', p)
+      if (ownerList.ok && listHasTid(ownerList.data, tid)) space = 'owner'
+    }
+    const result = space === '' ? 'owner' : space
+    tidSpaceCache.set(tid, result)
+    return result
+  }
+
   /** 接口返回值压成一段文本（太长就截断，别把上下文撑爆）。 */
   function jsonForModel(value, max = 4000) {
     try {
@@ -3181,7 +3217,8 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
             uin: {
               type: 'string',
               description:
-                '看谁的空间（list/detail/like/comment 用）。省略 = 他的（默认）；"me" = 我这号（挂载 bot 那个号）；也可以给具体数字号。',
+                '看谁的空间。省略 = 他的（默认）；"me" = 我这号（挂载 bot 那个号）；也可以给具体数字号。' +
+                'comment / like 会自动判断这条说说是谁的，一般不用传；显式传了就照传的走。',
             },
             tid: { type: 'string', description: '说说 id（detail/like/comment 用）。' },
             content: { type: 'string', description: '发说说或评论的正文（post/comment 用）。' },
@@ -3231,7 +3268,14 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
           if (act === 'detail') {
             const tid = String(args?.tid ?? '').trim()
             if (tid === '') return { ok: false, note: 'detail 要给 tid。', json: '' }
-            const r = await callOneBot('get_qzone_msg_detail', withTarget({ tid, pos: 0, num }))
+            // 跟 comment / like 一样认门：不然读自己那条说说会回「内容已被删除」，评论也就读不到。
+            const space = rawUin !== '' ? (wantMe ? 'me' : 'owner') : await resolveTidSpace(tid, selfUin, ownerUin())
+            const params = { tid, pos: 0, num }
+            if (space !== 'me') {
+              const owner = String(ownerUin())
+              if (owner !== '' && owner !== selfUin) params.target_uin = Number(owner)
+            }
+            const r = await callOneBot('get_qzone_msg_detail', params)
             return r.ok ? { ok: true, note: '', json: jsonForModel(r.data) } : { ok: false, note: r.note, json: '' }
           }
 
@@ -3273,7 +3317,12 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
           if (act === 'like') {
             const tid = String(args?.tid ?? '').trim()
             if (tid === '') return { ok: false, note: 'like 要给 tid。', json: '' }
-            const params = withTarget({ tid })
+            const space = rawUin !== '' ? (wantMe ? 'me' : 'owner') : await resolveTidSpace(tid, selfUin, ownerUin())
+            const params = { tid }
+            if (space !== 'me') {
+              const owner = String(ownerUin())
+              if (owner !== '' && owner !== selfUin) params.target_uin = Number(owner)
+            }
             const r = await callOneBot('like_qzone', params)
             return r.ok ? { ok: true, note: '', json: '赞了' } : { ok: false, note: r.note, json: '' }
           }
@@ -3282,7 +3331,13 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
             const tid = String(args?.tid ?? '').trim()
             const content = String(args?.content ?? '').trim()
             if (tid === '' || content === '') return { ok: false, note: 'comment 要 tid 和 content。', json: '' }
-            const params = withTarget({ tid, content })
+            // 这条说说是谁的，就往谁的空间里评：自己号不带 target_uin，他的号带上。
+            const space = rawUin !== '' ? (wantMe ? 'me' : 'owner') : await resolveTidSpace(tid, selfUin, ownerUin())
+            const params = { tid, content }
+            if (space !== 'me') {
+              const owner = String(ownerUin())
+              if (owner !== '' && owner !== selfUin) params.target_uin = Number(owner)
+            }
             const r = await callOneBot('comment_qzone', params)
             return r.ok ? { ok: true, note: '', json: '评论发出去了' } : { ok: false, note: r.note, json: '' }
           }
