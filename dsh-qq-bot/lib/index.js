@@ -57,6 +57,7 @@ import { isFarewell, shouldStopHere } from './goodnight.mjs'
 import { judgeTurnSilence } from './silence.mjs'
 import { judgeWatchdog } from './watchdog.mjs'
 import { isDuplicateMessage } from './dedupe.mjs'
+import { ROTATE_ACTION, evaluate, parseState, parseSwitchEvent, shortUrl } from './node-rotate.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -895,6 +896,15 @@ export function apply(ctx, rawConfig) {
     sessions.set(uin, { sessionId: realId, agent, handle, createdAt: new Date().toISOString(), generation: gen })
     saveMap()
     writeLog('INFO', `已切到新对话 ${realId}（第 ${gen} 局）`)
+    // 新的一局：用量门槛、轮次窗口、基线节点全部归零。
+    // 不归零的话新局一上来就继承旧局攒的几千万 token，节点一动就又被换掉。
+    // （这些变量声明在本函数后面，但只有运行时才会走到这儿，没有 TDZ 问题。）
+    nodeGenTokens = 0
+    nodeTurnNodes = []
+    nodeBaselineUrl = ''
+    nodePending = null
+    nodeLastVerdict = ''
+    saveNodeRotateState()
     void applyTaskEffort(realId, '换局后')
     return true
   }
@@ -924,6 +934,275 @@ export function apply(ctx, rawConfig) {
       rollingOver.delete(uin)
     }
   }
+
+  /* ── 节点池切换 → 自动换新对话（方案 2 + 3，2026-11-02） ──
+
+     换节点 = 换 prompt 缓存池。但 A-B-A 切回来时原节点那边的缓存还在
+     （实测切走前 hit=48512 → 切回第一次 30208 → 第二次 64640），所以
+     「一切就换」是错的，会把那份缓存白白废掉。
+
+     现在分两步：
+
+       第一步（发现）：node-pool.mjs 每次真改了 baseURL 就写一份
+         node-switch.json（seq 递增）。seq 一涨就记成 pending，只记一次。
+
+       第二步（评估）：每一轮结束重新判一次 pending ——
+         · 这局累计 token 没到门槛（默认 50M）→ 不换，短会话重算也就几万
+         · 当前节点又回到这局开工时那个 → 不换，缓存能接回
+         · 连续 N 轮都在新节点上 → 换（真留下来了）
+         · 最近 X 轮里够 M 轮在新节点上 → 换（来回抖，大半时间不在原节点）
+         · 都不满足 → pending 挂着，下一轮再看
+
+     落盘的东西：lastSeq（重载后不重放历史切换）、baselineUrl（这局开工
+     在哪）、genTokens（这局累计用量）、turnNodes（最近几轮各在哪）、
+     pending（正在观察哪次切换）。 */
+
+  let nodeSwitchTimer = null
+  let nodeSwitchLastSeq = 0
+  let nodeSwitchLastAt = 0
+  let nodeSwitchRunning = false
+  /** 这局开工时跑在哪个 baseURL（第一次切换时用事件的 from 补上）。 */
+  let nodeBaselineUrl = ''
+  /** 这局累计 token 用量（跟界面上那个 "62.6M tok" 一个口径）。 */
+  let nodeGenTokens = 0
+  /** 最近几轮各自跑在哪个 baseURL。 */
+  let nodeTurnNodes = []
+  /** 正在观察的那次切换。null = 没有待决。 */
+  let nodePending = null
+  /** 上一次评估的结论，用来给日志去重（不然每轮刷一行）。 */
+  let nodeLastVerdict = ''
+  const NODE_TURN_NODES_MAX = 64
+
+  /** 切换事件文件 —— 路径必须和 node-pool.mjs 的 SWITCH_FILE 对得上。 */
+  function resolveNodeSwitchPath() {
+    const given = typeof config.nodeSwitchStatePath === 'string' ? config.nodeSwitchStatePath : ''
+    if (given !== '') return given
+    const home = process.env.DSH_HOME || 'C:\\DSH\\dsh-home'
+    return join(home, 'llm-deepseek', 'node-pool', 'node-switch.json')
+  }
+
+  const nodeRotateStateFile = join(DATA_DIR, 'node-rotate-state.json')
+
+  function loadNodeRotateState() {
+    const st = parseState(readJsonFile(nodeRotateStateFile))
+    nodeSwitchLastSeq = st.lastSeq
+    nodeSwitchLastAt = st.lastAt
+    nodeBaselineUrl = st.baselineUrl
+    nodeGenTokens = st.genTokens
+    nodeTurnNodes = st.turnNodes
+    nodePending = st.pending
+  }
+
+  function saveNodeRotateState() {
+    try {
+      writeFileSync(
+        nodeRotateStateFile,
+        `${JSON.stringify(
+          {
+            lastSeq: nodeSwitchLastSeq,
+            lastAt: nodeSwitchLastAt,
+            baselineUrl: nodeBaselineUrl,
+            genTokens: nodeGenTokens,
+            turnNodes: nodeTurnNodes,
+            pending: nodePending,
+            updatedAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        )}\n`,
+        'utf8',
+      )
+    } catch (err) {
+      writeLog('WARN', `节点换局状态落盘失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /** 当前生效的 baseURL —— node-switch.json 最新那条的 to。 */
+  function currentNodeUrl() {
+    const ev = parseSwitchEvent(readJsonFile(resolveNodeSwitchPath()))
+    return ev === null ? '' : ev.to
+  }
+
+  /** 第一步：发现新切换就记成 pending。 */
+  function ingestNodeSwitch() {
+    const ev = parseSwitchEvent(readJsonFile(resolveNodeSwitchPath()))
+    if (ev === null || ev.seq <= nodeSwitchLastSeq) return false
+    nodeSwitchLastSeq = ev.seq
+    // 第一次见到切换时，才知道这局是打哪个节点上开工的
+    if (nodeBaselineUrl === '' && ev.from !== '') nodeBaselineUrl = ev.from
+    nodePending = { seq: ev.seq, from: ev.from, to: ev.to, at: ev.at }
+    nodeLastVerdict = ''
+    saveNodeRotateState()
+    writeLog(
+      'INFO',
+      `节点切换 seq=${ev.seq}：${shortUrl(ev.from)} -> ${shortUrl(ev.to)}，开始观察（门槛 ${config.nodeSwitchRotateMinTokens} token）`,
+    )
+    return true
+  }
+
+  /** 第二步：判一次；够条件就换局。 */
+  async function evaluateNodeSwitch() {
+    if (!config.rotateOnNodeSwitch) return
+    if (nodeSwitchRunning) return
+    if (nodePending === null) return
+
+    const verdict = evaluate({
+      pending: nodePending,
+      baselineUrl: nodeBaselineUrl,
+      turnNodes: nodeTurnNodes,
+      genTokens: nodeGenTokens,
+      minTokens: config.nodeSwitchRotateMinTokens,
+      streakN: config.nodeSwitchRotateStreak,
+      windowX: config.nodeSwitchRotateWindow,
+      windowM: config.nodeSwitchRotateWindowHits,
+      cooldownMs: Math.max(0, Number(config.nodeSwitchRotateMinIntervalSec) || 0) * 1000,
+      lastRotateAt: nodeSwitchLastAt,
+      now: Date.now(),
+    })
+
+    if (verdict.action === ROTATE_ACTION.NOOP) return
+
+    // 切回原节点了：缓存能接回，pending 作废，轮次记录也清掉
+    if (verdict.action === ROTATE_ACTION.BACK_TO_BASELINE) {
+      writeLog('INFO', `节点换局：${verdict.reason}`)
+      nodePending = null
+      nodeTurnNodes = []
+      nodeLastVerdict = ''
+      saveNodeRotateState()
+      return
+    }
+
+    if (verdict.action !== ROTATE_ACTION.ROTATE) {
+      // 用量不够 / 冷却 / 还没攒够 —— 同一结论只记一次，别每轮刷屏
+      const key = `${nodePending.seq}:${verdict.action}`
+      if (nodeLastVerdict !== key) {
+        nodeLastVerdict = key
+        writeLog('INFO', `节点换局：${verdict.reason}，先不换`)
+      }
+      return
+    }
+
+    const targets = [...sessions.entries()].filter(
+      ([, record]) => record && typeof record.sessionId === 'string' && record.sessionId !== '',
+    )
+    if (targets.length === 0) return
+
+    if (config.dryRun) {
+      const key = `${nodePending.seq}:dry-run`
+      if (nodeLastVerdict !== key) {
+        nodeLastVerdict = key
+        writeLog('INFO', `节点换局：${verdict.reason} —— 但 dryRun 开着，只记账不换`)
+      }
+      return
+    }
+
+    nodeSwitchRunning = true
+    try {
+      writeLog('INFO', `节点换局：${verdict.reason} —— 开始换新对话（${targets.length} 个会话）`)
+      for (const [uin, record] of targets) {
+        if (rollingOver.has(uin)) {
+          writeLog('WARN', `${uin} 正在换局，跳过这次节点换局`)
+          continue
+        }
+        rollingOver.add(uin)
+        try {
+          const ok = await rolloverSession(
+            uin,
+            record,
+            { used: 0, limit: resolveContextWindow(), percent: 0 },
+            { why: `节点换局（${verdict.reason}）`, notify: config.nodeSwitchRotateNotice },
+          )
+          if (ok) rolloverAt.set(uin, Date.now())
+        } catch (err) {
+          writeLog('ERROR', `${uin} 节点换局失败：${err instanceof Error ? err.message : String(err)}`)
+        } finally {
+          rollingOver.delete(uin)
+        }
+      }
+      nodeSwitchLastAt = Date.now()
+      nodePending = null
+      nodeLastVerdict = ''
+      saveNodeRotateState()
+    } finally {
+      nodeSwitchRunning = false
+    }
+  }
+
+  /** 一轮结束：记下这轮跑在哪个节点。 */
+  function recordTurnNode() {
+    const url = currentNodeUrl()
+    nodeTurnNodes.push({ at: Date.now(), url })
+    if (nodeTurnNodes.length > NODE_TURN_NODES_MAX) {
+      nodeTurnNodes = nodeTurnNodes.slice(-NODE_TURN_NODES_MAX)
+    }
+    if (nodeBaselineUrl === '' && url !== '') nodeBaselineUrl = url
+    saveNodeRotateState()
+  }
+
+  /** 累加这一轮的 token 用量（口径跟界面上那个总 tok 一致）。 */
+  function accumulateNodeTokens(usage) {
+    if (usage === null || typeof usage !== 'object') return
+    const total = Number(usage.totalTokens)
+    if (Number.isFinite(total) && total > 0) {
+      nodeGenTokens += total
+      return
+    }
+    const sum =
+      (Number(usage.inputTokens) || 0) + (Number(usage.cacheReadTokens) || 0) + (Number(usage.outputTokens) || 0)
+    if (sum > 0) nodeGenTokens += sum
+  }
+
+  function startNodeSwitchTimer() {
+    if (nodeSwitchTimer !== null) return
+    if (!config.rotateOnNodeSwitch) {
+      writeLog('INFO', '节点换局：关着（rotateOnNodeSwitch=false）')
+      return
+    }
+    loadNodeRotateState()
+    writeLog(
+      'INFO',
+      `节点换局：已启动（每 30 秒看一次 ${resolveNodeSwitchPath()}；` +
+        `门槛 ${config.nodeSwitchRotateMinTokens} token；` +
+        `连续 ${config.nodeSwitchRotateStreak} 轮 或 最近 ${config.nodeSwitchRotateWindow} 轮里 ${config.nodeSwitchRotateWindowHits} 轮；` +
+        `冷却 ${config.nodeSwitchRotateMinIntervalSec} 秒；上次 seq=${nodeSwitchLastSeq}）`,
+    )
+    nodeSwitchTimer = setInterval(() => {
+      void (async () => {
+        try {
+          ingestNodeSwitch()
+          await evaluateNodeSwitch()
+        } catch (err) {
+          writeLog('WARN', `节点换局调度出错：${err instanceof Error ? err.message : String(err)}`)
+        }
+      })()
+    }, 30_000)
+  }
+
+  function stopNodeSwitchTimer() {
+    if (nodeSwitchTimer === null) return
+    clearInterval(nodeSwitchTimer)
+    nodeSwitchTimer = null
+  }
+
+  /**
+   * 观察窗口：每轮结束记一次「这轮跑在哪个节点」，每条 assistant/message 累一次 token。
+   * 只认 QQ 会话，GUI 和子代理一个字都不记。
+   */
+  const offNodeSwitchTurns = ctx.on('session/event', (session, event) => {
+    if (!config.rotateOnNodeSwitch) return
+    const uin = uinForSession(session?.id)
+    if (uin === null) return
+    if (event?.type === 'assistant/message') {
+      accumulateNodeTokens(event?.data?.message?.usage)
+      return
+    }
+    if (event?.type === 'turn/end') {
+      recordTurnNode()
+      void evaluateNodeSwitch().catch((err) => {
+        writeLog('WARN', `节点换局评估出错：${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
+  })
 
   /* ── QQ 里的本地命令（不送进 agent）── */
 
@@ -3232,7 +3511,8 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
               type: 'string',
               description: 'autoImages 时想要的画面描述，一两句就够（post 用）。',
             },
-            num: { type: 'number', description: '取几条，默认 10。' },
+            num: { type: 'number', description: '取几条，默认 10，上限 100。' },
+            pos: { type: 'number', description: '从第几条开始（list 用，默认 0）。翻历史就往上加 num 的整数倍。' },
             ugc_right: { type: 'number', description: '可见范围：1=所有人 4=好友 64=仅自己。默认 1。' },
           },
         },
@@ -3257,11 +3537,15 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
             return params
           }
           const num = Number.isFinite(Number(args?.num))
-            ? Math.max(1, Math.min(50, Number(args.num)))
+            ? Math.max(1, Math.min(100, Number(args.num)))
             : 10
+          // 2026-10-31：pos 原来写死 0，等于只能从头往下取一段，翻不动历史。放出来给翻页用。
+          const pos = Number.isFinite(Number(args?.pos))
+            ? Math.max(0, Math.round(Number(args.pos)))
+            : 0
 
           if (act === 'list') {
-            const r = await callOneBot('get_qzone_msg_list', withTarget({ pos: 0, num }))
+            const r = await callOneBot('get_qzone_msg_list', withTarget({ pos, num }))
             return r.ok ? { ok: true, note: '', json: jsonForModel(r.data) } : { ok: false, note: r.note, json: '' }
           }
 
@@ -4085,6 +4369,7 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
     startDiaryTimer()
   startPollTimer()
   startWatchdog()
+  startNodeSwitchTimer()
 
   /* ── 清理：插件卸载 / 重载时全部拆掉 ── */
   ctx.effect(() => () => {
@@ -4093,6 +4378,8 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
       stopDiaryTimer()
       stopPollTimer()
       stopWatchdog()
+      stopNodeSwitchTimer()
+      offNodeSwitchTurns?.()
       offSession?.()
       offLocalCommands?.()
       offSessionTicks?.()

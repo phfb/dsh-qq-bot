@@ -109,8 +109,21 @@ test('QQ 面板渲染：11 组、50 个字段，缺的组都回来了', () => {
   }
 
   const fieldKeys = inner.map((n) => n._path).filter((p) => typeof p === 'string')
-  assert.equal(new Set(fieldKeys).size, 50, `字段数不对：${new Set(fieldKeys).size}`)
-  for (const must of ['qzoneDiaryEnabled', 'qzonePollTriggerPercent', 'watchdogSeconds', 'selfId', 'allowUsers']) {
+  // 2026-11-02：50 → 56，新增 6 个「换节点换新对话」的字段
+  assert.equal(new Set(fieldKeys).size, 56, `字段数不对：${new Set(fieldKeys).size}`)
+  for (const must of [
+    'qzoneDiaryEnabled',
+    'qzonePollTriggerPercent',
+    'watchdogSeconds',
+    'selfId',
+    'allowUsers',
+    'rotateOnNodeSwitch',
+    'nodeSwitchRotateMinTokens',
+    'nodeSwitchRotateStreak',
+    'nodeSwitchRotateWindow',
+    'nodeSwitchRotateWindowHits',
+    'nodeSwitchRotateMinIntervalSec',
+  ]) {
     assert.ok(fieldKeys.includes(must), `面板里缺了字段 ${must}`)
   }
 })

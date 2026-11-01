@@ -111,6 +111,37 @@ export const DEFAULTS = Object.freeze({
    * 说「上下文快满了哦」只会误导人（2026-10-27 实测过一次：明明只有 12%，却在喊快满了）。
    */
   stuckRolloverNotice: '脑子宕机了，重启一下...\n咱继续。',
+
+  /**
+   * 节点池切换后自动开新对话。
+   *
+   * 由来（2026-11-02）：探测脚本 node-pool.mjs 在 baseURL 变化时会写
+   * `node-switch.json`（seq 递增）。节点一换，上游的 prompt 缓存池就换了。
+   * 但 A-B-A 切回来时原节点的缓存还在，所以不是「一切就换」，而是先观察，
+   * 满足下面几个条件才换（见 lib/node-rotate.mjs）。
+   *
+   * 关掉：rotateOnNodeSwitch: false。
+   */
+  rotateOnNodeSwitch: true,
+  /** 切换事件文件路径。空串 = 默认 <DSH_HOME>/llm-deepseek/node-pool/node-switch.json */
+  nodeSwitchStatePath: '',
+  /** 因为换节点而换局时，在 QQ 里说的那句。 */
+  nodeSwitchRotateNotice: '网路那边换节点了，我换一局重新接上你。\n刚才聊的我都记得，接着来。',
+  /** 两次真换局之间的冷却（秒）。冷却期内发生的切换只记账、不换局。 */
+  nodeSwitchRotateMinIntervalSec: 300,
+  /**
+   * 这一局累计用掉多少 token 才值得换局（口径跟界面上那个「总 tok」一样，
+   * 不是当前上下文占用）。默认 5000 万 —— 只有跑到这个量级，全量重算才够贵，
+   * 换局丢掉的那段对话才划算。嫌它太钝就往下调。
+   */
+  nodeSwitchRotateMinTokens: 50_000_000,
+  /** 连续几轮都跑在新节点上，就认定"真留下来了"。 */
+  nodeSwitchRotateStreak: 3,
+  /** 观察窗口：看最近多少轮。 */
+  nodeSwitchRotateWindow: 8,
+  /** 窗口里有多少轮跑在新节点上就判定"大半时间不在原节点"。 */
+  nodeSwitchRotateWindowHits: 5,
+
   /**
    * 数据目录：会话映射、控制开关、表情闸门状态、日志全放这里。
    * 空串 = 默认落到 `<用户主目录>/.dsh-qq-bot`（插件首次启动时创建）。
@@ -414,6 +445,20 @@ export function parseConfig(raw) {
     stuckRolloverNotice: typeof input.stuckRolloverNotice === 'string' && input.stuckRolloverNotice.trim() !== ''
       ? input.stuckRolloverNotice
       : DEFAULTS.stuckRolloverNotice,
+    rotateOnNodeSwitch: input.rotateOnNodeSwitch !== false,
+    nodeSwitchStatePath: typeof input.nodeSwitchStatePath === 'string' ? input.nodeSwitchStatePath.trim() : '',
+    nodeSwitchRotateNotice: typeof input.nodeSwitchRotateNotice === 'string' && input.nodeSwitchRotateNotice.trim() !== ''
+      ? input.nodeSwitchRotateNotice
+      : DEFAULTS.nodeSwitchRotateNotice,
+    nodeSwitchRotateMinIntervalSec: num(input.nodeSwitchRotateMinIntervalSec, DEFAULTS.nodeSwitchRotateMinIntervalSec, { min: 0, max: 86_400 }),
+    nodeSwitchRotateMinTokens: Math.floor(
+      num(input.nodeSwitchRotateMinTokens, DEFAULTS.nodeSwitchRotateMinTokens, { min: 0, max: 1e10 }),
+    ),
+    nodeSwitchRotateStreak: Math.floor(num(input.nodeSwitchRotateStreak, DEFAULTS.nodeSwitchRotateStreak, { min: 1, max: 50 })),
+    nodeSwitchRotateWindow: Math.floor(num(input.nodeSwitchRotateWindow, DEFAULTS.nodeSwitchRotateWindow, { min: 1, max: 100 })),
+    nodeSwitchRotateWindowHits: Math.floor(
+      num(input.nodeSwitchRotateWindowHits, DEFAULTS.nodeSwitchRotateWindowHits, { min: 1, max: 100 }),
+    ),
     dataDir: typeof input.dataDir === 'string' ? input.dataDir.trim() : '',
     memesDir: typeof input.memesDir === 'string' && input.memesDir.trim() !== '' ? input.memesDir.trim() : '',
     commandPrefix: typeof input.commandPrefix === 'string' && input.commandPrefix.trim() !== '' ? input.commandPrefix.trim() : DEFAULTS.commandPrefix,
@@ -502,6 +547,14 @@ export function parseConfig(raw) {
   if (config.imageCachePurgeMB > config.imageCacheLimitMB) {
     problems.push(`imageCachePurgeMB（${config.imageCachePurgeMB}）大于上限 ${config.imageCacheLimitMB} MB，已压到上限`)
     config.imageCachePurgeMB = config.imageCacheLimitMB
+  }
+
+  // 窗口命中阈值不能超过窗口本身，否则这条判定永远不成立
+  if (config.nodeSwitchRotateWindowHits > config.nodeSwitchRotateWindow) {
+    problems.push(
+      `nodeSwitchRotateWindowHits（${config.nodeSwitchRotateWindowHits}）大于窗口 ${config.nodeSwitchRotateWindow} 轮，已压到窗口大小`,
+    )
+    config.nodeSwitchRotateWindowHits = config.nodeSwitchRotateWindow
   }
 
   return { config, problems }
