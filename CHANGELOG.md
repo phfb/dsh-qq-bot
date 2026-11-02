@@ -3,6 +3,56 @@
 这个仓库一次装两个插件：`dsh-qq-bot/`（QQ 私聊接入）和 `dsh-alive/`（活人感 / 主动开口）。
 版本号两边同步。
 
+## [1.0.8] - 2026-11-02
+
+### 改：情绪注入从 system prompt 挪到消息 —— 前缀缓存不再每轮作废
+
+情绪段（`alive-mood`）以前是 system prompt 的一个 section（order 4950），每轮 assemble 重算。
+百分比每浮动一次（84% → 83%），它后面的静态前缀和**整段对话历史**就全部失配，
+provider 的前缀缓存每轮从头重算。
+
+实测（一个 95 轮 / 9.2M token 的会话）：
+
+| 场景 | 命中率 |
+|---|---|
+| 每轮第一步（新消息 → 重算） | **0.4%**（input 21 万，cacheRead 768） |
+| 同一轮内后续 step（文本没变） | 99.9% |
+| 整局累计 | 17.9% |
+
+当时 system 的断点在第 18251 字符处 —— 前面记忆块已经做了会话级冻结，
+所以只剩情绪这一处在动，但它一处在动就够毁掉全部。
+
+**改法**：走 `agent/pre-step`，往请求末尾追加一条 user 消息。
+追加不破坏已有前缀 —— 这是官方 `@deepseek-ai/dsh-time-context` 处理
+「每轮都变的时间」用的同一套机制，它的 README 原话是
+"Append-only; ... does not invalidate existing KV Cache entries"。
+
+三个约束：
+
+1. 只在 `step === 1` 注入（否则一条消息里调 30 次工具就追加 30 条）
+2. 签名（主情绪 + 强度 + 语气）没变就不注入 —— 一个会话通常只说三五次
+3. `source.kind` 用 `dsh-alive`（DSH v4 拒收 `kind: 'plugin'`，只认 producer-owned kind）
+
+**顺带改的两处**：
+
+- 百分比换成三档强度词（轻 / 中 / 强）。提示里本来就写着「不必复述数字」，
+  模型要的是「多想要」这个量级，不是 84% 还是 79%。
+- `makeMoodMessage` 手搓消息对象，不 import `@deepseek-ai/dsh-llm` ——
+  插件是独立目录，靠宿主环境解析模块，实测 `ERR_MODULE_NOT_FOUND`。
+  `createUserMessage` 本体就三行（`{...input, role:'user', id: randomUUID()}` 再冻结）。
+
+**没动的**：情绪怎么算 ——`missing += 0.06 * hours` 随时间涨、`lustPhase: grow/decay`
+两个相位、`onTeased` 挑逗识别（正则快判 + 模型二次判断）、`scoreImpulse` / `checkGate`
+十二道闸和定时器，全部原样。改的只是「怎么告诉模型」。
+
+**效果**：每轮第一步 input 26 万 → 172，cacheRead 768 → 33 万，命中 99.9%。
+重启的代价只有一轮（system 重新组装），下一轮就回到 99.9%。
+
+**配置**：`moodInjectionMode`，`'system'` | `'message'`（默认）| `'off'`。
+填 `system` 就退回旧行为，一个字都不用改代码。
+
+测试：`node --test` 111/111 通过。
+
 ## [1.0.7] - 2026-11-02
 
 ### 新增：节点池切上游就开新对话（可关，默认门槛 5000 万 token）
