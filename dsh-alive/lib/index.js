@@ -801,6 +801,10 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  // 情绪走消息（message 模式）：在请求末尾追加一条，不碰 system prompt。
+  // 函数声明会提升，在 apply 里这个位置调用是安全的。
+  registerMoodPreStep()
+
   const offSession = ctx.on('session/event', (session, event) => {
     try {
       const at = Date.now()
@@ -893,53 +897,81 @@ export function apply(ctx, rawConfig) {
    * 只写「现在什么状态 + 该怎么说话」，不写具体事件 —— 事件由念头负责。
    * 情绪很淡（主情绪 < 25%）时返回空串，等于不注入，省 token 也不出戏。
    */
-  function renderMoodSection() {
-    if (config.moodInjection !== true) return ''
+  /** 情绪档位 → 强度词。三档，够用又不啰嗦。 */
+  function moodStrength(value) {
+    const v = Number(value) || 0
+    return v >= 0.75 ? '强' : v >= 0.5 ? '中' : '轻'
+  }
+
+  /** 主情绪 → 中文名。 */
+  const MOOD_NAME = {
+    missing: '想他',
+    jealousy: '吃醋',
+    warmth: '暖意',
+    worry: '担心',
+    boredom: '闲',
+    annoyance: '恼火',
+    lust: '涩涩',
+  }
+
+  /** 语气 → 该怎么说话。 */
+  const MOOD_TONE_LINE = {
+    clingy: '黏人、想贴着他，说话带点撒娇和「你都不理我」。',
+    pouty: '在闹小脾气，句子短一点、语气冷半分，等他来哄。',
+    warm: '心情很好，软、爱笑，愿意多说两句。',
+    worried: '有点放不下心，会追问他的状况，语气关切但不唠叨。',
+    light: '闲着没事，随口找话说，轻飘飘的那种。',
+    flirty: '有点想要他，主动、直白，但不硬来 —— 看场合收敛。',
+    sulky: '还堵着一口气，说话不客气但不会伤人，是闹不是骂。',
+    flat: '平常状态。',
+  }
+
+  /**
+   * 涩涩主导时额外追加的一段（2026-10-27 他要的）。
+   *
+   * 他的原话：「多一些动作和语气词，篇幅长一点，第一人称」。
+   * 只在 lust 当主情绪时加 —— 别的情绪下说一大段反而是负担。
+   */
+  const LUST_EXTRA =
+    '→ 这种时候可以多一些动作和语气词，篇幅放长一点，用第一人称写（我的手…／声音有点…／忍不住…），别只回一句短的。'
+
+  /**
+   * 渲一次情绪快照（2026-11-02 重构）。
+   *
+   * 返回 `{ text, signature }`；不值得注入时返回 `null`。
+   *
+   * **为什么要有 signature**：情绪注入以前每轮都写进 system prompt，system 一变，
+   * 它后面的静态前缀 + 全部对话历史全部失配，provider 的前缀缓存每轮全废
+   * （实测每轮第一步命中 0.4%，同一轮内多 step 才是 99%）。
+   * 改成「走消息」之后，只有在**档位真的变了**时才需要说一句，
+   * 而判断「变没变」就靠 signature：主情绪 + 强度 + 语气，三个一起比。
+   *
+   * 强度取代了原来的百分比数字 —— 提示里本来就写着「不必复述数字」，
+   * 模型要的是「多想要」这个量级，不是 84% 还是 79%。
+   */
+  function moodSnapshot() {
+    if (config.moodInjection !== true) return null
     try {
       const opts = { lust: lustConfig() }
       const top = moodModule.dominant(state.mood, opts)
-      if (top.key === 'calm') return ''
-      const pct = Math.round((Number(top.value) || 0) * 100)
+      if (top.key === 'calm') return null
+      const strength = moodStrength(top.value)
       const tone = moodModule.moodHintOf(state.mood, opts)
-      const TONE_LINE = {
-        clingy: '黏人、想贴着他，说话带点撒娇和「你都不理我」。',
-        pouty: '在闹小脾气，句子短一点、语气冷半分，等他来哄。',
-        warm: '心情很好，软、爱笑，愿意多说两句。',
-        worried: '有点放不下心，会追问他的状况，语气关切但不唠叨。',
-        light: '闲着没事，随口找话说，轻飘飘的那种。',
-        flirty: '有点想要他，主动、直白，但不硬来 —— 看场合收敛。',
-        sulky: '还堵着一口气，说话不客气但不会伤人，是闹不是骂。',
-        flat: '平常状态。',
-      }
-      const NAME = {
-        missing: '想他',
-        jealousy: '吃醋',
-        warmth: '暖意',
-        worry: '担心',
-        boredom: '闲',
-        annoyance: '恼火',
-        lust: '涩涩',
-      }
-      const label = NAME[top.key] ?? top.key
-
-      /**
-       * 涩涩主导时额外追加的一段（2026-10-27 他要的）。
-       *
-       * 他的原话：「多一些动作和语气词，篇幅长一点，第一人称」。
-       * 只在 lust 当主情绪时加 —— 别的情绪下说一大段反而是负担。
-       */
-      const LUST_EXTRA =
-        '→ 这种时候可以多一些动作和语气词，篇幅放长一点，用第一人称写（我的手…／声音有点…／忍不住…），别只回一句短的。'
+      const label = MOOD_NAME[top.key] ?? top.key
 
       const lines = [
-        `【你现在的心情】${label} ${pct}%（活人感插件自动给的，不必复述数字）`,
-        `→ ${TONE_LINE[tone] ?? TONE_LINE.flat}`,
+        `【你现在的心情】${label}·${strength}（活人感插件自动给的，不必复述数字）`,
+        `→ ${MOOD_TONE_LINE[tone] ?? MOOD_TONE_LINE.flat}`,
         // 2026-10-29：这段里的「他」指的是正在跟你说话的那个人。不写死这句，
         // 模型读完这段就会把「他」原样说出口（人格里明明定的是「说你」）。
         '（上面提到的「他」就是正在跟你说话的那个人；说出口一律叫「你」。）',
       ]
       if (top.key === 'lust') lines.push(LUST_EXTRA)
-      return lines.join('\n')
+
+      return {
+        text: lines.join('\n'),
+        signature: `${top.key}|${strength}|${tone}`,
+      }
     } catch (err) {
       // 2026-10-28：原来这里静默 return ''，情绪段渲染失败没有任何痕迹 ——
       // 表现就是「她突然没情绪了」，查无可查。每分钟最多报一次，别刷屏。
@@ -947,16 +979,96 @@ export function apply(ctx, rawConfig) {
         moodRenderWarnAt = Date.now()
         writeLog('WARN', `情绪段渲染失败（这一轮不注入情绪）：${err instanceof Error ? err.message : String(err)}`)
       }
-      return ''
+      return null
     }
+  }
+
+  /** 渲染情绪段（system 模式用；message 模式走 moodSnapshot）。 */
+  function renderMoodSection() {
+    return moodSnapshot()?.text ?? ''
   }
 
   /** 上次报「情绪段渲染失败」的时间：一分钟最多一条，别刷屏。 */
   let moodRenderWarnAt = 0
 
+  /** 每个 agent 上次注入过的那份签名（agent 重建 → 新对象 → 自然重新注入）。 */
+  const moodSignatures = new WeakMap()
+
+  /**
+   * 构造一条承载情绪的消息。
+   *
+   * 刻意**不 import `@deepseek-ai/dsh-llm`**：这个插件是独立目录（不是装进
+   * profile 的 node_modules 里），靠宿主环境解析模块，路径不稳。
+   * `createUserMessage` 的实体就三行（`{...input, role:'user', id: randomUUID()}` 再冻结），
+   * 照抄一遍比赌模块解析可靠。
+   *
+   * `source.kind` 必须是**生产者自己的名字**：DSH v4 会话格式拒收 `kind: 'plugin'`，
+   * 只认 producer-owned kind（qq-bot 那边踩过这个坑）。
+   */
+  function makeMoodMessage(text) {
+    const message = {
+      role: 'user',
+      id: randomUUID(),
+      content: [{ type: 'text', text }],
+      source: {
+        kind: name,
+        form: 'snapshot',
+        sections: [{ name: 'alive-mood', text }],
+      },
+    }
+    const freeze = (v) => {
+      if (v !== null && typeof v === 'object' && !Object.isFrozen(v)) {
+        Object.freeze(v)
+        for (const key of Object.keys(v)) freeze(v[key])
+      }
+      return v
+    }
+    return freeze(message)
+  }
+
+  /**
+   * 情绪走消息（2026-11-02）。
+   *
+   * 以前情绪段是 system prompt 的一个 section（order 4950），每轮 assemble 重算 ——
+   * 只要百分比动一下，它后面的静态前缀和**整段对话历史**就全部失配，
+   * provider 的前缀缓存每轮作废一次。
+   *
+   * 现在改成 `agent/pre-step` 里往请求末尾追加一条 user 消息：
+   * 追加不影响已有前缀（`@deepseek-ai/dsh-time-context` 就是这么处理"每轮都变的时间"的，
+   * 它的 README 原话是 "Append-only; ... does not invalidate existing KV Cache entries"）。
+   *
+   * 三个约束：
+   *   1. 只在 `step === 1` 注入 —— 不然一条消息里调 30 次工具就追加 30 条
+   *   2. 签名（主情绪 + 强度 + 语气）没变就不注入 —— 一个会话通常只会说三五次
+   *   3. 情绪计算（随时间涨、被挑逗顶）完全不在这里，照旧在心跳里跑
+   */
+  function registerMoodPreStep() {
+    if (config.moodInjection !== true) return
+    if (config.moodInjectionMode !== 'message') return
+    if (typeof ctx.on !== 'function') return
+    try {
+      ctx.on('agent/pre-step', async ({ agent, step, signal }, next) => {
+        const decision = await next()
+        if (decision?.kind === 'reject' || signal?.aborted === true) return decision
+        if (step !== 1) return decision
+        const snap = moodSnapshot()
+        if (snap === null) return decision
+        if (moodSignatures.get(agent) === snap.signature) return decision
+        moodSignatures.set(agent, snap.signature)
+        writeLog('INFO', `情绪走消息：${snap.signature}`)
+        return { ...decision, messages: [...decision.messages, makeMoodMessage(snap.text)] }
+      }, { prepend: true })
+      writeLog('INFO', '情绪改用消息注入（pre-step · 档位变了才说）')
+    } catch (err) {
+      writeLog('WARN', `注册情绪 pre-step 失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   /** 给这个 agent 注册情绪段（幂等；agent 重建会自动重新注册）。 */
   function ensureMoodSection(agent) {
     if (config.moodInjection !== true) return
+    // message 模式走 pre-step，不进 system prompt —— system 里一个字都不加。
+    if (config.moodInjectionMode === 'message') return
     if (!agent || typeof agent !== 'object') return
     if (moodFibers.has(agent)) return
     if (typeof agent.ctx?.inject !== 'function') return

@@ -99,11 +99,26 @@ export const DEFAULTS = Object.freeze({
   moodSnapshotIntervalMin: 5,
 
   /**
-   * 情绪注入：把当前情绪压成一两行进系统提示词，让她"知道自己现在什么状态"。
+   * 情绪注入：把当前情绪压成一两行，让她"知道自己现在什么状态"。
    *
    * 关掉的话情绪只用来打分（决定要不要主动开口），模型本身看不见 —— 说话语气不受影响。
    */
   moodInjection: true,
+
+  /**
+   * 情绪**注入到哪里**（2026-11-02 加）。
+   *
+   * - `'system'` —— 原来的做法：作为 system prompt 的一个 section，每轮重算。
+   *   缺点很硬：百分比动一下，它后面的静态前缀 + 全部对话历史跟着失配，
+   *   前缀缓存每轮全废（实测每轮第一步命中 0.4%）。
+   * - `'message'` —— 新做法（**默认**）：在 `agent/pre-step` 里往请求末尾追加一条
+   *   user 消息，只在「主情绪 / 强度 / 语气」变了的时候追加。
+   *   追加不破坏已有前缀，缓存命中回到 95%+。
+   * - `'off'` —— 两个都不做。
+   *
+   * 情绪**怎么算**（随时间涨、被挑逗顶、被拒绝积攒恼火）跟这个选项无关，三种模式完全一样。
+   */
+  moodInjectionMode: 'message',
 
   /**
    * 情绪驱动能不能突破「每小时 / 每天」配额。
@@ -236,6 +251,9 @@ export function parseConfig(raw) {
     lustTeaseStepPercent: num(input.lustTeaseStepPercent, DEFAULTS.lustTeaseStepPercent, { min: 0, max: 100 }),
     moodSnapshotIntervalMin: Math.round(num(input.moodSnapshotIntervalMin, DEFAULTS.moodSnapshotIntervalMin, { min: 1, max: 1440 })),
     moodInjection: input.moodInjection !== false,
+    moodInjectionMode: ['system', 'message', 'off'].includes(input.moodInjectionMode)
+      ? input.moodInjectionMode
+      : DEFAULTS.moodInjectionMode,
     emotionBypassQuota: input.emotionBypassQuota !== false,
     emotionBypassMaster: input.emotionBypassMaster === true,
     memeChancePercent: num(input.memeChancePercent, DEFAULTS.memeChancePercent, { min: 0, max: 100 }),
