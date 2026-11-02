@@ -977,7 +977,9 @@ export function apply(ctx, rawConfig) {
   function resolveNodeSwitchPath() {
     const given = typeof config.nodeSwitchStatePath === 'string' ? config.nodeSwitchStatePath : ''
     if (given !== '') return given
-    const home = process.env.DSH_HOME || 'C:\\DSH\\dsh-home'
+    // 兜底：DSH 没给 DSH_HOME 时，按用户目录推。别写死某台机器的绝对路径 ——
+    // 这个仓库是公开的，之前在里写死过一次，同步时才发现。
+    const home = process.env.DSH_HOME || join(homedir(), 'dsh-home')
     return join(home, 'llm-deepseek', 'node-pool', 'node-switch.json')
   }
 
@@ -2473,6 +2475,7 @@ export function apply(ctx, rawConfig) {
         at: new Date().toISOString(),
       })
       agent.followup(message)
+      rememberInbound(event.message_id, promptText)
       const tags = []
       if (collected.images.length > 0) tags.push(`图 ${collected.images.length}${nativeImages ? ' 原生' : ' 路径'}`)
       if (collected.files.length > 0) tags.push(`文件 ${collected.files.length}`)
@@ -2489,6 +2492,49 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /* ── 最近入站消息的 id → 原文（撤回时用） ──
+     OneBot 的 friend_recall 事件只带 message_id，不带内容。原来那句
+     「他把刚发的一条消息撤回了」因此永远是空指，她没法知道撤掉的是哪句。
+     这里留一个内存环形表，撤回事件一来就按 id 查回去。不写盘，重启即清。 */
+  const recentInbound = new Map()
+  const RECENT_INBOUND_MAX = 50
+
+  function rememberInbound(id, text) {
+    const key = String(id ?? '')
+    if (key === '' || text === '') return
+    recentInbound.delete(key)
+    recentInbound.set(key, text)
+    while (recentInbound.size > RECENT_INBOUND_MAX) {
+      const oldest = recentInbound.keys().next().value
+      recentInbound.delete(oldest)
+    }
+  }
+
+  /** 撤回：先查本地表，查不到再试一次 get_msg（部分实现撤回后短时间内还取得到）。 */
+  async function recallTextOf(messageId) {
+    const key = String(messageId ?? '')
+    if (key === '') return null
+    const cached = recentInbound.get(key)
+    if (cached !== undefined) return cached
+    try {
+      if (client !== null && typeof client.call === 'function') {
+        const res = await client.call('get_msg', { message_id: Number(key) })
+        const segs = res?.data?.message ?? res?.message ?? []
+        if (Array.isArray(segs)) {
+          const text = segs
+            .filter((s) => s?.type === 'text')
+            .map((s) => String(s?.data?.text ?? ''))
+            .join('')
+            .trim()
+          if (text !== '') return text
+        }
+      }
+    } catch {
+      /* 取不到就算了，退回原来那句话 */
+    }
+    return null
+  }
+
   /**
    * 社交事件（戳一戳 / 撤回 / 好友申请）：翻成一句话送进他的会话。
    *
@@ -2497,8 +2543,16 @@ export function apply(ctx, rawConfig) {
    * 这样也不会给陌生人开一个空会话出来。
    */
   async function handleSocialEvent(event) {
-    const text = socialEventToText(event, { selfUin: config.selfId })
+    let text = socialEventToText(event, { selfUin: config.selfId })
     if (text === null) return
+
+    // 撤回：把被撤掉的那条原文找回来，附在这句话后面
+    if (event?.post_type === 'notice' && event?.notice_type === 'friend_recall') {
+      const recalled = await recallTextOf(event?.message_id)
+      if (typeof recalled === 'string' && recalled !== '') {
+        text = `他把刚发的一条消息撤回了：「${recalled.slice(0, 200)}」`
+      }
+    }
 
     const owner = String(config.allowUsers[0] ?? '')
     if (owner === '') return
