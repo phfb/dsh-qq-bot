@@ -304,6 +304,35 @@ window.__ModuleLoader__.load({
         }).then(function () { setBusy(false) })
       }, [reload])
 
+      // 2026-11-03：整机重启。命令下到 Windows 的 shutdown.exe，
+      // 倒数期间还能用下面的「取消重启」拦下来。
+      var onRestartHost = useCallback(function () {
+        var ok = true
+        if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          ok = window.confirm(
+            '现在重启整机？\n\n'
+            + 'QQ / SnowLuma / DSH 会全部关掉，重启后由 hostguard 按顺序拉回来。\n'
+            + '手上没保存的东西先存一下。'
+          )
+        }
+        if (!ok) return
+        setBusy(true)
+        request('POST', '/hostguard', { action: 'restart' }).then(function (data) {
+          setMsg({ kind: 'warn', text: data.note || '已下重启指令' })
+        }).catch(function (err) {
+          setMsg({ kind: 'err', text: '重启失败：' + err.message })
+        }).then(function () { setBusy(false) })
+      }, [])
+
+      var onCancelRestart = useCallback(function () {
+        setBusy(true)
+        request('POST', '/hostguard', { action: 'cancel' }).then(function (data) {
+          setMsg({ kind: 'ok', text: data.note || '已撤销重启' })
+        }).catch(function (err) {
+          setMsg({ kind: 'err', text: '撤销失败：' + err.message })
+        }).then(function () { setBusy(false) })
+      }, [])
+
       if (form === null) {
         return h('div', { className: 'qqbot-wrap' },
           h('div', { className: 'qqbot-banner' },
@@ -341,7 +370,9 @@ window.__ModuleLoader__.load({
           h('button', { className: 'qqbot-btn', 'data-primary': '1', disabled: busy, onClick: onSave }, busy ? '处理中…' : '保存'),
           h('button', { className: 'qqbot-btn', disabled: busy, onClick: onReconnect }, '重新连接'),
           h('button', { className: 'qqbot-btn', disabled: busy, onClick: onResetSession }, '清空会话（换新一局）'),
-          h('button', { className: 'qqbot-btn', disabled: busy, onClick: reload }, '刷新状态')),
+          h('button', { className: 'qqbot-btn', disabled: busy, onClick: reload }, '刷新状态'),
+          h('button', { className: 'qqbot-btn', disabled: busy, onClick: onRestartHost }, '重启整机'),
+          h('button', { className: 'qqbot-btn', disabled: busy, onClick: onCancelRestart }, '取消重启')),
 
         msg !== null ? h('div', { className: 'qqbot-msg', 'data-kind': msg.kind }, msg.text) : null,
 

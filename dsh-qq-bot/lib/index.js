@@ -4275,6 +4275,44 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
             sendJson(res, outcome.ok ? 200 : 400, outcome)
             return
           }
+          /* 宿主守护：面板上的「立即重启整机 / 取消重启」（2026-11-03）
+             命令走 Windows 自己的 shutdown.exe —— 不自造重启逻辑，
+             这样 /a 能撤销、系统日志里也留得到记录。 */
+          if (route === '/hostguard' && req.method === 'POST') {
+            const body = await readBody(req)
+            const act = String(body?.action ?? '')
+            const shutExe = 'C:\\Windows\\System32\\shutdown.exe'
+            if (act === 'cancel') {
+              try {
+                const child = spawn(shutExe, ['/a'], { windowsHide: true, stdio: 'ignore' })
+                child.on('error', () => {})
+              } catch { /* 没排着也在撤销，Windows 自己会忽略 */ }
+              writeLog('INFO', '设置页撤销了关机')
+              sendJson(res, 200, { ok: true, note: '已撤销（如果本来就没事排着，Windows 会忽略）' })
+              return
+            }
+            if (act !== 'restart') {
+              sendJson(res, 400, { ok: false, error: `不认识的 action：${act}` })
+              return
+            }
+            const delay = Math.max(0, Math.min(3600, Number(config.hostGuardRestartDelaySec) || 60))
+            try {
+              const child = spawn(shutExe, ['/r', '/t', String(delay), '/f', '/c', 'DSH 面板手动重启'], {
+                windowsHide: true,
+                stdio: 'ignore',
+              })
+              child.on('error', (err) => writeLog('WARN', `下重启指令失败：${err.message}`))
+            } catch (err) {
+              sendJson(res, 500, { ok: false, error: `下重启指令失败：${err instanceof Error ? err.message : String(err)}` })
+              return
+            }
+            writeLog('WARN', `设置页要重启整机（${delay} 秒后）`)
+            sendJson(res, 200, {
+              ok: true,
+              note: `${delay} 秒后重启整机。这期间点「取消重启」还能拦下来。`,
+            })
+            return
+          }
           sendJson(res, 404, { ok: false, error: `未知接口 ${route}` })
         } catch (err) {
           sendJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) })
@@ -4425,6 +4463,71 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
   startWatchdog()
   startNodeSwitchTimer()
 
+  /* ── hostguard 保活（2026-11-03）────────────────────────────────────
+     宿主守护 hostguard.ps1 负责 QQ → SnowLuma → DSH 的按序拉起和定时重启。
+     但它自己只是个普通 powershell 进程：被谁顺手杀掉、或者宿主重启时被一起
+     带走，就再没人知道了 —— 今天 15:49 起来的那个（pid 11608）就是这么没的，
+     日志里连一行退出原因都没留。
+
+     所以倒过来加一环：它盯三个程序，这里盯它。
+     判断只看心跳：hostguard 每轮把 pid + 时间戳写进 hostguard-state.json，
+     超过 3 个检查周期没更新就当它死了，拉一个新的。
+
+     启动必须 detached + unref —— 新进程要脱离当前进程树，否则宿主一重启
+     就被一起带走了，那这个保活等于白写。 */
+
+  /** hostguard 目录：配置优先，留空就是数据目录的同级。 */
+  const hostGuardDir = config.hostGuardDir !== '' ? config.hostGuardDir : join(DATA_DIR, '..', 'hostguard')
+  const hostGuardStateFile = join(hostGuardDir, 'hostguard-state.json')
+  let hostGuardTimer = null
+
+  /** 心跳距今多少毫秒；状态文件不在或没心跳返回 Infinity。 */
+  function hostGuardBeatAgeMs() {
+    const raw = readJsonFile(hostGuardStateFile)
+    if (raw === null || typeof raw !== 'object') return Number.POSITIVE_INFINITY
+    const beat = Number(raw.heartbeat) || 0
+    if (beat <= 0) return Number.POSITIVE_INFINITY
+    return Date.now() - beat * 1000
+  }
+
+  function spawnHostGuard(reason) {
+    try {
+      const child = spawn(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', join(hostGuardDir, 'hostguard.ps1')],
+        { detached: true, stdio: 'ignore', windowsHide: true },
+      )
+      child.unref()
+      writeLog('INFO', `宿主守护：${reason}，已经拉起来（pid=${child.pid ?? '?'}）`)
+      return true
+    } catch (err) {
+      writeLog('WARN', `宿主守护：拉不起来 —— ${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+  }
+
+  function startHostGuardTimer() {
+    if (hostGuardTimer !== null) return
+    // 3 个检查周期没心跳才算死；最低 60 秒，免得检查间隔调得很小的时候误判
+    const pokeMs = Math.max(60_000, (Number(config.hostGuardIntervalSec) || 30) * 3000)
+    hostGuardTimer = setInterval(() => {
+      try {
+        if (config.hostGuardEnabled !== true) return
+        const age = hostGuardBeatAgeMs()
+        if (age < pokeMs) return
+        spawnHostGuard(
+          Number.isFinite(age) ? `心跳 ${Math.round(age / 1000)} 秒没更新` : '状态文件里没有心跳',
+        )
+      } catch (err) {
+        writeLog('WARN', `宿主守护保活出错：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }, pokeMs)
+    if (typeof hostGuardTimer.unref === 'function') hostGuardTimer.unref()
+    writeLog('INFO', `宿主守护保活：已启动（${Math.round(pokeMs / 1000)} 秒看一次心跳）`)
+  }
+
+  startHostGuardTimer()
+
   /* ── 清理：插件卸载 / 重载时全部拆掉 ── */
   ctx.effect(() => () => {
     try {
@@ -4433,6 +4536,10 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
       stopPollTimer()
       stopWatchdog()
       stopNodeSwitchTimer()
+      if (hostGuardTimer !== null) {
+        clearInterval(hostGuardTimer)
+        hostGuardTimer = null
+      }
       offNodeSwitchTurns?.()
       offSession?.()
       offLocalCommands?.()

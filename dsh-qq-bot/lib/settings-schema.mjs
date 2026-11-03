@@ -330,6 +330,83 @@ export const BOT_GROUPS = [
       { key: 'zeroTextNudge', path: 'zeroTextNudge', label: '正文为空时催她一句', type: 'bool', default: true },
       { key: 'logRotateMB', path: 'logRotateMB', label: '日志滚到多大换新文件（MB）', type: 'number', min: 0, max: 512, step: 1, decimals: 0 },
     ],
+  },
+  {
+    title: '宿主守护（开机拉起 + 定时重启）',
+    hint:
+      '这组给 hostguard.ps1 读（默认在数据目录的同级 hostguard\\ 下）。它是个独立进程，'
+      + '不跟着 DSH 一起死：QQ → SnowLuma → DSH 按顺序拉起，谁没了补谁，'
+      + '同一个目标连续拉不起来就放弃它，不再无脑刷。开关打开后最多 20 秒被守护读到。',
+    fields: [
+      {
+        key: 'hostGuardEnabled',
+        path: 'hostGuardEnabled',
+        label: '开启宿主守护',
+        type: 'bool',
+        hint: '关着 = 不检查、不拉起、不定时重启；守护进程本身还在，只是不动手',
+      },
+      {
+        key: 'hostGuardRestartTimes',
+        path: 'hostGuardRestartTimes',
+        label: '每天整机重启时间',
+        type: 'text',
+        placeholder: '04:00 或 04:00,16:00（留空 = 不重启）',
+        hint: '24 小时制，逗号分隔可以写多个。到点会先给一个倒数，期间可以 shutdown /a 取消',
+      },
+      {
+        key: 'hostGuardRestartDelaySec',
+        path: 'hostGuardRestartDelaySec',
+        label: '重启前倒数（秒）',
+        type: 'number',
+        min: 0,
+        max: 3600,
+        step: 10,
+        decimals: 0,
+        hint: '给正在处理的活留收尾时间，默认 60',
+      },
+      {
+        key: 'hostGuardRetryLimit',
+        path: 'hostGuardRetryLimit',
+        label: '连续拉几次就放弃（次）',
+        type: 'number',
+        min: 1,
+        max: 50,
+        step: 1,
+        decimals: 0,
+        hint: '对同一个目标。放弃后不再拉起它，日志里留一条 ERROR；三个都放弃守护就退出',
+      },
+      {
+        key: 'hostGuardIntervalSec',
+        path: 'hostGuardIntervalSec',
+        label: '多久查一遍（秒）',
+        type: 'number',
+        min: 5,
+        max: 3600,
+        step: 5,
+        decimals: 0,
+        hint: '默认 30。调小响应快，代价是每轮都要枚举一次进程',
+      },
+      {
+        key: 'hostGuardReadyTimeoutSec',
+        path: 'hostGuardReadyTimeoutSec',
+        label: '拉起后给多久启动（秒）',
+        type: 'number',
+        min: 20,
+        max: 1800,
+        step: 10,
+        decimals: 0,
+        hint: '这段时间里没看到进程不算失败，别把还在启动的 DSH 当成挂掉又拉一个，默认 150',
+      },
+      {
+        key: 'hostGuardDir',
+        path: 'hostGuardDir',
+        label: 'hostguard 目录',
+        type: 'text',
+        placeholder: '留空 = 数据目录同级的 hostguard\\',
+        hint: '装到别处才填。留空时插件按「数据目录的上一级 / hostguard」找它，'
+          + '和 hostguard.ps1 自己的默认位置一致',
+      },
+    ],
   }
 ];
 

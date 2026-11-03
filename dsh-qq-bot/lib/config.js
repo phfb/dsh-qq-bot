@@ -337,6 +337,43 @@ export const DEFAULTS = Object.freeze({
    * 只保留一份旧的 .1，不做 .1 .2 .3 那种堆叠 —— 那只会让人不知道该看哪个。
    */
   logRotateMB: 10,
+
+  /* ── 宿主守护（2026-11-03 加）────────────────────────────────── */
+
+  /**
+   * 宿主机常驻守护的总开关。
+   *
+   * 真正干活的是独立的 hostguard.ps1（不是本插件）—— 它必须活在插件外面，
+   * 否则 DSH 自己挂了看门狗跟着一起死，就没人拉 DSH 了。
+   * 这里只是把开关和参数写进 config.json 让它读到，插件自身不消费这几个键。
+   */
+  hostGuardEnabled: false,
+
+  /**
+   * 每天几点整机重启，24 小时制，逗号分隔：`04:00` 或 `04:00,16:00`。
+   * 默认凌晨 4 点（2026-11-03 他定的）。显式清空 = 不定时重启。
+   */
+  hostGuardRestartTimes: '04:00',
+
+  /** 同一个目标连续拉几次还不起来，就放弃它（不再无脑重启）。 */
+  hostGuardRetryLimit: 5,
+
+  /** 看门狗多久扫一遍（秒）。 */
+  hostGuardIntervalSec: 30,
+
+  /** 拉起一个程序后给它多久的就绪时间（秒），期间不判失败。 */
+  hostGuardReadyTimeoutSec: 150,
+
+  /** 整机重启前留多少秒收尾。 */
+  hostGuardRestartDelaySec: 60,
+
+  /**
+   * hostguard 所在目录。留空 = 数据目录的同级 `hostguard\`。
+   *
+   * 留空是常态：hostguard.ps1 和插件的数据目录摆在一起（`<dataDir>\..\hostguard`），
+   * 绝大多数部署都是这个形状。装到别处才需要填。
+   */
+  hostGuardDir: '',
 });
 
 /** 图片缓存上限的允许范围（MB）：512 MB ~ 6 GB，2026-10-25 他定的。 */
@@ -368,6 +405,49 @@ function strList(value, fallback) {
     if (s !== '' && !out.includes(s)) out.push(s)
   }
   return out
+}
+
+/**
+ * 把「04:00」/「4:0, 16:30」这种手写值规范成 `04:00,16:30`。
+ *
+ * 认不出的整段丢掉，但会记一条 problem —— 静默吞掉会让面板显示空白，
+ * 他会以为自己存上了，第二天等到 4 点才发现没重启。
+ *
+ * 区别对待「没填过」和「填了个空」：
+ *   undefined → 用默认（凌晨 4 点）
+ *   ''        → 真的不重启（他手动清空的）
+ */
+function normalizeRestartTimes(value, problems) {
+  if (value === undefined || value === null) return DEFAULTS.hostGuardRestartTimes
+  if (typeof value !== 'string' || value.trim() === '') return ''
+  const out = []
+  const seen = new Set()
+  for (const part of value.split(/[,;，；\s]+/)) {
+    const t = part.trim()
+    if (t === '') continue
+    const m = /^(\d{1,2}):(\d{1,2})$/.exec(t)
+    if (m === null) {
+      problems.push(`定时重启里的「${t}」不是 HH:mm 格式，已忽略`)
+      continue
+    }
+    const hh = Number(m[1])
+    const mm = Number(m[2])
+    if (hh > 23 || mm > 59) {
+      problems.push(`定时重启里的「${t}」超出 00:00 ~ 23:59，已忽略`)
+      continue
+    }
+    const norm = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`
+    if (seen.has(norm)) continue
+    seen.add(norm)
+    out.push(norm)
+  }
+  out.sort()
+  // 填了一串但一个都认不出来：退回默认，别让它变成「从此不重启」
+  if (out.length === 0 && value.trim() !== '') {
+    problems.push(`定时重启里没有一个能认出来的时间，已退回默认 ${DEFAULTS.hostGuardRestartTimes}`)
+    return DEFAULTS.hostGuardRestartTimes
+  }
+  return out.join(',')
 }
 
 /**
@@ -539,6 +619,23 @@ export function parseConfig(raw) {
     imageCachePurgeMB: Math.round(num(input.imageCachePurgeMB, DEFAULTS.imageCachePurgeMB, { min: 50, max: IMAGE_LIMIT_MAX_MB })),
     imageMaxMB: num(input.imageMaxMB, DEFAULTS.imageMaxMB, { min: 1, max: 200 }),
     imageTimeoutMs: num(input.imageTimeoutMs, DEFAULTS.imageTimeoutMs, { min: 2000, max: 120_000 }),
+
+    /* ── 宿主守护（2026-11-03 加）──────────────────────────────
+       这几个键给 hostguard.ps1 读。这里做两件事：
+         1. 把 hour:min 手写值规范化（9:5 → 09:05，24:00 之类直接丢）
+         2. 数字夹到合理区间，免得面板手滑填个 0 让守护原地空转
+    */
+    hostGuardEnabled: input.hostGuardEnabled === true,
+    hostGuardRestartTimes: normalizeRestartTimes(input.hostGuardRestartTimes, problems),
+    hostGuardRetryLimit: Math.round(num(input.hostGuardRetryLimit, DEFAULTS.hostGuardRetryLimit, { min: 1, max: 50 })),
+    hostGuardIntervalSec: Math.round(num(input.hostGuardIntervalSec, DEFAULTS.hostGuardIntervalSec, { min: 5, max: 3600 })),
+    hostGuardReadyTimeoutSec: Math.round(
+      num(input.hostGuardReadyTimeoutSec, DEFAULTS.hostGuardReadyTimeoutSec, { min: 20, max: 1800 }),
+    ),
+    hostGuardRestartDelaySec: Math.round(
+      num(input.hostGuardRestartDelaySec, DEFAULTS.hostGuardRestartDelaySec, { min: 0, max: 3600 }),
+    ),
+    hostGuardDir: typeof input.hostGuardDir === 'string' ? input.hostGuardDir.trim() : '',
   }
 
   // 2026-10-27：shortMax / longMin 不再参与切分，那条互相拉扯的校验也一起去掉了。
