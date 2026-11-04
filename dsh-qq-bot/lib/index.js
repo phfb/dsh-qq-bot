@@ -224,7 +224,18 @@ let ALIVE_CONFIG_FILE = ''
 
 function readJsonFile(file) {
   try {
-    return JSON.parse(readFileSync(file, 'utf8'))
+    /* 别的程序写出来的 JSON 可能带 UTF-8 BOM（PowerShell 的
+       `New-Object System.Text.UTF8Encoding($true)` 就会写），而 JSON.parse
+       遇到 U+FEFF 直接抛 "Unexpected token"。
+
+       2026-11-05 就是这么炸的：hostguard.ps1 用带 BOM 的编码写
+       hostguard-state.json，这里读成 null → 「状态文件里没有心跳」→
+       每 90 秒拉起一个 hostguard，1237 次全是空转（每个新进程起来看见
+       老 pid 还活着，被自己的单实例锁挡回去，立刻就退）。
+
+       所以读的时候统一剥一次 BOM，别再让一个字节把整条保活链带进死循环。 */
+    const text = readFileSync(file, 'utf8')
+    return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
   } catch {
     return null
   }
@@ -2947,8 +2958,25 @@ export function apply(ctx, rawConfig) {
           if (record?.agent && typeof record.agent.followup === 'function') {
             silentNudgeAt.set(uin, Date.now())
             writeLog('INFO', `零正文：推她一句，把刚才没说的补上（第 ${turnNo} 轮）`)
-            void deliverTask(record.agent, config.zeroTextNudgeText, 'zero-text-nudge').catch((err) => {
-              writeLog('WARN', `零正文催话失败：${err instanceof Error ? err.message : String(err)}`)
+            /* 必须推到下一拍（setImmediate），不能就地同步调 followup。
+
+               这儿是 session/event 的 turn/end 处理器，此刻 session 还在发布
+               「零正文」那条 append，同步追加会被宿主判成重入：
+               「session append cannot reenter while another append is being published」。
+
+               2026-11-04 连着撞了两次（10:50 第 426 轮、16:21 第 54 轮），
+               两次都是几毫秒内被打回来 —— 唯一一次补救没送出去，下一轮就只能
+               掉进「连续零正文 → 换局」，把整个上下文断掉。
+
+               注意延迟的只有这一个调用点：deliverTask 还喂着日记(1737)、
+               说说互动(1961)、看门狗(2799)三条路，那三条各有时序，不能一起动。 */
+            setImmediate(() => {
+              void deliverTask(record.agent, config.zeroTextNudgeText, 'zero-text-nudge').catch((err) => {
+                /* 没推成功就把占位退掉，否则 20 秒防抖会把下一轮的补救一起吃掉，
+                   这个机制等于一次失败就永久报废。 */
+                silentNudgeAt.delete(uin)
+                writeLog('WARN', `零正文催话失败：${err instanceof Error ? err.message : String(err)}`)
+              })
             })
           }
         }
@@ -4490,6 +4518,36 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
     return Date.now() - beat * 1000
   }
 
+  /** 上一轮已经为哪个 pid 报过「进程还在」，免得每 90 秒刷一条同样的 WARN。 */
+  let hostGuardAliveWarnedPid = 0
+
+  /**
+   * 状态文件里记的那个 hostguard 进程还在不在 —— **只探进程，不看心跳**。
+   *
+   * 加这一层是因为心跳文件会骗人：写它的进程可能好好的，只是某个字写歪了
+   * （2026-11-05 就是状态文件带了 BOM，这边读成 null）。只看心跳的话，
+   * 这种时候会一直判「它死了」，然后不停地拉起新的 —— 而新的每个都会在启动时
+   * 看见老进程还活着，被自己的单实例锁挡回去立刻退出。结果是每 90 秒空转一次，
+   * 拉起记录刷了 1237 条，真正的问题被埋在最底下。
+   *
+   * @returns {number} 进程号（活着）
+   *          `0`  = pid 记着，但进程已经不在了（可以放心拉起）
+   *          `-1` = 状态文件读不到 / 里面没有 pid，没法判断
+   */
+  function hostGuardLivePid() {
+    const raw = readJsonFile(hostGuardStateFile)
+    if (raw === null || typeof raw !== 'object') return -1
+    const pid = Number(raw.pid) || 0
+    if (pid <= 0) return -1
+    try {
+      // signal 0 只做存在性探测，不会真的给那个进程发信号
+      process.kill(pid, 0)
+      return pid
+    } catch {
+      return 0
+    }
+  }
+
   function spawnHostGuard(reason) {
     try {
       const child = spawn(
@@ -4514,7 +4572,29 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
       try {
         if (config.hostGuardEnabled !== true) return
         const age = hostGuardBeatAgeMs()
-        if (age < pokeMs) return
+        if (age < pokeMs) {
+          hostGuardAliveWarnedPid = 0
+          return
+        }
+
+        /* 心跳旧了，但先看进程还在不在 —— 心跳文件会骗人，进程不会。
+           进程还活着就只是「心跳没写进去」，拉起新的纯属空转（新进程会被
+           单实例锁挡回来），所以这里只报警、不动手。 */
+        const livePid = hostGuardLivePid()
+        if (livePid > 0) {
+          if (hostGuardAliveWarnedPid !== livePid) {
+            hostGuardAliveWarnedPid = livePid
+            writeLog(
+              'WARN',
+              `宿主守护心跳 ${
+                Number.isFinite(age) ? `${Math.round(age / 1000)} 秒没更新` : '读不到（状态文件可能是坏的）'
+              }，但进程 ${livePid} 还在 —— 不重复拉起（心跳写盘那条路有问题）`,
+            )
+          }
+          return
+        }
+        hostGuardAliveWarnedPid = 0
+
         spawnHostGuard(
           Number.isFinite(age) ? `心跳 ${Math.round(age / 1000)} 秒没更新` : '状态文件里没有心跳',
         )

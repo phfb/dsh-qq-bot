@@ -1,4 +1,4 @@
-﻿<#
+<#
   DSH 宿主守护 · hostguard.ps1
   ------------------------------------------------------------------
   三件套：QQ  ->  SnowLuma  ->  DSH
@@ -205,7 +205,11 @@ function Save-State {
   param($State)
   try {
     $json = $State | ConvertTo-Json -Depth 5
-    [System.IO.File]::WriteAllText($StatePath, $json, (New-Object System.Text.UTF8Encoding($true)))
+    # 不写 BOM（$false）。原来这里是 $true，写出来的 hostguard-state.json 开头带
+    # EF BB BF，dsh-qq-bot 那边用 JSON.parse 直接读，撞上 U+FEFF 就抛
+    # "Unexpected token"，整个文件被当成空 → 判「没有心跳」→ 每 90 秒拉起一个
+    # hostguard（1237 次全是空转，全被下面的单实例锁挡回去）。2026-11-05 修。
+    [System.IO.File]::WriteAllText($StatePath, $json, (New-Object System.Text.UTF8Encoding($false)))
   } catch {
     Write-Log 'WARN' ('状态写盘失败：' + $_.Exception.Message)
   }
@@ -270,9 +274,22 @@ function Start-QQ {
 function Start-SnowLuma {
   if (-not (Test-Path $SnowLaunch)) { Write-Log 'ERROR' ('找不到 launcher.bat：' + $SnowLaunch); return $false }
   if ($DryRun) { Write-Log 'DRYRUN' '本该拉起 SnowLuma'; return $true }
+
+  # 优先直接起 bundled node.exe，不经过 launcher.bat。
+  # launcher.bat 里是 `node ./index.mjs` 加一个死循环，外层 cmd 不会退出 ——
+  # 光杀 node 的话它 20 秒后又拉一个回来，于是出现两个实例抢 3000/3001。
+  # 2026-11-03 升级 2.4.0 时就撞上了这个（两条 launcher 链同时在跑）。
+  # 重启这件事交给本守护就够了，不需要 launcher 再来一层。
+  $nodeExe = Join-Path $SnowDir 'node.exe'
+  $entry   = Join-Path $SnowDir 'index.mjs'
   try {
-    Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('"' + $SnowLaunch + '"') -WindowStyle Hidden -ErrorAction Stop
-    Write-Log 'INFO' '拉起 SnowLuma（launcher.bat）'
+    if ((Test-Path $nodeExe) -and (Test-Path $entry)) {
+      Start-Process -FilePath $nodeExe -ArgumentList $entry -WorkingDirectory $SnowDir -WindowStyle Hidden -ErrorAction Stop
+      Write-Log 'INFO' '拉起 SnowLuma（node.exe 直启）'
+    } else {
+      Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('"' + $SnowLaunch + '"') -WindowStyle Hidden -ErrorAction Stop
+      Write-Log 'INFO' '拉起 SnowLuma（launcher.bat，没找到 bundled node）'
+    }
     return $true
   } catch {
     Write-Log 'ERROR' ('拉起 SnowLuma 失败：' + $_.Exception.Message)
