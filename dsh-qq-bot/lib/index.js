@@ -14,7 +14,7 @@
  * @module dsh-qq-bot
  */
 
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
@@ -1601,6 +1601,20 @@ export function apply(ctx, rawConfig) {
   }
 
   installPanelRoutes()
+
+  /* 启动后就异步回填一次会话履历（2026-11-07 补的洞）。
+   *
+   * 原来只在 GET /sessions 里触发懒回填，而**面板只调 /state、从不调 /sessions** ——
+   * 于是回填永远不会跑，履历一直是空表（现场表现：面板上「切回历史会话」只有当前那一局，
+   * 以前被换掉的局一条都没有）。
+   *
+   * 放 setImmediate：不阻塞启动，也不拖慢第一条消息；失败只写日志。
+   * 必须在 `if (!config.enabled) return` **之前** —— 关着插件也该能翻履历。 */
+  setImmediate(() => {
+    void backfillHistory().catch((err) => {
+      writeLog('WARN', `会话履历回填（启动）失败：${err instanceof Error ? err.message : String(err)}`)
+    })
+  })
 
   if (!config.enabled) {
     writeLog('INFO', 'enabled=false，本次不连接、不转发。改配置后插件会重载。')
@@ -4086,10 +4100,52 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
   /* ── 面板：会话履历（切回历史会话，2026-11-07）─────────────────────────── */
 
   /**
+   * 扫磁盘找「QQ 专用的那些局」——`sessionQuery` 用不了时的兜底。
+   *
+   * 宿主把每个会话按 cwd 分目录：`<DSH_HOME>/sessions/--C-DSH-DSHBot-workspace--/session-<uuid>/`。
+   * 目录名就是 cwd 把 `: \ /` 换成 `-` 再包一层 `--`，所以不用解压任何日志
+   * 就能知道哪些会话属于 QQ 的工作目录。
+   *
+   * 时间用会话日志文件的 mtime 近似（**是最后一次写入**，不是创建时间）——
+   * 只用来排序和显示，reason 会标成「历史遗留」，不会冒充精确时间。
+   *
+   * @param {string} cwd
+   * @returns {{id:string, at:string|null}[]} 按时间升序
+   */
+  function scanWorkspaceSessions(cwd) {
+    try {
+      const home = (process.env.DSH_HOME ?? '').trim() !== '' ? process.env.DSH_HOME.trim() : join(homedir(), 'dsh-home')
+      const root = join(home, 'sessions')
+      if (!existsSync(root)) return []
+      const key = `--${String(cwd).replace(/[:\\/]+/g, '-')}--`
+      const dir = join(root, key)
+      if (!existsSync(dir)) return []
+      const out = []
+      for (const name of readdirSync(dir)) {
+        if (!name.startsWith('session-')) continue
+        try {
+          const st = statSync(join(dir, name, 'session.v4.jsonl.zstd'))
+          out.push({ id: name, at: new Date(st.mtimeMs).toISOString() })
+        } catch {
+          // 目录里没有日志文件（空会话 / 被清过）就跳过
+        }
+      }
+      out.sort((a, b) => String(a.at ?? '').localeCompare(String(b.at ?? '')))
+      return out
+    } catch {
+      return []
+    }
+  }
+
+  /**
    * 把「以前那些局」补进履历。
    *
    * 为什么需要：这个功能上线之前换掉的局一条记录都没有，而最想切回去的
-   * 恰恰就是那些。会话文件还在磁盘上，`sessionQuery.listSessions()` 能列出来。
+   * 恰恰就是那些。两条数据来源，按可靠度排：
+   *
+   *   1. `sessionQuery.listSessions()` —— 有精确的 header（cwd / createdAt）；
+   *   2. `scanWorkspaceSessions()`   —— 宿主没挂 sessionQuery 时扫目录，
+   *      时间只能拿文件 mtime 近似。
    *
    * **只收 `cwd === 当前 workspacePath` 的会话** —— 那是 QQ 专用的目录；
    * 别的目录里的是他自己在 GUI 里干的活，不该出现在这个下拉框里，
@@ -4101,24 +4157,39 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
 
     const run = (async () => {
       try {
-        const query = ctx.get('sessionQuery')
-        if (!query || typeof query.listSessions !== 'function') {
-          backfillState = { done: true, running: null, added: 0, reason: '宿主没挂 sessionQuery，只能从今天开始记' }
-          writeLog('INFO', `会话履历回填：${backfillState.reason}`)
-          return backfillState
-        }
         ensureHistoryLoaded()
         const cwd = String(config.workspacePath ?? '')
         if (cwd === '') {
           backfillState = { done: true, running: null, added: 0, reason: '没配 workspacePath，无法区分哪些会话是 QQ 的' }
+          writeLog('INFO', `会话履历回填：${backfillState.reason}`)
           return backfillState
         }
 
-        const all = await query.listSessions()
-        const usable = (Array.isArray(all) ? all : [])
-          .filter((item) => item && item.header && typeof item.header.id === 'string')
-          .filter((item) => String(item.header.cwd ?? '') === cwd)
-          .sort((a, b) => String(a.header.createdAt ?? '').localeCompare(String(b.header.createdAt ?? '')))
+        /** @type {{id:string, at:string|null}[]} */
+        let usable = []
+        let source = ''
+        try {
+          const query = ctx.get('sessionQuery')
+          if (query && typeof query.listSessions === 'function') {
+            const all = await query.listSessions()
+            usable = (Array.isArray(all) ? all : [])
+              .filter((item) => item && item.header && typeof item.header.id === 'string')
+              .filter((item) => String(item.header.cwd ?? '') === cwd)
+              .map((item) => ({
+                id: item.header.id,
+                at: typeof item.header.createdAt === 'string' ? item.header.createdAt : null,
+              }))
+            source = 'sessionQuery'
+          }
+        } catch (err) {
+          writeLog('WARN', `会话履历回填：sessionQuery 读了但失败（${err instanceof Error ? err.message : String(err)}），改扫目录`)
+          usable = []
+        }
+        if (usable.length === 0) {
+          usable = scanWorkspaceSessions(cwd)
+          source = source === '' ? '扫目录' : `${source} 没结果，改扫目录`
+        }
+        usable.sort((a, b) => String(a.at ?? '').localeCompare(String(b.at ?? '')))
 
         const targets =
           sessions.size > 0
@@ -4132,22 +4203,26 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
           const known = new Set((historyData.sessions[String(uin)] ?? []).map((item) => item.sessionId))
           const currentId = sessions.get(uin)?.sessionId ?? null
           for (const item of usable) {
-            const id = item.header.id
+            const id = item.id
             if (known.has(id)) continue
-            const startedAt = typeof item.header.createdAt === 'string' ? item.header.createdAt : null
             if (currentId !== null && id === currentId) {
-              openEntry(historyData, uin, { sessionId: id, startedAt })
+              openEntry(historyData, uin, { sessionId: id, startedAt: item.at })
               continue
             }
             // 不知道这一局是什么时候结束的 —— 用开始时间占位，reason 标「历史遗留」，
             // 面板上就不会把它显示成「正在用」。
-            closeEntry(historyData, uin, { sessionId: id, startedAt, endedAt: startedAt, reason: 'backfill' })
+            closeEntry(historyData, uin, { sessionId: id, startedAt: item.at, endedAt: item.at, reason: 'backfill' })
             added += 1
           }
         }
         if (added > 0) saveHistorySoon()
-        backfillState = { done: true, running: null, added, reason: '' }
-        writeLog('INFO', `会话履历回填：补进 ${added} 局（workspace=${cwd}）`)
+        backfillState = {
+          done: true,
+          running: null,
+          added,
+          reason: usable.length === 0 ? `工作目录 ${cwd} 下一个会话都没找到` : '',
+        }
+        writeLog('INFO', `会话履历回填：补进 ${added} 局（来源 ${source}，workspace=${cwd}）`)
         return backfillState
       } catch (err) {
         backfillState = {
