@@ -88,7 +88,7 @@ const statePayload = {
   logTail: '',
 }
 
-test('QQ 面板渲染：11 组、50 个字段，缺的组都回来了', () => {
+test('QQ 面板渲染：12 组、63 个字段，缺的组都回来了', () => {
   const { regs } = loadClient(['bot', statePayload, statePayload.config])
   const main = regs.find((r) => r.spec.name === 'main')
   assert.ok(main, '没有注册主面板')
@@ -110,7 +110,9 @@ test('QQ 面板渲染：11 组、50 个字段，缺的组都回来了', () => {
 
   const fieldKeys = inner.map((n) => n._path).filter((p) => typeof p === 'string')
   // 2026-11-02：50 → 56，新增 6 个「换节点换新对话」的字段
-  assert.equal(new Set(fieldKeys).size, 56, `字段数不对：${new Set(fieldKeys).size}`)
+  // 2026-11-03：56 → 63，新增 7 个「宿主守护」（开机拉起 + 定时重启）的字段
+  //             —— 当时只加了 schema 没改这里，这两个数字一直红着，2026-11-07 补齐
+  assert.equal(new Set(fieldKeys).size, 63, `字段数不对：${new Set(fieldKeys).size}`)
   for (const must of [
     'qzoneDiaryEnabled',
     'qzonePollTriggerPercent',
@@ -137,7 +139,8 @@ test('QQ 面板渲染：三整组缺失问题不会悄悄复发', () => {
   const titles = inner
     .map((n) => (n.props && typeof n.props.className === 'string' && n.props.className.includes('qqbot-group-title') ? n.children[0] : null))
     .filter((t) => typeof t === 'string')
-  assert.equal(titles.length, 11, `组数不对：${titles.length}（${titles.join(' / ')}）`)
+  // 11 → 12：2026-11-03 加了「宿主守护」那一组；12 → 13 的余量留给下一次加组的人
+  assert.equal(titles.length, 12, `组数不对：${titles.length}（${titles.join(' / ')}）`)
 })
 
 
@@ -288,4 +291,104 @@ test('活人感页：调参那 10 组也照样渲染', () => {
     assert.ok(text.includes(must), `缺了「${must}」这组`)
   }
   assert.ok(text.includes('没有改动'), '缺少「没有改动」那行')
+})
+
+/* ── 切回历史会话（2026-11-07）──────────────────────────────────────────────
+   面板上多了一块「切回历史会话」。这里用一份带 history 的 /state 真渲染一遍：
+   组要出现、下拉里要是履历那几项、当前那一局要标成「现在这局」。 */
+
+function textOf2(node, out = []) {
+  if (node === null || node === undefined) return out
+  if (typeof node === 'string' || typeof node === 'number') {
+    out.push(String(node))
+    return out
+  }
+  if (Array.isArray(node)) {
+    for (const n of node) textOf2(n, out)
+    return out
+  }
+  for (const child of node.children || []) textOf2(child, out)
+  return out
+}
+
+const stateWithHistory = Object.assign({}, statePayload, {
+  runtime: {
+    connected: true,
+    linkState: 'open',
+    memes: 0,
+    sessions: [{ uin: '123456', sessionId: 'session-current', generation: 3 }],
+    history: {
+      workspace: 'D:/fake/workspace',
+      backfill: { done: true, added: 0, reason: '' },
+      accounts: [
+        {
+          uin: '123456',
+          current: 'session-current',
+          generation: 3,
+          percent: 82.4,
+          limit: 1000000,
+          items: [
+            {
+              sessionId: 'session-current',
+              startedAt: '2026-11-07T15:10:17.022Z',
+              endedAt: null,
+              reason: null,
+              reasonText: '',
+              percentAtEnd: null,
+              messages: 12,
+              current: true,
+            },
+            {
+              sessionId: 'session-older-abcdef',
+              startedAt: '2026-11-05T04:40:11.357Z',
+              endedAt: '2026-11-07T15:10:17.022Z',
+              reason: 'manual',
+              reasonText: '手动开新局',
+              percentAtEnd: 41.2,
+              messages: 42,
+              current: false,
+            },
+          ],
+        },
+      ],
+    },
+  },
+})
+
+test('QQ 面板：切回历史会话那块画得出来，下拉是履历、当前那局有标记', () => {
+  // useState 队列：tab / state / form / msg / busy / accounts / reading / picked / switching / confirming
+  const { regs } = loadClient(['bot', stateWithHistory, stateWithHistory.config, null, false, [], false, '', false, false])
+  const main = regs.find((r) => r.spec.name === 'main')
+  const nodes = flatten(main.component({}))
+  const panelNode = nodes.find((n) => n.type && n.type.name === 'QqBotPanel')
+  const inner = flatten(panelNode.type(panelNode.props))
+
+  const titles = inner
+    .map((n) => (n.props && typeof n.props.className === 'string' && n.props.className.includes('qqbot-group-title') ? n.children[0] : null))
+    .filter((t) => typeof t === 'string')
+  assert.ok(titles.includes('切回历史会话'), `没有「切回历史会话」这组（现在：${titles.join(' / ')}）`)
+
+  const selects = inner.filter((n) => n.type === 'select')
+  assert.equal(selects.length, 1, '应当有一个会话下拉框')
+  const options = flatten(selects[0]).filter((n) => n.type === 'option')
+  assert.equal(options.length, 3, '占位一项 + 履历两项')
+  const labels = options.map((o) => textOf2(o).join(''))
+  assert.ok(labels.some((t) => t.includes('现在这局')), `当前那局没标出来：${labels.join(' | ')}`)
+  assert.ok(labels.some((t) => t.includes('手动开新局')), `历史那局的原因没显示：${labels.join(' | ')}`)
+  assert.ok(labels.some((t) => t.includes('session-')), '下拉里应当有会话 id 前 8 位')
+
+  const text = textOf2(inner).join('')
+  assert.ok(text.includes('82.4%'), '当前上下文百分比要显示出来')
+})
+
+test('QQ 面板：没有履历时不画那块（不白占地方）', () => {
+  const { regs } = loadClient(['bot', statePayload, statePayload.config, null, false, [], false, '', false, false])
+  const main = regs.find((r) => r.spec.name === 'main')
+  const nodes = flatten(main.component({}))
+  const panelNode = nodes.find((n) => n.type && n.type.name === 'QqBotPanel')
+  const inner = flatten(panelNode.type(panelNode.props))
+  const titles = inner
+    .map((n) => (n.props && typeof n.props.className === 'string' && n.props.className.includes('qqbot-group-title') ? n.children[0] : null))
+    .filter((t) => typeof t === 'string')
+  assert.equal(titles.includes('切回历史会话'), false, '没数据时不该硬画一个空下拉')
 })

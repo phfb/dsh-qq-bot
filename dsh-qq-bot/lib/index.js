@@ -58,6 +58,17 @@ import { judgeTurnSilence } from './silence.mjs'
 import { judgeWatchdog } from './watchdog.mjs'
 import { isDuplicateMessage } from './dedupe.mjs'
 import { ROTATE_ACTION, evaluate, parseState, parseSwitchEvent, shortUrl } from './node-rotate.mjs'
+import {
+  bumpMessages as bumpHistoryMessages,
+  closeEntry,
+  describeReason,
+  emptyHistory,
+  hasSession as hasHistorySession,
+  listFor,
+  loadHistory,
+  openEntry,
+  saveHistory,
+} from './session-history.mjs'
 
 /** cordis 插件名。 */
 export const name = 'dsh-qq-bot'
@@ -696,7 +707,81 @@ export function apply(ctx, rawConfig) {
   const rolloverAt = new Map()
 
   const mapPath = join(DATA_DIR, 'qq-session-map.json')
+  const historyPath = join(DATA_DIR, 'qq-session-history.json')
   const controlPath = join(DATA_DIR, 'qq-bot-control.json')
+
+  /* ── 会话履历（2026-11-07）──────────────────────────────────────────────
+   *
+   * 换局之后旧的那一局会从 `qq-session-map.json` 里消失，会话文件却还在磁盘上。
+   * 想在面板里「切回之前那局」就必须有人记得它 —— 这就是这份履历的用处。
+   *
+   * 三条纪律（都写在 session-history.mjs 里，这里只负责接上）：
+   *  · 记不进去只写一行日志，**绝不影响换局和收发**；
+   *  · 落盘防抖 1 秒，连着换两局不会写两次盘；
+   *  · 只读它、不改主链路。
+   */
+  let historyData = emptyHistory()
+  let historyLoaded = false
+  let historyFlushTimer = null
+  /**
+   * 回填只做一次。**必须在这里声明**：apply() 底下有两条早退（enabled=false /
+   * allowUsers 为空），早退之后的行不会执行，`let` 就会留在 TDZ 里 ——
+   * 关了插件再看面板会直接 500（2026-11-07 的冒烟就是这么抓到的）。
+   */
+  let backfillState = { done: false, running: null, added: 0, reason: '' }
+
+  function ensureHistoryLoaded() {
+    if (historyLoaded) return historyData
+    historyLoaded = true
+    historyData = loadHistory(historyPath)
+    return historyData
+  }
+
+  /** 防抖落盘：1 秒内的多次记账合并成一次写。 */
+  function saveHistorySoon() {
+    if (historyFlushTimer !== null) return
+    historyFlushTimer = setTimeout(() => {
+      historyFlushTimer = null
+      try {
+        if (!saveHistory(historyPath, historyData)) writeLog('WARN', '会话履历落盘失败（不影响聊天）')
+      } catch (err) {
+        writeLog('WARN', `会话履历落盘异常（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }, 1000)
+    // 这个定时器不该拖住进程退出
+    if (typeof historyFlushTimer.unref === 'function') historyFlushTimer.unref()
+  }
+
+  /**
+   * 记一笔「这一局结束了」。
+   *
+   * 调用点只有四处，全是**事后记账**：换局、手动开新局、手动切走、会话失效。
+   * 任何一处调用都不该因为它失败而改变自己的行为。
+   *
+   * @param {string} uin
+   * @param {{sessionId?:string, createdAt?:string|null, messages?:number|null}|null} record
+   * @param {string} reason 见 session-history.mjs 的 REASON_TEXT
+   * @param {number|null} [percentAtEnd]
+   */
+  function recordSessionEnd(uin, record, reason, percentAtEnd) {
+    try {
+      const sessionId = typeof record?.sessionId === 'string' ? record.sessionId : ''
+      if (sessionId === '') return
+      ensureHistoryLoaded()
+      closeEntry(historyData, uin, {
+        sessionId,
+        startedAt: typeof record?.createdAt === 'string' ? record.createdAt : null,
+        reason,
+        percentAtEnd: Number.isFinite(percentAtEnd) ? percentAtEnd : null,
+        messages: Number.isFinite(record?.messages) ? record.messages : null,
+      })
+      saveHistorySoon()
+      writeLog('INFO', `会话履历：${sessionId.slice(0, 13)}… 记一笔「${describeReason(reason)}」`)
+    } catch (err) {
+      writeLog('WARN', `会话履历记账失败（不影响聊天）：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
 
   /**
    * 运行时开关。和配置里的 enabled 是两件事：
@@ -904,8 +989,10 @@ export function apply(ctx, rawConfig) {
         if (Date.now() - entry.at > 600_000) legacyIds.delete(id)
       }
     }
-    sessions.set(uin, { sessionId: realId, agent, handle, createdAt: new Date().toISOString(), generation: gen })
+    sessions.set(uin, { sessionId: realId, agent, handle, createdAt: new Date().toISOString(), generation: gen, messages: 0 })
     saveMap()
+    // 旧的那一局记进履历（写失败只打日志，绝不影响换局）
+    recordSessionEnd(uin, record, options.reason ?? 'context', usage?.percent ?? null)
     writeLog('INFO', `已切到新对话 ${realId}（第 ${gen} 局）`)
     // 新的一局：用量门槛、轮次窗口、基线节点全部归零。
     // 不归零的话新局一上来就继承旧局攒的几千万 token，节点一动就又被换掉。
@@ -918,6 +1005,136 @@ export function apply(ctx, rawConfig) {
     saveNodeRotateState()
     void applyTaskEffort(realId, '换局后')
     return true
+  }
+
+  /* ── 手动切回历史会话（2026-11-07）────────────────────────────────────────
+   *
+   * 为什么要它：第三方 API 抽风的时候她会连着换局，等线路恢复了，想接着
+   * 之前那一局聊，插件这边没有任何入口 —— 旧 id 早就从映射里消失了。
+   *
+   * 边界是**刻意收窄**的，三条都不能松：
+   *
+   *  1. **只允许切回「这个号自己用过的会话」**（履历里有记录）。
+   *     任意 sessionId 都能绑的话，一旦绑上 GUI 里的会话，`session/event`
+   *     是全局监听 → 你在电脑上说的每句话都会被发到 QQ 上。这条路直接堵死。
+   *  2. **先证明这一局能活，再改映射。** 恢复了却切过去的表现是
+   *     「发消息没反应」，比当场报错难查一百倍。
+   *  3. **和自动换局共用 `rollingOver` 互斥**，避免一边手动切、一边被自动换掉。
+   *
+   * 不做「锁定」：切回去的那一局如果本来就超了阈值，让它照规则自动换掉是对的
+   * —— 返回值里带上当前百分比，面板会显示，看不看得满由人决定。
+   *
+   * @param {string} uin
+   * @param {string} targetId
+   * @returns {Promise<{ok:boolean, sessionId?:string, generation?:number,
+   *                    percent?:number|null, live?:boolean, note?:string, error?:string}>}
+   */
+  async function switchSession(uin, targetId) {
+    const key = String(uin ?? '')
+    const target = String(targetId ?? '').trim()
+    if (key === '' || target === '') return { ok: false, error: '缺少 QQ 号或会话 id' }
+
+    const agents = ctx.get('agents')
+    if (!agents) return { ok: false, error: '宿主还没就绪（拿不到 agents），等 DSH 起完再试' }
+
+    const current = sessions.get(key) ?? null
+    if (current !== null && current.sessionId === target) {
+      return { ok: true, sessionId: target, generation: current.generation ?? 1, live: true, note: '已经在这一局了' }
+    }
+    if (rollingOver.has(key)) return { ok: false, error: '正在换局，等一两秒再点' }
+
+    // 只认 QQ 自己用过的会话 —— 这是防串台的第一道闸
+    ensureHistoryLoaded()
+    if (!hasHistorySession(historyData, key, target)) {
+      return {
+        ok: false,
+        error: '这一局不在 QQ 的会话履历里。只能切回 QQ 自己用过的对话 —— 绑到其它会话上会把那段对话的内容发到你 QQ 里。',
+      }
+    }
+
+    rollingOver.add(key)
+    try {
+      // 先证明能活：活着就直接用，冷的走 sessionController 恢复
+      let agent = null
+      let live = false
+      try {
+        agent = agents.get?.(target) ?? null
+      } catch {
+        agent = null
+      }
+      live = agent !== null
+
+      if (agent === null) {
+        const sc = ctx.get('sessionController')
+        if (!sc || typeof sc.resolveAgent !== 'function') {
+          return { ok: false, error: '宿主没有 sessionController，没法恢复冷会话' }
+        }
+        const resolved = await sc.resolveAgent(target)
+        if (!resolved || 'error' in resolved || !resolved.agent) {
+          const why = String(resolved?.error?.message ?? resolved?.error ?? 'unknown')
+          return { ok: false, error: `这一局恢复不了（${why}）—— 可能已经被删除或归档，先用 GUI 打开确认它还在` }
+        }
+        agent = resolved.agent
+      }
+
+      // 记账：当前这一局先结束
+      const usage = current !== null ? contextUsage(current) : null
+      if (current !== null) recordSessionEnd(key, current, 'switch-out', usage?.percent ?? null)
+
+      const generation = (Number(current?.generation) || 1) + 1
+      const record = {
+        sessionId: String(agent.id ?? target),
+        agent,
+        handle: null,
+        createdAt: new Date().toISOString(),
+        generation,
+        messages: 0,
+      }
+      sessions.set(key, record)
+      saveMap()
+
+      // 旧局的在途消息不该再被当成 QQ 消息发出去 —— 清掉这个号的 legacy 映射
+      for (const [id, entry] of legacyIds) {
+        if (entry.uin === key) legacyIds.delete(id)
+      }
+
+      // 履历里把这一局标回「活着」
+      openEntry(historyData, key, { sessionId: record.sessionId, startedAt: new Date().toISOString() })
+      saveHistorySoon()
+
+      // 换局后要归零的那套状态（和 rolloverSession 保持一致，否则新局一上来
+      // 就继承旧局的累计 token，节点一动又被换掉）
+      nodeGenTokens = 0
+      nodeTurnNodes = []
+      nodeBaselineUrl = ''
+      nodePending = null
+      nodeLastVerdict = ''
+      saveNodeRotateState()
+      void applyTaskEffort(record.sessionId, '手动切回')
+
+      const after = contextUsage(record)
+      writeLog(
+        'INFO',
+        `手动切回会话 ${record.sessionId}（第 ${generation} 局）` +
+          (after !== null ? `，当前上下文 ${after.percent}%` : '，上下文量不了'),
+      )
+      return {
+        ok: true,
+        sessionId: record.sessionId,
+        generation,
+        percent: after !== null ? after.percent : null,
+        live,
+        note:
+          (live ? '这一局在 GUI 里也开着，两边看到的是同一段对话。' : '已从磁盘恢复这一局。') +
+          (after !== null && after.percent >= config.contextLimitPercent
+            ? `它已经 ${after.percent}% 了，下一条消息可能触发自动换新局。`
+            : ''),
+      }
+    } catch (err) {
+      return { ok: false, error: `切换失败：${err instanceof Error ? err.message : String(err)}` }
+    } finally {
+      rollingOver.delete(key)
+    }
   }
 
   /**
@@ -1123,7 +1340,7 @@ export function apply(ctx, rawConfig) {
             uin,
             record,
             { used: 0, limit: resolveContextWindow(), percent: 0 },
-            { why: `节点换局（${verdict.reason}）`, notify: config.nodeSwitchRotateNotice },
+            { why: `节点换局（${verdict.reason}）`, notify: config.nodeSwitchRotateNotice, reason: 'node-switch' },
           )
           if (ok) rolloverAt.set(uin, Date.now())
         } catch (err) {
@@ -2113,7 +2330,12 @@ export function apply(ctx, rawConfig) {
       const freshAgents = (agents.list?.() ?? []).filter((a) => !beforeIds.has(a.id))
       const agent = freshAgents.find((a) => a.id === targetId) ?? freshAgents[0] ?? handle?.agent ?? null
       const realId = String(agent?.id ?? targetId)
-      const record = { sessionId: realId, agent, handle, createdAt: new Date().toISOString(), generation: cached?.generation ?? 1 }
+      const record = { sessionId: realId, agent, handle, createdAt: new Date().toISOString(), generation: cached?.generation ?? 1, messages: 0 }
+      // 老的那一局恢复不了、只好新建 —— 记一笔「会话失效」，
+      // 否则它会连履历都没有，以后想切回去根本找不到。
+      if (typeof cached?.sessionId === 'string' && cached.sessionId !== '' && cached.sessionId !== realId) {
+        recordSessionEnd(uin, cached, 'gone', null)
+      }
       sessions.set(uin, record)
       saveMap()
       writeLog('INFO', `已为 ${uin} 建立 DSH 会话 ${realId}`)
@@ -2894,6 +3116,7 @@ export function apply(ctx, rawConfig) {
       const switched = await rolloverSession(uin, record, usage, {
         notify: config.stuckRolloverNotice,
         why: `她卡住了（${reason}），不是上下文满 —— 当前 ${usage.percent}%`,
+        reason: 'stuck',
       })
       if (switched) rolloverAt.set(uin, Date.now())
       else writeLog('ERROR', `换局失败（${reason}）—— 这个会话可能要人工介入了`)
@@ -2998,7 +3221,21 @@ export function apply(ctx, rawConfig) {
       // 这条日志是压测换新局时踩出来的：需要能一眼看出「事件到了但文本是 0 字」，
       // 否则只会看到"她没回话"，分不清是模型没说话还是出站把他吞了。
       writeLog('INFO', `出站：${sessionId.slice(0, 13)}… 匹配 QQ ${uin}，本段 ${text.length} 字`)
-      if (text !== '') enqueueReply(uin, text)
+      if (text !== '') {
+        enqueueReply(uin, text)
+        // 顺手记一笔「这一局说过几句」——只用于面板上的履历显示，出错也不影响发送
+        try {
+          const live = sessions.get(uin)
+          if (live && live.sessionId === sessionId) {
+            live.messages = (Number(live.messages) || 0) + 1
+            ensureHistoryLoaded()
+            bumpHistoryMessages(historyData, uin, sessionId)
+            saveHistorySoon()
+          }
+        } catch {
+          // 履历计数失败不是事
+        }
+      }
 
       // 记一笔：这一轮她说出话了没有？零正文的判定全靠 turnSpeech
       const turnNo = Number(event?.data?.turn)
@@ -3846,6 +4083,142 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
     return out
   }
 
+  /* ── 面板：会话履历（切回历史会话，2026-11-07）─────────────────────────── */
+
+  /**
+   * 把「以前那些局」补进履历。
+   *
+   * 为什么需要：这个功能上线之前换掉的局一条记录都没有，而最想切回去的
+   * 恰恰就是那些。会话文件还在磁盘上，`sessionQuery.listSessions()` 能列出来。
+   *
+   * **只收 `cwd === 当前 workspacePath` 的会话** —— 那是 QQ 专用的目录；
+   * 别的目录里的是他自己在 GUI 里干的活，不该出现在这个下拉框里，
+   * 更不该被一键绑到 QQ 上。
+   */
+  async function backfillHistory() {
+    if (backfillState.done) return backfillState
+    if (backfillState.running !== null) return backfillState.running
+
+    const run = (async () => {
+      try {
+        const query = ctx.get('sessionQuery')
+        if (!query || typeof query.listSessions !== 'function') {
+          backfillState = { done: true, running: null, added: 0, reason: '宿主没挂 sessionQuery，只能从今天开始记' }
+          writeLog('INFO', `会话履历回填：${backfillState.reason}`)
+          return backfillState
+        }
+        ensureHistoryLoaded()
+        const cwd = String(config.workspacePath ?? '')
+        if (cwd === '') {
+          backfillState = { done: true, running: null, added: 0, reason: '没配 workspacePath，无法区分哪些会话是 QQ 的' }
+          return backfillState
+        }
+
+        const all = await query.listSessions()
+        const usable = (Array.isArray(all) ? all : [])
+          .filter((item) => item && item.header && typeof item.header.id === 'string')
+          .filter((item) => String(item.header.cwd ?? '') === cwd)
+          .sort((a, b) => String(a.header.createdAt ?? '').localeCompare(String(b.header.createdAt ?? '')))
+
+        const targets =
+          sessions.size > 0
+            ? [...sessions.keys()]
+            : Array.isArray(config.allowUsers) && config.allowUsers.length > 0
+              ? [String(config.allowUsers[0])]
+              : []
+
+        let added = 0
+        for (const uin of targets) {
+          const known = new Set((historyData.sessions[String(uin)] ?? []).map((item) => item.sessionId))
+          const currentId = sessions.get(uin)?.sessionId ?? null
+          for (const item of usable) {
+            const id = item.header.id
+            if (known.has(id)) continue
+            const startedAt = typeof item.header.createdAt === 'string' ? item.header.createdAt : null
+            if (currentId !== null && id === currentId) {
+              openEntry(historyData, uin, { sessionId: id, startedAt })
+              continue
+            }
+            // 不知道这一局是什么时候结束的 —— 用开始时间占位，reason 标「历史遗留」，
+            // 面板上就不会把它显示成「正在用」。
+            closeEntry(historyData, uin, { sessionId: id, startedAt, endedAt: startedAt, reason: 'backfill' })
+            added += 1
+          }
+        }
+        if (added > 0) saveHistorySoon()
+        backfillState = { done: true, running: null, added, reason: '' }
+        writeLog('INFO', `会话履历回填：补进 ${added} 局（workspace=${cwd}）`)
+        return backfillState
+      } catch (err) {
+        backfillState = {
+          done: true,
+          running: null,
+          added: 0,
+          reason: `回填失败：${err instanceof Error ? err.message : String(err)}`,
+        }
+        writeLog('WARN', `会话履历回填失败（不影响聊天）：${backfillState.reason}`)
+        return backfillState
+      }
+    })()
+
+    backfillState.running = run
+    return run
+  }
+
+  /**
+   * 面板要的履历 + 当前绑定。
+   * 只做读和一次 `contextUsage`（当前局），不做任何模型调用。
+   */
+  function historyForPanel() {
+    ensureHistoryLoaded()
+    const keys =
+      sessions.size > 0
+        ? [...sessions.keys()]
+        : Array.isArray(config.allowUsers) && config.allowUsers.length > 0
+          ? [String(config.allowUsers[0])]
+          : []
+    const accounts = []
+    for (const uin of keys) {
+      const current = sessions.get(uin) ?? null
+      const usage = current !== null ? contextUsage(current) : null
+      const items = listFor(historyData, uin).map((item) => ({
+        sessionId: item.sessionId,
+        startedAt: item.startedAt,
+        endedAt: item.endedAt,
+        reason: item.reason,
+        reasonText: item.reason === null || item.reason === undefined ? '' : describeReason(item.reason),
+        percentAtEnd: item.percentAtEnd,
+        messages: item.messages,
+        current: current !== null && current.sessionId === item.sessionId,
+      }))
+      if (current !== null && !items.some((item) => item.sessionId === current.sessionId)) {
+        items.unshift({
+          sessionId: current.sessionId,
+          startedAt: current.createdAt ?? null,
+          endedAt: null,
+          reason: null,
+          reasonText: '',
+          percentAtEnd: null,
+          messages: current.messages ?? null,
+          current: true,
+        })
+      }
+      accounts.push({
+        uin,
+        current: current?.sessionId ?? null,
+        generation: current?.generation ?? null,
+        percent: usage?.percent ?? null,
+        limit: usage?.limit ?? null,
+        items,
+      })
+    }
+    return {
+      workspace: String(config.workspacePath ?? ''),
+      backfill: { done: backfillState.done, added: backfillState.added, reason: backfillState.reason },
+      accounts,
+    }
+  }
+
   function collectState() {
     let logTail = ''
     try {
@@ -3871,6 +4244,8 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
         linkState: String(linkState ?? ''),
         memes: countMemes(),
         sessions: list,
+        // 会话履历 + 当前绑定：面板上的「切回历史会话」靠它画下拉框
+        history: historyForPanel(),
       },
       logTail,
     }
@@ -4283,11 +4658,39 @@ post 时配图用 autoImages=1~3，图由插件自己准备，你拿不到路径
             sendJson(res, 200, { ok: true, note: '已重新连接 OneBot' })
             return
           }
+          /* 会话履历 / 切回历史会话（2026-11-07）
+             GET  /sessions → 列出这个号用过的每一局（懒回填一次）
+             POST /switch-session { uin, sessionId } → 切回其中某一局 */
+          if (route === '/sessions' && req.method === 'GET') {
+            await backfillHistory()
+            sendJson(res, 200, { ok: true, ...historyForPanel() })
+            return
+          }
+          if (route === '/switch-session' && req.method === 'POST') {
+            const body = await readBody(req)
+            const uin = String(body?.uin ?? '')
+            const sessionId = String(body?.sessionId ?? '')
+            if (uin === '' || sessionId === '') {
+              sendJson(res, 400, { ok: false, error: '缺 uin 或 sessionId' })
+              return
+            }
+            const outcome = await switchSession(uin, sessionId)
+            sendJson(res, outcome.ok ? 200 : 400, outcome)
+            return
+          }
           if (route === '/reset-session' && req.method === 'POST') {
+            // 2026-11-07：清之前先给每一局记一笔履历。
+            // 这个接口以前只有 `sessions.clear()` —— 点一下「开新一局」，
+            // 旧会话就从插件这边彻底消失了（文件还在，但没有任何地方记得它），
+            // 想切回去只能凭记忆敲 id。现在记下来，面板的下拉框就能列。
+            for (const [uin, record] of sessions) {
+              const usage = contextUsage(record)
+              recordSessionEnd(uin, record, 'manual', usage?.percent ?? null)
+            }
             sessions.clear()
             saveMap()
-            writeLog('INFO', '设置页清空了会话映射')
-            sendJson(res, 200, { ok: true, note: '会话映射已清空，下一条消息会开新的一局' })
+            writeLog('INFO', '设置页清空了会话映射（旧局已记进会话履历）')
+            sendJson(res, 200, { ok: true, note: '会话映射已清空，下一条消息会开新的一局；旧的那几局在「切回历史会话」里还能找到' })
             return
           }
           /* 活人感那几个按钮：跟老 PowerShell 窗口一套命令信箱 */

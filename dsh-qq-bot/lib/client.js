@@ -214,6 +214,10 @@ window.__ModuleLoader__.load({
       var busyRes = useState(false)
       var accountsRes = useState([])
       var readingRes = useState(false)
+      // 切回历史会话：选中的那一局 / 正在切 / 等二次确认
+      var pickedRes = useState('')
+      var switchingRes = useState(false)
+      var confirmRes = useState(false)
       var state = stateRes[0]
       var setState = stateRes[1]
       var form = formRes[0]
@@ -226,6 +230,38 @@ window.__ModuleLoader__.load({
       var setAccounts = accountsRes[1]
       var reading = readingRes[0]
       var setReading = readingRes[1]
+      var picked = pickedRes[0]
+      var setPicked = pickedRes[1]
+      var switching = switchingRes[0]
+      var setSwitching = switchingRes[1]
+      var confirming = confirmRes[0]
+      var setConfirming = confirmRes[1]
+
+      // 履历在 return 之前要能用（回调里引用），所以先取出来。
+      // state 还没到时全是空数组，渲染那一层再判空。
+      var runtime0 = state && state.runtime ? state.runtime : {}
+      var history0 = runtime0.history && typeof runtime0.history === 'object' ? runtime0.history : null
+      var historyAccounts0 = history0 && Array.isArray(history0.accounts) ? history0.accounts : []
+
+      /** 履历里的时间写成 11-07 23:10（本地时间，别显示 ISO 串）。 */
+      function fmtWhen(iso) {
+        if (!iso) return '时间未知'
+        var d = new Date(iso)
+        if (isNaN(d.getTime())) return '时间未知'
+        var p = function (n) { return n < 10 ? '0' + n : String(n) }
+        return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+      }
+
+      /** 下拉里一行：什么时候 · 为什么结束 · 百分比 · 条数 · id 前 8 位。 */
+      function historyLabel(item) {
+        var bits = [fmtWhen(item && item.startedAt)]
+        if (item && item.current === true) bits.push('现在这局')
+        else if (item && item.reasonText) bits.push(item.reasonText)
+        if (item && typeof item.percentAtEnd === 'number') bits.push(item.percentAtEnd + '%')
+        if (item && typeof item.messages === 'number' && item.messages > 0) bits.push(item.messages + ' 条')
+        bits.push(String((item && item.sessionId) || '').slice(0, 8))
+        return bits.join(' · ')
+      }
 
       var readAccounts = useCallback(function () {
         setReading(true)
@@ -304,6 +340,50 @@ window.__ModuleLoader__.load({
         }).then(function () { setBusy(false) })
       }, [reload])
 
+      /* 切回历史会话：点第一次只是「上膛」，第二次才真发请求。
+         这条动作会改「以后消息往哪一局走」，值得多问一句。 */
+      var onSwitchSession = useCallback(function () {
+        if (picked === '') return
+        if (confirming !== true) {
+          setConfirming(true)
+          return
+        }
+        var target = null
+        for (var i = 0; i < historyAccounts0.length; i += 1) {
+          var acc = historyAccounts0[i]
+          var items = Array.isArray(acc.items) ? acc.items : []
+          for (var j = 0; j < items.length; j += 1) {
+            if (items[j].sessionId === picked) {
+              target = { uin: acc.uin, item: items[j] }
+              break
+            }
+          }
+          if (target !== null) break
+        }
+        if (target === null) {
+          setMsg({ kind: 'err', text: '选中的那一局在最新状态里找不到了，点「刷新状态」再来一次' })
+          setConfirming(false)
+          return
+        }
+        setConfirming(false)
+        setSwitching(true)
+        request('POST', '/switch-session', { uin: target.uin, sessionId: picked }).then(function (data) {
+          var text = data.note || '已切回'
+          setMsg({ kind: 'ok', text: text + '（' + String(picked).slice(0, 12) + '…）' })
+          setPicked('')
+          return reload()
+        }).catch(function (err) {
+          setMsg({ kind: 'err', text: '切换失败：' + err.message })
+        }).then(function () { setSwitching(false) })
+      }, [picked, confirming, historyAccounts0, reload])
+
+      /* 切回失败最常见的原因是「这一局已经不在了」，刷新一下状态就看得出来；
+         顺手把选中的那份也清掉，免得一直点一个不存在的目标。 */
+      var onPickSession = useCallback(function (value) {
+        setPicked(value)
+        setConfirming(false)
+      }, [])
+
       // 2026-11-03：整机重启。命令下到 Windows 的 shutdown.exe，
       // 倒数期间还能用下面的「取消重启」拦下来。
       var onRestartHost = useCallback(function () {
@@ -373,6 +453,46 @@ window.__ModuleLoader__.load({
           h('button', { className: 'qqbot-btn', disabled: busy, onClick: reload }, '刷新状态'),
           h('button', { className: 'qqbot-btn', disabled: busy, onClick: onRestartHost }, '重启整机'),
           h('button', { className: 'qqbot-btn', disabled: busy, onClick: onCancelRestart }, '取消重启')),
+
+        /* ── 切回历史会话（2026-11-07）──
+           只列 QQ 自己用过的局。列别的会话会把那段对话发到 QQ 上，所以后端也不放行。 */
+        historyAccounts0.length > 0 ? h('div', { className: 'qqbot-group' },
+          h('div', { className: 'qqbot-group-title' }, '切回历史会话'),
+          h('div', { className: 'qqbot-group-hint' },
+            '只列 QQ 自己用过的对话（工作目录 ' + (history0.workspace || '未配置') + '）。'
+            + '切换只改「以后的消息送到哪一局」，不删任何东西；换到别的局会重新算一局（第 N 局 +1）。'),
+          historyAccounts0.map(function (acc) {
+            var items = Array.isArray(acc.items) ? acc.items : []
+            var options = [h('option', { key: '__none', value: '' },
+              items.length === 0 ? '（还没有履历，换过一次局才会出现）' : '（选一局）')]
+            for (var i = 0; i < items.length; i += 1) {
+              options.push(h('option', { key: items[i].sessionId, value: items[i].sessionId }, historyLabel(items[i])))
+            }
+            return h('div', { key: 'hist-' + acc.uin, style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+              h('div', { className: 'qqbot-row' },
+                h('div', { className: 'qqbot-label' },
+                  acc.uin + (typeof acc.percent === 'number' ? '（当前 ' + acc.percent + '%）' : '')),
+                h('div', { style: { display: 'flex', gap: '6px' } },
+                  h('select', {
+                    className: 'qqbot-input',
+                    value: picked,
+                    disabled: switching === true,
+                    onChange: function (event) { onPickSession(event.target.value) },
+                  }, options),
+                  h('button', {
+                    className: 'qqbot-btn',
+                    'data-primary': confirming === true ? '1' : undefined,
+                    disabled: picked === '' || switching === true,
+                    onClick: onSwitchSession,
+                  }, switching === true ? '切换中…' : confirming === true ? '确定切回？' : '切回这一局'))))
+          }),
+          history0 && history0.backfill && history0.backfill.done !== true
+            ? h('div', { className: 'qqbot-hint' }, '第一次打开会懒回填一次以前的会话（只扫这个工作目录）。')
+            : null,
+          history0 && history0.backfill && history0.backfill.reason
+            ? h('div', { className: 'qqbot-hint' }, '回填提示：' + history0.backfill.reason)
+            : null
+        ) : null,
 
         msg !== null ? h('div', { className: 'qqbot-msg', 'data-kind': msg.kind }, msg.text) : null,
 

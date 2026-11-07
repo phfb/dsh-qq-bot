@@ -3,6 +3,72 @@
 这个仓库一次装两个插件：`dsh-qq-bot/`（QQ 私聊接入）和 `dsh-alive/`（活人感 / 主动开口）。
 版本号两边同步。
 
+> ⚠️ 例外：**1.2.0 只改了 `dsh-qq-bot/`**，`dsh-alive/` 这一版没有任何改动，
+> 所以它的版本号停在 1.1.1，两边不同步是有意的。
+
+## [1.2.0] - 2026-11-07
+
+### 新：会话履历 + 面板上「切回历史会话」
+
+**他的要求**：第三方 API 出问题的时候 Qbot 会自动换新对话，等线路恢复了，
+想切回之前那一局却没有任何入口 —— 旧 id 从 `qq-session-map.json` 里消失了。
+
+**改法**：换局时把旧的那一局记进 `<dataDir>/qq-session-history.json`：
+
+| 字段 | 含义 |
+|---|---|
+| `sessionId` | 哪一局 |
+| `startedAt` / `endedAt` | 开始 / 被换掉的时刻 |
+| `reason` | `manual`（面板点「换新一局」）/ `context`（到阈值）/ `stuck`（卡住）/ `node-switch`（节点切换）/ `gone`（会话失效）/ `backfill`（功能上线前留下的） |
+| `percentAtEnd` | 换掉那一刻的上下文百分比 |
+| `messages` | 这一局她说过几句 |
+
+面板上多了一块「切回历史会话」：下拉选一局 → 「切回这一局」→ 再点一次「确定切回？」。
+
+**四条边界**（都是刻意收窄的）：
+
+1. **只列 QQ 自己用过的会话。** 别的会话不在履历里，后端直接拒绝 ——
+   `session/event` 是全局监听，绑到 GUI 会话上的话，你在电脑上说的每句话都会被发到 QQ。
+2. **先验证能活再改映射。** 目标会话被删 / 被归档就当场报错，不会切到一个「发消息没反应」的绑定上。
+   归档会话由 `ArchivedSessionGate` 在 `agent/pre-step` 直接 reject，切过去只会静默不响应。
+3. **不做锁定。** 切回去的那一局如果本来就超了阈值，下一条消息照样触发自动换局 ——
+   那是它该做的。下拉里会把当前百分比标出来。
+4. **和自动换局共用 `rollingOver` 互斥**，避免一边手动切、一边被自动换掉。
+
+**记录点四处**：`rolloverSession`（自动换局）、`/reset-session`（面板换新一局，
+以前这里只有 `sessions.clear()`，旧会话直接失忆）、`switchSession`（手动切走）、
+`ensureSession` 新建时（旧局恢复不了 → `gone`）。
+
+**懒回填**：面板第一次要列表时，把 `cwd === workspacePath` 的历史会话补进履历
+（只扫 QQ 专用的那个工作目录，GUI 里别处的活不会混进来）。
+宿主没挂 `sessionQuery` 就跳过，并在面板上写清原因。
+
+### 修：`enabled=false` 时看面板会 500（TDZ）
+
+`apply()` 底下有两条早退（`enabled=false` / `allowUsers` 为空），早退之后的行不执行。
+新加的 `backfillState` 一开始声明在早退之后，`let` 留在 TDZ 里 →
+关了插件再打开设置页，`/state` 直接返回
+`Cannot access 'backfillState' before initialization`。
+已经把它挪到 `apply()` 早期。这个 bug 是 `tools/smoke-session-switch.mjs` 抓到的。
+
+### 修：面板渲染测试的期望值早就过期了
+
+`settings-render.test.cjs` 还按「11 组 / 56 字段」断言，而 `settings-schema.mjs`
+2026-11-03 加上「宿主守护」组之后是 12 组 / 63 字段 —— 这两个断言一直红着。
+已修正，并补了两条针对新面板的断言（有履历时画下拉、没履历时不画）。
+
+### 新增文件
+
+- `lib/session-history.mjs` —— 履历的纯函数 + 原子写，**任何失败都不抛**。
+- `test/session-history.test.mjs` —— 16 条，专测「搞不坏主流程」。
+- `tools/smoke-session-switch.mjs` —— 用假宿主把插件真加载起来跑一遍新接口。
+
+### 测试
+
+`node --test` 279/279 通过（仓库副本）。
+
+---
+
 ## [1.1.1] - 2026-11-05
 
 ### 修：零正文催话 100% 推不出去 —— 她说的话被写进思考通道之后救不回来
